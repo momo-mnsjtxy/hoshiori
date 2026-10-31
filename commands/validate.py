@@ -16,6 +16,9 @@ def command(args) -> int:
     """读、验、报哈希。"""
     path = Path(args.recipe)
     data = recipe.load(path)  # 展开 extends，循环会在这里报
+    if data.get("schema") == "itoguchi/1":  # 拿数据集卡来验，提示一下别对着卡片改
+        print(f"{path} 是数据集卡，不是配方；要看卡片成不成用 ori weave 出的那份")
+        return 0
     recipe.check(data)  # 字段名、类型、必备项
     print(f"✓ {path} 过了（哈希 {recipe.stamp(data)}）")
     return 0
