@@ -1,0 +1,22 @@
+# 一个能直接跑的 LoRA 配方示例：只写跟兜底不同的地方，其余继承。
+# 用法：ori validate examples/sft-lora.warp.yaml
+#       ori spin examples/sft-lora.warp.yaml --dry-run
+extends: base/qwen3.warp.yaml   # 继承兜底那份
+name: sft-lora-demo             # 这次跑的名字
+data:
+  files: [data/raw.jsonl]       # 示例语料，正式训练换成 weave 出来的 bolt.jsonl
+train:
+  precision: nf4                # 4bit 载入基座，小卡也跑得动
+  batch_size: 1                 # 4bit 下批只能压到 1
+  lora:
+    r: 16                       # 秩数
+    alpha: 32                   # 缩放分子，alpha/r = 2
+    dropout: 0.05
+    target: [w_q, w_k, w_v, w_o]  # 只挂注意力投影
+eval:
+  suites: [zh-lite]             # 跑完评测这一套
+  gate:
+    min_delta: 0.0              # 掉分就判失败
+forge:
+  formats: [safetensors]        # 先出安全格式，量化另跑
+  out: out/merged

@@ -15,9 +15,12 @@
 | `ori weave`：收 JSONL/TXT/目录/stdin/链接，规范化、MinHash 去重、指纹、数据集卡 | 可用 |
 | `ori import lmlab`：把 lmlab 的 yaml 转成配方，逐条差异清单 | 可用 |
 | `ori validate`：配方校验，报错指到字段并给候选 | 可用 |
+| `ori judge`：跑评测套件、三格式报告、对基线走回归门，掉分退出 1 | 可用 |
+| `ori forge`：safetensors → GGUF（f16/q8_0/q5_k_m）、LoRA 合并 | 可用（onnx/mlx 待接） |
+| `ori serve`：OpenAI 兼容网关，流式、限流、请求日志 | 可用（后端 echo / 外部命令） |
+| `ori loom`：只读面板，五页看卡、样本、拒收、进度、对比 | 可用 |
 | `ori spin --dry-run`：训练计划表与显存估算 | 可用（实跑接训练后端） |
 | `ori doctor`：环境自检 | 可用 |
-| `ori judge` / `forge` / `serve` / `loom` | 参数面已定，后端接入中 |
 
 ## 装
 
@@ -43,6 +46,14 @@ ori spin sft.warp.yaml --dry-run
 
 # 4. 从别家迁过来
 ori import lmlab ../configs/sft_lora.yaml --out imported
+
+# 5. 评测，跟基线比
+ori judge sft.warp.yaml --suite zh-lite --answer-cmd 'ollama run {model} {prompt}' --baseline out/base/report.json
+
+# 6. 导出、起服务、看面板
+ori forge sft.warp.yaml --out out/gguf --format gguf --quant q8_0
+ori serve out/merged --port 8080
+ori loom bolt
 ```
 
 `weave` 出来四样东西，都在 `--out` 里：`bolt.jsonl`（收下的正文）、`rejects.jsonl`（拒收的带原因码）、`fingerprint.json`（整份指纹）、`card.json`（数据集卡）。训练只吃 `bolt.jsonl`。
@@ -56,6 +67,10 @@ commands/            一个命令一个文件
   import_lmlab.py    迁外部配置
   validate.py        验配方
   spin.py            训练前出账
+  judge.py           跑评测与回归门
+  forge.py           导出与量化
+  serve.py           起兼容网关
+  loom.py            起面板
   doctor.py          自检
 features/            主体，平铺
   sample.py          一条样本：认正文、收干净、拒收带原因
@@ -67,6 +82,14 @@ features/            主体，平铺
   plan.py            训练计划表
   migration.py       lmlab 预设转配方
   woof.py            混配比例
+  suite.py           评测套件装载
+  scorer.py          判分规则
+  report.py          评测报告三格式
+  gate.py            回归门
+  forge.py           GGUF 写入与量化
+  merge.py           adapter 合并
+  gateway.py         兼容网关
+  loom.py            只读面板
 utils/               跨主体的小工具
   fail.py            带类型和退出码的错误
   logs.py            终端与 loom.jsonl

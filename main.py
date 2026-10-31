@@ -71,16 +71,31 @@ def parser() -> argparse.ArgumentParser:
     judge = below.add_parser("judge", help="评测")
     judge.add_argument("recipe", nargs="?")
     judge.add_argument("--suite", action="append", help="评测套件，可给多次")
+    judge.add_argument("--answer-cmd", help="拿答案的外部命令，{prompt} 换成题面；不给就回显")
+    judge.add_argument("--baseline", help="基线 report.json，给了就走回归门")
+    judge.add_argument("--min-delta", type=float, help="允许掉多少总分，缺省读配方 eval.gate")
+    judge.add_argument("--limit", type=int, default=0, help="每套最多跑几题，0 不限")
+    judge.add_argument("--out", default="out/judge", help="报告目录，默认 out/judge")
 
     forge = below.add_parser("forge", help="导出")
     forge.add_argument("recipe")
+    forge.add_argument("--out", required=True, help="产物文件或目录，必填")
     forge.add_argument("--format", action="append", dest="formats", help="导出格式，可给多次")
+    forge.add_argument("--quant", action="append", help="量化档，可给多次：f16 / q8_0 / q5_k_m")
 
     serve = below.add_parser("serve", help="起一个 OpenAI 兼容的服务")
     serve.add_argument("model")
     serve.add_argument("--port", type=int, default=8080)
+    serve.add_argument("--backend", default="cmd", help="回声 echo / 外部命令 cmd")
+    serve.add_argument("--answer-cmd", default="", help="后端命令，{prompt} 换成最后一条消息")
+    serve.add_argument("--limit", type=int, default=60, help="每 IP 每分钟几条，0 不限")
+    serve.add_argument("--log", default="gateway.jsonl", help="请求日志路径，一行一条 JSON")
+    serve.add_argument("--host", default="127.0.0.1", help="监听地址，默认只本机")
 
-    below.add_parser("loom", help="打开面板")
+    loom = below.add_parser("loom", help="打开面板")
+    loom.add_argument("out", nargs="?", default="bolt", help="产物目录，默认 bolt")
+    loom.add_argument("--port", type=int, default=8765, help="监听端口，0 表示随便挑一个空口")
+    loom.add_argument("--host", default="127.0.0.1", help="监听地址，默认只本机")
     below.add_parser("doctor", help="看看这台机器缺什么")
     return top
 

@@ -1,0 +1,18 @@
+# 兜底配方：几何、精度、批大小这些常改项放这里，具体实验 extends 它只写差异。
+# 用法：ori validate examples/sft-lora.warp.yaml
+version: 1                      # 格式版本
+task: sft                       # 监督微调
+model:
+  path: ../base-model           # 基座目录，换成你本地的
+  params_b: 3                   # 只给显存估算用
+train:
+  strategy: single              # 单卡；多卡改 fsdp2 并给 devices
+  precision: bf16               # 老卡没有 bf16 就改 fp16
+  batch_size: 2                 # 单卡一步两条
+  grad_accum: 8                 # 攒 8 步，等于有效批 16
+  epochs: 2
+  lr: 0.0002
+  warmup_steps: 20
+  max_grad_norm: 1.0
+  seed: 42
+  grad_checkpoint: true         # 省显存

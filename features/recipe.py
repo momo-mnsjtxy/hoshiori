@@ -29,30 +29,55 @@ PRECISIONS = {"bf16", "fp16", "fp32", "fp8", "nf4", "int8"}  # 认的精度
 FORMATS = {"safetensors", "gguf", "onnx", "mlx"}  # 认的导出格式
 
 # 允许出现的字段，按节写。(类型, 允许取值) 表示枚举；写 dict 表示还有下一层。
+# 加字段只加在这一张表里，校验、候选提示、文档三处同时就有了。
 FIELDS = {
-    "version": int,
-    "extends": str,
-    "name": str,
-    "task": (str, TASKS),
-    "model": {"path": str, "dtype": str, "params_b": float},
-    "data": {"files": list, "warp": str, "fingerprint": str, "fields": list, "min_chars": int, "max_chars": int},
-    "train": {
-        "strategy": (str, STRATEGIES),
-        "devices": list,
-        "precision": (str, PRECISIONS),
-        "batch_size": int,
-        "grad_accum": int,
-        "epochs": (int, float),
-        "lr": float,
-        "warmup_steps": int,
-        "weight_decay": float,
-        "max_grad_norm": float,
-        "seed": int,
-        "grad_checkpoint": bool,
-        "lora": {"r": int, "alpha": int, "dropout": float, "target": (list, ())},
+    "version": int,  # 格式版本，固定 1
+    "extends": str,  # 父配方路径，先读它再被本份覆盖
+    "name": str,  # 这次跑的名字，进产物目录和报告
+    "task": (str, TASKS),  # 训练类型，决定走哪个训练器
+    "model": {
+        "path": str,  # 基座目录或权重文件
+        "dtype": str,  # 载入权重时的精度
+        "params_b": (int, float),  # 参数量（十亿），只给显存估算用；写 3 或 3.0 都行
     },
-    "eval": {"suites": list, "gate": {"min_delta": float}, "limit": int},
-    "forge": {"formats": (list, FORMATS), "quant": list, "out": str},
+    "data": {
+        "files": list,  # 训练数据，weave 出来的 bolt.jsonl
+        "warp": str,  # 混配配方，多来源时才给
+        "fingerprint": str,  # 数据的指纹，跑之前拿来比对不对
+        "fields": list,  # 正文优先取的字段名
+        "min_chars": int,  # 短于此数算空样本
+        "max_chars": int,  # 长于此数截断或拒收，0 不限
+    },
+    "train": {
+        "strategy": (str, STRATEGIES),  # single 单卡 / ddp 每卡一份 / fsdp2 摊开
+        "devices": list,  # 用哪几张卡，写照应列表
+        "precision": (str, PRECISIONS),  # 数值精度，nf4 即 4bit QLoRA
+        "batch_size": int,  # 单卡每步几条
+        "grad_accum": int,  # 攒几步再更新一次，等于放大批
+        "epochs": (int, float),  # 过几遍数据
+        "lr": float,  # 学习率
+        "warmup_steps": int,  # 预热步数，从 0 线性升到 lr
+        "weight_decay": float,  # 权重衰减
+        "max_grad_norm": float,  # 梯度裁剪阈值
+        "seed": int,  # 随机种子，复现要用
+        "grad_checkpoint": bool,  # 用时间换显存
+        "lora": {
+            "r": int,  # 低秩秩数，越大越占参数
+            "alpha": int,  # 缩放分子，实际缩放是 alpha/r
+            "dropout": float,  # adapter 上的丢弃率
+            "target": (list, ()),  # 挂在哪几种线性层上
+        },
+    },
+    "eval": {
+        "suites": list,  # 要跑的评测套件名
+        "gate": {"min_delta": float},  # 回归门：掉过这个分就判失败
+        "limit": int,  # 每个套件最多跑几题
+    },
+    "forge": {
+        "formats": (list, FORMATS),  # 要出的产物格式
+        "quant": list,  # 量化档，例 q5_k_m
+        "out": str,  # 产物目录
+    },
 }
 
 FINE_TUNE = {"sft", "distill", "dpo", "grpo", "ppo", "rloo"}  # 这几类都要基座

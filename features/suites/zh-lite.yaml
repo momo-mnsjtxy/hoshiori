@@ -1,0 +1,53 @@
+# 中文常识与格式跟随，10 题。答案都短，判得出来，也不依赖具体模型。
+name: zh-lite
+desc: 中文常识与格式跟随（10 题）
+tasks:
+  - id: units
+    prompt: 一打鸡蛋是几个？只写数字。
+    rule: contains
+    keywords: ["12"]
+    why: 量词常识，答 12 或 12 个都对
+  - id: nasal
+    prompt: 「明」这个字是前鼻音还是后鼻音？只写「前鼻音」或「后鼻音」。
+    rule: exact
+    answer: 后鼻音
+    why: 拼音常识，答案必须落在两个选项里
+  - id: fruits
+    prompt: 用顿号分隔，列出三种水果，只写这一行，不加解释。
+    rule: regex
+    pattern: ^[^、\n]+、[^、\n]+、[^、\n]+$
+    why: 顿号分隔三项，格式服从
+  - id: json-name
+    prompt: 只输出一个 JSON 对象，键 name 的值是「星织」，不要代码块标记，不要解释。
+    rule: regex
+    pattern: ^\s*\{.*"name"\s*:\s*"星织".*\}\s*$
+    why: 只给 JSON，不给废话
+  - id: five-chars
+    prompt: 写一个正好五个汉字的短句，不加标点，不加解释。
+    rule: regex
+    pattern: ^[\u4e00-\u9fa5]{5}$
+    why: 数汉字个数，标点也算错
+  - id: markdown-list
+    prompt: 用 markdown 无序列表列出两种颜色，每种一行，以「- 」开头。
+    rule: regex
+    pattern: (?m)^-\s+\S+\n-\s+\S+
+    why: markdown 列表两行
+  - id: kilometer
+    prompt: 1 公里等于多少米？只写数字。
+    rule: contains
+    keywords: ["1000"]
+    why: 单位换算
+  - id: upper
+    prompt: 把 hoshiori 全部转成大写输出，只写转换结果。
+    rule: exact
+    answer: HOSHIORI
+  - id: kv-line
+    prompt: "用「键: 值」的格式只写一行，键是 lang，值是 zh。"
+    rule: regex
+    pattern: ^\s*lang\s*:\s*zh\s*$
+    why: 键值行，冒号后面留不留空格都行
+  - id: sort-numbers
+    prompt: 把 3、1、2 从小到大排好，用逗号连成一行，只写这一行。
+    rule: regex
+    pattern: ^\s*1\s*,\s*2\s*,\s*3\s*$
+    why: 排序后再输出

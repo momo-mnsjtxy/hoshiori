@@ -20,8 +20,11 @@ def command(args) -> int:
     recipe.check(data)
 
     for one in (data.get("data") or {}).get("files") or []:  # 数据不在就别开跑
-        if not Path(one).exists():
-            fail("input", f"训练数据不在: {one}", hint="先用 ori weave 出 bolt/，或改 data.files")
+        found = Path(one)
+        if not found.exists() and not found.is_absolute():  # 相对路径先按配方旁边找，换目录启动也找得到
+            found = Path(args.recipe).parent / one
+        if not found.exists():
+            fail("input", f"训练数据不在: {one}", hint="先用 ori weave 出 bolt/，或把相对路径改成相对配方的")
 
     table = plan.build(data)
     print(table.show())
