@@ -36,6 +36,7 @@ class Choice:
     algo: str = "sha256"  # 指纹算法
     keep_duplicates: bool = False  # 判掉的要不要也留进 bolt
     dry_run: bool = False  # 只跑流程，产物照样写，卡片里标注
+    store_dir: Path = None  # 去重索引落盘的目录，给了就落在 <store_dir>/index；None 只在内存
 
 
 @dataclass
@@ -68,7 +69,8 @@ class Dataset:
     def __init__(self, choice: Choice) -> None:
         self.choice = choice
         self.counts = Counts()
-        self._dup = duplicate.Duplicate(choice.rule)  # 判重索引，整趟共用
+        store = (choice.store_dir / "index") if choice.store_dir else None  # 索引落哪；None 就纯内存
+        self._dup = duplicate.Duplicate(choice.rule, store=store)  # 判重索引，整趟共用
         self._stamp = fingerprint.Stamp(choice.algo)  # 指纹器，整趟共用
         self._kept_path = choice.out / "bolt.jsonl"
         self._refused_path = choice.out / "rejects.jsonl"
@@ -126,6 +128,8 @@ class Dataset:
         if not card["sources"]:  # 没有来源卡就不是卡，别写出去
             raise ValueError("没有任何来源，卡片出不来")
         (self.choice.out / "card.json").write_text(json.dumps(card, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._dup.save()  # 索引落盘：收工才写，跑一半断了不留半份
+        self._dup.close()
 
 
 def _put(handle, payload: dict) -> None:

@@ -12,13 +12,16 @@ from utils.fail import Failure
 # ---------- 内置套件 ----------
 
 def test_builtin_suites_scanned():
-    found = suite.scan(suite.folder())
-    assert [one.name for one in found] == ["format-lite.yaml", "zh-lite.yaml"]
+    # 导入 lm-eval 任务会往这个目录里加文件，所以只断言内置两份都在，不断言完全相等
+    found = [one.name for one in suite.scan(suite.folder())]
+    assert "format-lite.yaml" in found
+    assert "zh-lite.yaml" in found
 
 
 def test_builtin_suites_have_expected_size():
     counts = {one.name: len(suite.read(one).tasks) for one in suite.scan(suite.folder())}
-    assert counts == {"format-lite.yaml": 6, "zh-lite.yaml": 10}
+    assert counts["format-lite.yaml"] == 6  # 这两份是内置的，题数固定
+    assert counts["zh-lite.yaml"] == 10
 
 
 def test_builtin_tasks_carry_their_rule_field():
@@ -49,7 +52,8 @@ def test_builtin_suites_grade_correct_answers():
         "pipe-path": "a|b|c",
         "pi-two": "3.14",
     }
-    for path in suite.scan(suite.folder()):
+    builtin = [one for one in suite.scan(suite.folder()) if one.name in {"format-lite.yaml", "zh-lite.yaml"}]  # 导入进来的套件另有答案，这里只跑内置两份
+    for path in builtin:
         for task in suite.read(path).tasks:
             assert scorer.grade(task, right[task.id]).score == 1.0
 

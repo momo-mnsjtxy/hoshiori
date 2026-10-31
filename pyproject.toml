@@ -28,7 +28,8 @@ packages = ["commands", "features", "utils"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q -m 'not slow'"  # slow 是十万条压测，pytest -m slow 单独跑
+markers = ["slow: 跑得慢的压测，默认不跑"]
 
 [tool.ruff]
 line-length = 100

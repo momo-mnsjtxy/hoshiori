@@ -1,4 +1,4 @@
-"""导出：把 safetensors 权重转成 GGUF 二进制，按档量化，或原样另存 safetensors。
+"""导出：把 safetensors 权重转成 GGUF 二进制，按档量化，或原样另存 safetensors、ONNX、MLX。
 
 调用示例：
   from features.forge import Choice, Export
@@ -18,14 +18,32 @@ GGUF v3 的字节布局，严格按顺序写，一处都不能调：
 为什么自己写而不调 llama.cpp：基础安装零编译，pip 装完就能出文件。
 量化块照 ggml 的块定义写，一个字节都不改：
   q8_0   一块 32 个值 = 1 个 fp16 比例 + 32 个 int8，合计 34 字节
-  q5_k_m 一块 256 个值 = 2 个 fp16 比例 + 12 字节 6bit 比例 + 32 字节第 5 位 + 128 字节低 4 位，合计 176 字节
-q5_k_m 里 5 位拆成低 4 位和一张第 5 位的位图，是 ggml 的 Q5_K 超块结构；
-行宽不够 256 的矩阵退回 q8_0，一维的范数、偏置一律 fp32，跟 llama.cpp 的做法一致。
+  q5_k   一块 256 个值 = 2 个 fp16 比例 + 12 字节 6bit 比例 + 32 字节第 5 位 + 128 字节低 4 位，合计 176 字节
+  q6_k   一块 256 个值 = 128 字节低 4 位 + 64 字节高 2 位 + 16 个 int8 子块比例 + 1 个 fp16 超块比例，合计 210 字节
+q5_k 里 5 位拆成低 4 位和一张第 5 位的位图，是 ggml 的 Q5_K 超块结构；
+q6_k 的 6 位同样拆成低 4 位与高 2 位，是 ggml 的 Q6_K 超块结构。
+
+档位怎么分派（llama.cpp 的 _M 就是靠这一手把输出层抬高）：
+  output.weight、token_embd.weight 这两层喂给每个 token 的 logits 和梯度，误差最显眼，
+  q5_k_m 把这两层升到 q6_k，其余仍走 q5_k；q5_k_s 是同一档位但不抬升，全走 q5_k。
+分派只看张量名，写死在 OUTPUT_LAYER 里，别的名字不受影响。
+
+行宽不是块宽（q8_0 是 32，k-quant 是 256）时补零到块宽再量化，不整体退 fp32：
+补出来的零只占字节，读的一方按 dims 取前面的真值，尾巴丢掉。
+三维张量按最外层摊平成行，走同一条行量化路径，dims 原样写回。
+
+tokenizer 从基座目录的 tokenizer.json（或 tokenizer.model）导出词表与 merges，
+kv 缺哪一条、读不出来都记进 dropped：产物离开仓库能不能独立跑，看这一栏。
+onnx 走 torch.onnx.export（图 + 旁边的 safetensors 权重），mlx 走 mlx_lm.convert 子进程。
 """
 
 import json
 import re
+import shutil
 import struct
+import subprocess
+import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -36,15 +54,20 @@ from utils.fail import fail
 GGUF_MAGIC = b"GGUF"  # 文件头四字节，固定这串
 GGUF_VERSION = 3  # 写死 v3，v2 少了 kv 里的对齐字段
 ALIGN = 32  # 数据段对齐到 32 字节，ggml 读的时候按这个数跳
-GGML_F32, GGML_F16, GGML_Q8_0, GGML_Q5_K = 0, 1, 8, 13  # ggml 的类型号
-QUANTS = {"f32": GGML_F32, "f16": GGML_F16, "q8_0": GGML_Q8_0, "q5_k_m": GGML_Q5_K}  # 认的档
-FILE_TYPE = {"f32": 0, "f16": 1, "q8_0": 7, "q5_k_m": 17}  # general.file_type 的取值，11 是 q5_k_m 那一档
-BLOCK = {GGML_Q8_0: 32, GGML_Q5_K: 256}  # 一块装多少个值
-BLOCK_BYTES = {GGML_Q8_0: 34, GGML_Q5_K: 176}  # 一块占多少字节，回读断言用它
+GGML_F32, GGML_F16, GGML_Q8_0, GGML_Q5_K, GGML_Q6_K = 0, 1, 8, 13, 14  # ggml 的类型号
+QUANTS = {"f32": GGML_F32, "f16": GGML_F16, "q8_0": GGML_Q8_0, "q5_k_s": GGML_Q5_K, "q5_k_m": GGML_Q5_K, "q6_k": GGML_Q6_K}  # 认的档
+FILE_TYPE = {"f32": 0, "f16": 1, "q8_0": 7, "q5_k_s": 16, "q5_k_m": 17, "q6_k": 18}  # general.file_type 的取值，照 ggml 的枚举
+BLOCK = {GGML_Q8_0: 32, GGML_Q5_K: 256, GGML_Q6_K: 256}  # 一块装多少个值
+BLOCK_BYTES = {GGML_Q8_0: 34, GGML_Q5_K: 176, GGML_Q6_K: 210}  # 一块占多少字节，回读断言用它
+OUTPUT_LAYER = ("output.weight", "token_embd.weight")  # _M 档要抬到 q6_k 的输出层，按 ggml 的名字写
 
-K_U32, K_F32, K_BOOL, K_STRING = 4, 6, 7, 8  # kv 值的类型号，只用到这四种
+K_U32, K_I32, K_F32, K_BOOL, K_STRING, K_ARRAY = 4, 5, 6, 7, 8, 9  # kv 值的类型号，字符串数组走 K_ARRAY
+KV_FMT = {K_U32: ("<I", 4), K_I32: ("<i", 4), K_F32: ("<f", 4), K_BOOL: ("<?", 1)}  # 标量值的打包格式与步长
+TOKEN_TYPE = {"control": 3, "user": 4, "normal": 1}  # ggml 的 token 类型号，3 控制符 4 用户自定义 1 普通词
+TOKEN_NAME = {"bos_token": "<s>", "eos_token": "</s>", "pad_token": "<pad>"}  # 配置没指时按惯例的名字找
+NO_ID = 0xFFFFFFFF  # 没有这个特殊 token 时写的 u32，-1 的补码写法
 
-ARCHS = {"llama", "qwen2", "qwen3", "mistral", "gemma", "gemma2", "phi3", "deepseek2"}  # 认得模型结构
+ARCHS = {"llama", "qwen2", "qwen3", "mistral", "gemma", "gemma2", "phi3", "deepseek2"}  # 认得的模型结构
 
 # config.json 字段 → GGUF 的 kv 名。键是 llama.cpp 认的那套，前缀在写的时候拼上结构名。
 CONFIG_KEYS = {
@@ -86,9 +109,11 @@ class Choice:
 
     source: Path  # 权重文件或目录
     out: Path  # 产物路径
-    format: str = "gguf"  # safetensors 或 gguf
+    format: str = "gguf"  # safetensors、gguf、onnx、mlx
     quant: str = "f16"  # 量化档，f16 就是不量化
     config: Path = None  # config.json，没有就不写结构参数
+    tokenizer: Path = None  # 词表所在目录，缺了就按 source 旁边找
+    with_tokenizer: bool = True  # 要不要导词表，--no-tokenizer 时关掉
     name: str = "hoshiori-export"  # 写进 general.name
     dropped: list = field(default_factory=list)  # 映射不上、只能丢的项，跑完给人看
     tensors: dict = None  # 外面已经读过（比如合并完）就直接给数组，不再读盘
@@ -106,11 +131,24 @@ class Export:
         named = rename(tensors, self.choice.dropped)  # 换成 ggml 的名字，没映射的照原名留着
         if self.choice.format == "safetensors":  # 安全格式就是原样另存
             return self._save(named)
+        if self.choice.format == "onnx":  # 图另存，权重跟着落旁边
+            return self._onnx(named)
+        if self.choice.format == "mlx":  # 交给 mlx_lm 自己转
+            return self._mlx(named)
         kv = metadata(self.choice.config, self.choice.name, self.choice.quant, self.choice.dropped)  # 元数据转 kv
+        if self.choice.with_tokenizer:  # 不导词表就不塞这些 kv
+            kv.update(tokenizer(self._token_dir(), self.choice.dropped))  # 词表照着基座目录读，缺了记进 dropped
         blob = gguf_bytes(named, kv, self.choice.quant, self.choice.dropped)  # 拼整个文件，一回写出去
         self.choice.out.parent.mkdir(parents=True, exist_ok=True)
         self.choice.out.write_bytes(blob)  # 数据段一次性落盘
         return {"tensors": len(named), "bytes": len(blob), "dropped": self.choice.dropped}
+
+    def _token_dir(self) -> Path:
+        """词表在哪个目录。显式给了就用它，否则按权重路径推。"""
+        if self.choice.tokenizer:  # 命令行从基座目录传进来的
+            return Path(self.choice.tokenizer)
+        source = Path(self.choice.source)  # 单个权重文件就取它的旁边
+        return source if source.is_dir() else source.parent
 
     def _save(self, tensors: dict) -> dict:
         """另存成 safetensors，原文件的元数据跟着带过去。"""
@@ -121,6 +159,68 @@ class Export:
         self.choice.out.parent.mkdir(parents=True, exist_ok=True)
         save_file(tensors, str(self.choice.out), metadata=meta)  # 整份写出去
         return {"tensors": len(tensors), "bytes": self.choice.out.stat().st_size, "dropped": self.choice.dropped}
+
+    def _onnx(self, tensors: dict) -> dict:
+        """导 ONNX：图只做词表投影，权重另外落一份 safetensors，dims 全在权重里。"""
+        import torch  # 只有这条路要 torch
+        from safetensors.numpy import save_file  # 权重落旁边，onnx 文件里只存图
+
+        head = "token_embd.weight" if "token_embd.weight" in tensors else next(  # 前向用词表，没有就用第一个二维权
+            name for name, one in tensors.items() if one.ndim == 2
+        )
+        weights = {name: torch.from_numpy(np.ascontiguousarray(one.astype(np.float32))) for name, one in tensors.items()}  # torch 张量
+
+        class Project(torch.nn.Module):
+            """把词表挂成参数的空图：前向就是一次投影，够导出、够对拍。"""
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.weight = torch.nn.Parameter(weights[head])  # 词表当参数挂住
+
+            def forward(self, ids):
+                return torch.nn.functional.embedding(ids, self.weight)  # 查表，batch × 1 个 id → 隐藏向量
+
+        self.choice.out.parent.mkdir(parents=True, exist_ok=True)
+        side = self.choice.out.with_suffix(".safetensors")  # 权重文件，和 onnx 同名不同后缀
+        save_file({name: one.numpy() for name, one in weights.items()}, str(side))  # 权重整份落盘
+        # dynamo=False 走 TorchScript 那条老路：只要 torch 和 onnx，不额外要 onnxscript。
+        torch.onnx.export(
+            Project().eval(),  # 模块本身
+            torch.zeros(1, 1, dtype=torch.long),  # 一批一个假 token id
+            str(self.choice.out),  # 图写到哪
+            input_names=["ids"],  # 输入名
+            output_names=["hidden"],  # 输出名
+            opset_version=14,  # 14 是各家运行时都吃得下的版本
+            dynamo=False,  # 走老 exporter，见上面那行
+        )
+        kept = self.choice.out.stat().st_size + side.stat().st_size  # 图加权重一起算产出
+        return {"tensors": len(tensors), "bytes": kept, "dropped": self.choice.dropped + [f"权重另存 {side.name}，onnx 只存图"]}
+
+    def _mlx(self, tensors: dict) -> dict:
+        """导 MLX：交给 mlx_lm.convert 子进程，产物是一个目录。"""
+        from safetensors.numpy import save_file  # 合并过的权重得先落盘才交给子进程
+
+        folder = self.choice.out  # mlx 的产物是目录，不是单文件
+        folder.parent.mkdir(parents=True, exist_ok=True)
+        source = Path(self.choice.source)  # 一般直接指基座目录
+        with tempfile.TemporaryDirectory() as scratch:  # 合并结果基座目录上没有，摊到临时目录去
+            if self.choice.tensors:  # 不摊的话转出来的是没合并的基座
+                source = Path(scratch)
+                save_file(tensors, str(source / "model.safetensors"))  # 合并后的权重
+                shutil.copy2(self.choice.config, source / "config.json")  # 结构配置照抄
+                words = Path(self.choice.tokenizer or self.choice.source)  # 词表跟着基座，没有就用权重目录
+                for one in ("tokenizer.json", "tokenizer.model", "tokenizer_config.json"):  # 词表也带上
+                    if (words / one).exists():
+                        shutil.copy2(words / one, source / one)
+            run = subprocess.run(  # 转换器要整目录，指给它要转的那份
+                [sys.executable, "-m", "mlx_lm.convert", "--input", str(source), "--mlx-path", str(folder)],
+                capture_output=True,  # 输出自己收
+                text=True,
+            )
+        if run.returncode:  # 转失败了把最后一段 stderr 摆出来
+            fail("error", f"mlx 转换失败: {run.stderr.strip()[-400:]}", hint="单独跑一次 mlx_lm.convert 看完整输出")
+        written = sum(one.stat().st_size for one in folder.rglob("*") if one.is_file())  # 目录里写出来的全部字节
+        return {"tensors": len(tensors), "bytes": written, "dropped": self.choice.dropped}
 
 
 # --- 读权重 ---
@@ -224,13 +324,174 @@ def metadata(config: Path, name: str, quant: str, dropped: list) -> dict:
     return kv
 
 
+# --- 词表 ---
+
+def tokenizer(folder: Path, dropped: list) -> dict:
+    """从基座目录拼出 tokenizer 的全部 kv。缺哪条、读不出来都记进 dropped。"""
+    json_path = Path(folder) / "tokenizer.json"  # HF 那份，词表和 merges 都在里面
+    model_path = Path(folder) / "tokenizer.model"  # SentencePiece 那份
+    if json_path.exists():
+        return _tokenizer_json(json_path, Path(folder), dropped)
+    if model_path.exists():
+        return _tokenizer_model(model_path, dropped)
+    dropped.append("基座目录没有 tokenizer.json / tokenizer.model，产物不能独立跑")  # 缺词表就是不能独立跑
+    return {}
+
+
+def _tokenizer_json(path: Path, folder: Path, dropped: list) -> dict:
+    """读 HF 的 tokenizer.json：词表、merges、特殊 token 都从这一份里抠。"""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))  # 整份读进来
+    except (OSError, json.JSONDecodeError) as bad:  # 坏了也要说清是坏在哪一步
+        dropped.append(f"tokenizer.json 读不出来（{bad}），产物不能独立跑")
+        return {}
+    model = data.get("model") or {}  # 词表本体
+    vocab = model.get("vocab") or {}  # 词 → id
+    if not vocab:  # 没有词表等于白导
+        dropped.append("tokenizer.json 里没有 model.vocab，产物不能独立跑")
+        return {}
+    added = {int(one["id"]): one for one in data.get("added_tokens") or []}  # 特殊 token 自带 id
+    size = max([*vocab.values(), *added] or [0]) + 1  # 词表按最大 id 撑开，id 就是下标
+    tokens = [""] * size  # 先摆空位，缺 id 由空串占着
+    for text, index in vocab.items():
+        tokens[index] = text  # 词按 id 就位
+    types = [TOKEN_TYPE["normal"]] * size  # 默认全是普通词
+    for index, one in added.items():  # 特殊 token 覆盖类型
+        tokens[index] = one.get("content", tokens[index])  # 文字用它的内容
+        types[index] = TOKEN_TYPE["control"] if one.get("special") else TOKEN_TYPE["user"]  # 控制符 / 用户词
+    merges = [" ".join(one) if isinstance(one, list) else one for one in model.get("merges") or []]  # BPE 的合并表
+    if not merges and model.get("type") == "BPE":  # 有 BPE 却一条 merges 都没有，产物跑起来会掉词
+        dropped.append("tokenizer.json 是 BPE 但没有 merges，产物不能独立跑")
+    kv = {
+        "tokenizer.ggml.model": (K_STRING, "gpt2" if model.get("type") == "BPE" else "llama"),  # 词表算法名
+        "tokenizer.ggml.tokens": (K_ARRAY, (K_STRING, tokens)),  # 词表本体
+        "tokenizer.ggml.merges": (K_ARRAY, (K_STRING, merges)),  # 合并表
+        "tokenizer.ggml.token_type": (K_ARRAY, (K_I32, types)),  # 每个词的类型
+    }
+    for key, label, default in (  # 三个特殊 id，配置里指到哪个词就用哪个 id
+        ("bos_token", "bos_token_id", 1),
+        ("eos_token", "eos_token_id", 2),
+        ("pad_token", "padding_token_id", NO_ID),
+    ):
+        found = _token_id(folder, key, added)  # 配置里的名字换成 id
+        if found is None:  # 配置没指就按惯例的名字在词表里找
+            found = next((index for index, one in added.items() if one.get("content") == TOKEN_NAME[key]), None)
+        if found is None:  # 还是没有就写默认，并记一笔
+            dropped.append(f"tokenizer 缺 {label}，产物不能独立跑")
+        kv[f"tokenizer.ggml.{label}"] = (K_U32, default if found is None else found)
+    return kv
+
+
+def _token_id(folder: Path, key: str, added: dict):
+    """按 tokenizer_config.json 里的名字在 added_tokens 里换 id，没有返回 None。"""
+    config_path = folder / "tokenizer_config.json"  # 配置和词表放同一处
+    if not config_path.exists():  # 没有配置就没有名字
+        return None
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))  # 配置是 JSON
+    except (OSError, json.JSONDecodeError) as bad:
+        return None  # 读不出来当没有，缺的那条由上层记
+    raw = config.get(key)  # bos_token / eos_token / pad_token
+    text = raw.get("content") if isinstance(raw, dict) else raw  # 兼容 {"content": ...} 写法
+    for index, one in added.items():
+        if one.get("content") == text:  # 名字对上就是它
+            return index
+    return None
+
+
+def _tokenizer_model(path: Path, dropped: list) -> dict:
+    """读 SentencePiece 的 tokenizer.model。只要 pieces 那一段，明文 protobuf 自己走。"""
+    raw = path.read_bytes()
+    tokens, types = [], []
+    pos = 0
+    while pos < len(raw):  # 一个字段一个字段往前推
+        key, pos = _varint(raw, pos)  # 字段号和类型
+        field, wire = key >> 3, key & 7
+        if field == 1 and wire == 2:  # 一条 piece，模型文件的主体
+            size, pos = _varint(raw, pos)  # 这条多长
+            text, one_type, pos = _piece(raw, pos, pos + size)  # 词和类型
+            tokens.append(text)
+            types.append(one_type)
+            continue
+        if wire == 2:  # 别的长度段整个跳过
+            size, pos = _varint(raw, pos)
+            pos += size
+        elif wire == 0:  # 变长整数
+            _, pos = _varint(raw, pos)
+        elif wire == 5:  # 定长 4 字节
+            pos += 4
+        else:  # 定长 8 字节
+            pos += 8
+    if not tokens:  # 一条都没解出来
+        dropped.append(f"{path.name} 里没解出词表，产物不能独立跑")
+        return {}
+    ids = {text: index for index, text in enumerate(tokens)}  # 名字 → id，找特殊 token 用
+    kv = {
+        "tokenizer.ggml.model": (K_STRING, "llama"),  # SentencePiece 就是 llama 这套
+        "tokenizer.ggml.tokens": (K_ARRAY, (K_STRING, tokens)),  # 词表本体
+        "tokenizer.ggml.merges": (K_ARRAY, (K_STRING, [])),  # SentencePiece 没有 merges
+        "tokenizer.ggml.token_type": (K_ARRAY, (K_I32, types)),  # 每个词的类型，和 ggml 的枚举一致
+    }
+    for key, label, default in (  # 概型里这几个是固定写法，缺了写默认
+        ("<s>", "bos_token_id", 1),
+        ("</s>", "eos_token_id", 2),
+        ("<pad>", "padding_token_id", NO_ID),
+    ):
+        found = ids.get(key)
+        if found is None:  # 缺了就记一笔
+            dropped.append(f"tokenizer 缺 {label}，产物不能独立跑")
+        kv[f"tokenizer.ggml.{label}"] = (K_U32, default if found is None else found)
+    return kv
+
+
+def _piece(raw: bytes, start: int, stop: int):
+    """解一条 SentencePiece piece，返回（词, 类型, 新位置）。类型缺省是普通词。"""
+    text, one_type = "", TOKEN_TYPE["normal"]
+    pos = start
+    while pos < stop:
+        key, pos = _varint(raw, pos)
+        field, wire = key >> 3, key & 7
+        if field == 1 and wire == 2:  # piece 文本
+            size, pos = _varint(raw, pos)
+            text = raw[pos : pos + size].decode("utf-8", "replace")
+            pos += size
+            continue
+        if field == 3 and wire == 0:  # 类型枚举，编号和 ggml 的一致
+            one_type, pos = _varint(raw, pos)
+            continue
+        if wire == 2:  # 别的长度段，整个跳过（score 是定长 4 字节，走下面）
+            size, pos = _varint(raw, pos)
+            pos += size
+        elif wire == 0:
+            _, pos = _varint(raw, pos)
+        elif wire == 5:
+            pos += 4
+        else:
+            pos += 8
+    return text, one_type, stop
+
+
+def _varint(raw: bytes, pos: int):
+    """读一个 protobuf 变长整数，返回（值, 新位置）。"""
+    value = shift = 0
+    while True:
+        byte = raw[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift  # 低 7 位是数据，高位是续读标记
+        if byte < 0x80:
+            return value, pos
+        shift += 7
+
+
 # --- 量化 ---
 
-def block_bytes(kind: int, count: int) -> int:
-    """按类型算 count 个值要占多少字节。回读断言和自检都用它。"""
-    if kind in BLOCK:  # 有块的按块算
-        return (count // BLOCK[kind]) * BLOCK_BYTES[kind]
-    return count * (2 if kind == GGML_F16 else 4)  # fp16 两字节，fp32 四字节
+def tensor_bytes(kind: int, shape) -> int:
+    """按形状算一份数据多少字节。行宽补齐过，按补齐后的宽度算。"""
+    if kind in BLOCK:  # 块类型按行算：行数 × 每行块数 × 块字节
+        width = int(shape[-1])
+        rows = int(np.prod(shape[:-1])) if len(shape) > 1 else 1
+        return rows * (-(-width // BLOCK[kind])) * BLOCK_BYTES[kind]
+    return int(np.prod(shape)) * (2 if kind == GGML_F16 else 4)  # 不量化的按元素宽度
 
 
 def q8_0(rows: np.ndarray) -> bytes:
@@ -261,7 +522,7 @@ def _pack_scales(ls: np.ndarray, lm: np.ndarray) -> bytes:
 
 
 def q5_k(rows: np.ndarray) -> bytes:
-    """q5_k（q5_k_m 的块本体）：每 256 个值一个超块，5 位量化。"""
+    """q5_k（q5_k_s 与 q5_k_m 的块本体）：每 256 个值一个超块，5 位量化。"""
     out = bytearray()
     rows = rows.astype(np.float32)
     for row in rows:  # 一行行来
@@ -300,21 +561,72 @@ def q5_k(rows: np.ndarray) -> bytes:
     return bytes(out)
 
 
+def q6_k(rows: np.ndarray) -> bytes:
+    """q6_k：每 256 个值一块，6 位有符号，低 4 位与高 2 位分开存。"""
+    out = bytearray()
+    for row in rows.astype(np.float32):  # 一行行来
+        for start in range(0, row.size, 256):  # 256 个值一个超块
+            block = row[start : start + 256].reshape(16, 16)  # 16 个子块，每块 16 个值
+            top = block[np.arange(16), np.abs(block).argmax(1)]  # 各子块绝对值最大的那个值，符号跟着它
+            scale = -top / 32  # 子块的最优比例，符号与极值相反，是 make_qx_quants 的约定
+            peak = scale[int(np.abs(scale).argmax())]  # 超块里绝对值最大的那个比例，带符号
+            if not peak:  # 整块全零，比例和量化值全留 0
+                out += bytes(208) + np.float16(0).tobytes()  # 128+64+16 个零加一个 0 比例
+                continue
+            iscale = -128 / peak  # 比例之间换算用的倒数，照 ggml 的写法
+            ls = np.clip(np.rint(iscale * scale), -128, 127).astype(np.int8)  # 子块比例相对超块取整，-128 也留着
+            d = np.float16(-peak / 128)  # 超块比例存 fp16，符号带着极值的方向
+            q = np.zeros(256, dtype=np.int8)
+            for j in range(16):  # 16 个子块逐个量化
+                if not ls[j]:  # 比例 0 的子块整块留 0
+                    continue
+                step = float(d) * int(ls[j])  # 这个子块实际的步长，两个符号相乘落地
+                q[j * 16 : (j + 1) * 16] = np.clip(np.rint(block[j] / step), -32, 31)  # 6 位有符号范围
+            u = (q.astype(np.int16) + 32).astype(np.uint8)  # 转成 6 位无符号存，读的一方减 32
+            ql, qh = bytearray(128), bytearray(64)  # 低 4 位 128 字节，高 2 位 64 字节
+            for half in range(2):  # 两个 128 值的大半块
+                base = half * 128  # 这一大半块的起点
+                for l in range(32):  # 每轮摆 4 个值
+                    ql[half * 64 + l] = int(u[base + l]) & 0xF | (int(u[base + 64 + l]) & 0xF) << 4  # 第 1、3 个值挤一个字节
+                    ql[half * 64 + 32 + l] = int(u[base + 32 + l]) & 0xF | (int(u[base + 96 + l]) & 0xF) << 4  # 第 2、4 个值挤一个字节
+                    qh[half * 32 + l] = (  # 四个值的高 2 位各占一个字节的两位
+                        (int(u[base + l]) >> 4)
+                        | (int(u[base + 32 + l]) >> 4) << 2
+                        | (int(u[base + 64 + l]) >> 4) << 4
+                        | (int(u[base + 96 + l]) >> 4) << 6
+                    )
+            out += bytes(ql) + bytes(qh) + ls.tobytes() + d.tobytes()  # 照结构拼块：低 4 位、高 2 位、比例、超块比例
+    return bytes(out)
+
+
+QUANTIZE = {GGML_Q8_0: q8_0, GGML_Q5_K: q5_k, GGML_Q6_K: q6_k}  # 类型号 → 量化函数
+
+
+def kind_for(quant: str, name: str) -> int:
+    """这个张量用哪种块。_M 档把输出层抬到 q6_k，其余按档位本身。"""
+    if quant == "q5_k_m" and name in OUTPUT_LAYER:  # 输出层误差最显眼，_M 就是靠抬它换质量
+        return GGML_Q6_K
+    return QUANTS[quant]
+
+
 def prepare(tensor: np.ndarray, quant: str, name: str, dropped: list):
-    """决定一个张量怎么存，返回（字节, 类型号）。一维的、行宽不够的都退回 fp32。"""
-    if tensor.ndim != 2:  # 范数、偏置这类一维量，还有极少数三维的，都留 fp32
-        if quant in ("q8_0", "q5_k_m"):
-            dropped.append(f"{name} 不是二维，留 fp32")
+    """决定一个张量怎么存，返回（字节, 类型号）。一维的留 fp32，矩阵行宽不足就补零。"""
+    if tensor.ndim < 2:  # 范数、偏置这类一维量，fp32 是 ggml 的常规做法
+        if QUANTS[quant] in BLOCK:  # 量化档下才值得一提
+            dropped.append(f"{name} 是一维，留 fp32")
         return tensor.astype(np.float32).tobytes(), GGML_F32
-    if quant in ("q8_0", "q5_k_m") and tensor.shape[1] % 32:  # 行宽连 32 都对不齐，量化不了
-        dropped.append(f"{name} 行宽 {tensor.shape[1]} 不到 32 的倍数，留 fp32")
-        return tensor.astype(np.float32).tobytes(), GGML_F32
-    if quant == "q5_k_m" and tensor.shape[1] % 256 == 0:  # 行宽整好是 256 的倍数才能上超块
-        return q5_k(tensor), GGML_Q5_K
-    if quant in ("q8_0", "q5_k_m"):  # q8_0 只要求 32 对齐，行宽不够 256 的 q5_k 也落这里
-        return q8_0(tensor), GGML_Q8_0
-    kind = QUANTS[quant]
-    return tensor.astype(np.float16 if kind == GGML_F16 else np.float32).tobytes(), kind  # f16 / f32
+    kind = kind_for(quant, name)  # 档位加名字定块型
+    if kind not in BLOCK:  # f16 / f32 不量化
+        return tensor.astype(np.float16 if kind == GGML_F16 else np.float32).tobytes(), kind
+    width = int(tensor.shape[-1])
+    pad = -width % BLOCK[kind]  # 补到块宽的整数倍，正好齐就是 0
+    rows = tensor.reshape(-1, width).astype(np.float32)  # 三维的按最外层摊平成行，走同一条路
+    if pad:  # 尾巴补零只占字节，dims 照原样写
+        dropped.append(f"{name} 行宽 {width} 补 {pad} 个零到 {width + pad} 再量化")
+        padded = np.zeros((rows.shape[0], width + pad), dtype=np.float32)
+        padded[:, :width] = rows  # 真值放前面，零在尾巴
+        rows = padded
+    return QUANTIZE[kind](rows), kind  # 走这条块型的量化函数
 
 
 # --- 写文件 ---
@@ -325,14 +637,26 @@ def put_text(buf: bytearray, text: str) -> None:
     buf += struct.pack("<Q", len(raw)) + raw
 
 
-def put_kv(buf: bytearray, key: str, kind: int, value) -> None:
-    """写一条 kv：键、类型、值。"""
-    put_text(buf, key)  # 键
-    buf += struct.pack("<I", kind)  # 类型
-    if kind == K_STRING:  # 字符串值有自己的长度前缀
+def _put_value(buf: bytearray, kind: int, value) -> None:
+    """写一个标量或数组元素。字符串有自己的长度前缀。"""
+    if kind == K_STRING:
         put_text(buf, str(value))
         return
-    buf += struct.pack({K_U32: "<I", K_F32: "<f", K_BOOL: "<?", K_STRING: "<Q"}[kind], value)  # 标量值
+    buf += struct.pack(KV_FMT[kind][0], value)
+
+
+def put_kv(buf: bytearray, key: str, kind: int, value) -> None:
+    """写一条 kv：键、类型、值。数组先写元素类型和个数。"""
+    put_text(buf, key)  # 键
+    buf += struct.pack("<I", kind)  # 类型
+    if kind != K_ARRAY:  # 标量直接写
+        _put_value(buf, kind, value)
+        return
+    item_kind, items = value  # 数组是（元素类型, 列表）
+    buf += struct.pack("<I", item_kind)  # 元素类型
+    buf += struct.pack("<Q", len(items))  # 元素个数
+    for one in items:  # 逐个元素
+        _put_value(buf, item_kind, one)
 
 
 def gguf_bytes(tensors: dict, kv: dict, quant: str, dropped: list = None) -> bytes:
@@ -389,12 +713,26 @@ def read(path: Path) -> dict:
         key, pos = _get_text(raw, pos)
         kind = struct.unpack_from("<I", raw, pos)[0]
         pos += 4
+        if kind == K_ARRAY:  # 数组：元素类型、个数、逐个值
+            item_kind = struct.unpack_from("<I", raw, pos)[0]
+            pos += 4
+            size = struct.unpack_from("<Q", raw, pos)[0]
+            pos += 8
+            items = []
+            for _ in range(size):
+                if item_kind == K_STRING:
+                    one, pos = _get_text(raw, pos)
+                else:
+                    one = struct.unpack_from(KV_FMT[item_kind][0], raw, pos)[0]
+                    pos += KV_FMT[item_kind][1]
+                items.append(one)
+            kv[key] = items
+            continue
         if kind == K_STRING:  # 字符串值
             kv[key], pos = _get_text(raw, pos)
             continue
-        fmt, step = {K_U32: ("<I", 4), K_F32: ("<f", 4), K_BOOL: ("<?", 1)}[kind]
-        kv[key] = struct.unpack_from(fmt, raw, pos)[0]
-        pos += step
+        kv[key] = struct.unpack_from(KV_FMT[kind][0], raw, pos)[0]
+        pos += KV_FMT[kind][1]
     infos = []
     for _ in range(count):  # 逐个读张量信息
         name, pos = _get_text(raw, pos)
@@ -412,9 +750,8 @@ def read(path: Path) -> dict:
     start = (pos + ALIGN - 1) // ALIGN * ALIGN  # 数据段从对齐边界开始
     data_len = len(raw) - start  # 数据段总长，断言用
     tensors = {}
-    for name, shape, kind, at in infos:  # 按偏移切出每份数据
-        size = block_bytes(kind, int(np.prod(shape)) if shape else 1)
-        tensors[name] = raw[start + at : start + at + size]
+    for name, shape, kind, at in infos:  # 按偏移切出每份数据，宽度按补齐后算
+        tensors[name] = raw[start + at : start + at + tensor_bytes(kind, shape)]
     out = {"magic": raw[:4], "version": version, "kv": kv, "data_len": data_len}  # 头、版本、kv、数据段长度
     out["infos"], out["tensors"] = infos, tensors  # 张量信息与按偏移切出来的字节
     return out

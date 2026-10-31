@@ -1,8 +1,10 @@
-"""forge 的测试：GGUF 写出去能按格式读回来，量化块字节数对，LoRA 合并偏差够小。
+"""forge 的测试：GGUF 写出去能按格式读回来，量化块字节数对，档位分派对，词表 kv 落盘，LoRA 合并偏差够小。
 
 约定：权重全是几行几列的小矩阵，量化只考字节布局和还原误差，不考压缩率。
+缺包的用例用 monkeypatch 假掉 find_spec，机器上装没装 onnx / mlx_lm 都跑得出同一个结果。
 """
 
+import importlib.util
 import json
 import struct
 
@@ -36,6 +38,37 @@ def ckpt(tmp_path):
         json.dumps({"model_type": "qwen3", "num_hidden_layers": 1, "hidden_size": 32, "torch_dtype": "float32"}),
         encoding="utf-8",
     )
+    return tokenizer_files(folder)  # 词表跟着权重放，多数用例都要它
+
+
+def one_tensor(tmp_path, name, array):
+    """只放一个张量的目录，单独考某种形状或某个名字的量化分派。"""
+    folder = tmp_path / "one"
+    folder.mkdir()
+    save_file({name: array.astype(np.float32)}, str(folder / "m.safetensors"))
+    (folder / "config.json").write_text(json.dumps({"model_type": "qwen3"}), encoding="utf-8")
+    return folder
+
+
+def tokenizer_files(folder):
+    """给权重目录补一份词表和一份特殊 token 配置。"""
+    (folder / "tokenizer.json").write_text(
+        json.dumps(
+            {
+                "model": {"type": "BPE", "vocab": {"a": 0, "b": 1, "c": 2}, "merges": ["a b", ["b", "c"]]},  # 两种 merges 写法都认
+                "added_tokens": [
+                    {"id": 3, "content": "<s>", "special": True},
+                    {"id": 4, "content": "</s>", "special": True},
+                    {"id": 5, "content": "<pad>", "special": True},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (folder / "tokenizer_config.json").write_text(
+        json.dumps({"bos_token": "<s>", "eos_token": "</s>", "pad_token": {"content": "<pad>"}}),
+        encoding="utf-8",
+    )
     return folder
 
 
@@ -63,7 +96,22 @@ def read_gguf(path):
         pos += 8 + size
         kind = struct.unpack_from("<I", raw, pos)[0]
         pos += 4
-        if kind == 8:  # 字符串
+        if kind == 9:  # 数组：元素类型、个数、逐个值
+            item_kind = struct.unpack_from("<I", raw, pos)[0]
+            pos += 4
+            size = struct.unpack_from("<Q", raw, pos)[0]
+            pos += 8
+            items = []
+            for _ in range(size):
+                if item_kind == 8:
+                    one = struct.unpack_from("<Q", raw, pos)[0]
+                    items.append(raw[pos + 8 : pos + 8 + one].decode())
+                    pos += 8 + one
+                else:
+                    items.append(struct.unpack_from({4: "<I", 5: "<i"}[item_kind], raw, pos)[0])
+                    pos += 4
+            kv[key] = items
+        elif kind == 8:  # 字符串
             size = struct.unpack_from("<Q", raw, pos)[0]
             kv[key] = raw[pos + 8 : pos + 8 + size].decode()
             pos += 8 + size
@@ -90,8 +138,8 @@ def read_gguf(path):
         pos += 8
         infos.append({"name": name, "shape": tuple(reversed(shape)), "kind": kind, "at": at})
     start = (pos + 31) // 32 * 32  # 数据段起点，32 字节对齐
-    for one in infos:  # 按偏移切数据
-        size = forge.block_bytes(one["kind"], int(np.prod(one["shape"])))
+    for one in infos:  # 按偏移切数据，宽度按补齐后算
+        size = forge.tensor_bytes(one["kind"], one["shape"])
         one["data"] = raw[start + one["at"] : start + one["at"] + size]
     return {"version": version, "kv": kv, "infos": infos, "data_len": len(raw) - start}
 
@@ -121,9 +169,9 @@ def test_gguf_roundtrip(tmp_path):
     expected = 0
     for one in got["infos"]:  # 自己按对齐规则算一遍数据段该多长
         expected = (expected + 31) // 32 * 32
-        expected += forge.block_bytes(one["kind"], int(np.prod(one["shape"])))
+        expected += forge.tensor_bytes(one["kind"], one["shape"])
     assert got["data_len"] == expected  # 数据段长度严丝合缝
-    assert not got["kv"].get("general.tokenizer")  # 词表没导，别假装有
+    assert not got["kv"].get("general.tokenizer")  # 没有 general.tokenizer 这条，词表走 tokenizer.ggml.*
 
 
 def test_q8_0_block_bytes(tmp_path):
@@ -156,13 +204,9 @@ def test_q8_0_block_layout(tmp_path):
 
 def test_q5_k_superblock(tmp_path):
     """q5_k_m 要按 256 个值 176 字节的超块写，还原误差也别太大。"""
-    folder = tmp_path / "big"
-    folder.mkdir()
     ramp = np.linspace(-1.0, 1.0, 256, dtype=np.float32).reshape(1, 256)  # 斜坡，好量误差
-    save_file({"model.layers.0.mlp.up_proj.weight": ramp}, str(folder / "m.safetensors"))
-    (folder / "config.json").write_text(json.dumps({"model_type": "qwen3", "num_hidden_layers": 1}), encoding="utf-8")
-    job = Export(Choice(source=folder, out=tmp_path / "k.gguf", quant="q5_k_m"))
-    job.run()
+    folder = one_tensor(tmp_path, "model.layers.0.mlp.down_proj.weight", ramp)
+    Export(Choice(source=folder, out=tmp_path / "k.gguf", quant="q5_k_m")).run()
     got = read_gguf(tmp_path / "k.gguf")
     one = next(one for one in got["infos"] if one["kind"] == forge.GGML_Q5_K)
     assert len(one["data"]) == 176  # 256 个值正好一个超块
@@ -187,23 +231,183 @@ def test_q5_k_superblock(tmp_path):
     assert err.max() < 0.12  # 5 位 + 子块比例的粗误差上限
 
 
-def test_q5_k_falls_back_on_narrow_rows(tmp_path):
-    """行宽不是 256 的倍数就退回 q8_0，不硬凑超块。"""
+def test_q6_k_block_bytes(tmp_path):
+    """q6_k 一块 256 个值 210 字节：低 4 位 128 + 高 2 位 64 + 16 个 int8 比例 + 1 个 fp16 比例。"""
+    ramp = np.linspace(-1.0, 1.0, 512, dtype=np.float32).reshape(2, 256)  # 两行，正好两个块
+    folder = one_tensor(tmp_path, "model.layers.0.mlp.down_proj.weight", ramp)
+    Export(Choice(source=folder, out=tmp_path / "k6.gguf", quant="q6_k")).run()
+    got = read_gguf(tmp_path / "k6.gguf")
+    one = next(one for one in got["infos"] if one["kind"] == forge.GGML_Q6_K)
+    assert forge.BLOCK[forge.GGML_Q6_K] == 256  # 一块 256 个值
+    assert forge.BLOCK_BYTES[forge.GGML_Q6_K] == 210  # 一块 210 字节
+    assert len(one["data"]) == 2 * 210  # 两行两个块
+
+
+def test_q6_k_block_layout(tmp_path):
+    """解一个 q6_k 块出来，6 位有符号 + 子块比例的还原误差要小。"""
+    ramp = np.linspace(-1.0, 1.0, 256, dtype=np.float32).reshape(1, 256)
+    folder = one_tensor(tmp_path, "model.layers.0.mlp.down_proj.weight", ramp)
+    Export(Choice(source=folder, out=tmp_path / "k6.gguf", quant="q6_k")).run()
+    one = next(one for one in read_gguf(tmp_path / "k6.gguf")["infos"] if one["kind"] == forge.GGML_Q6_K)
+    ql, qh = one["data"][:128], one["data"][128:192]  # 低 4 位与高 2 位
+    scales = np.frombuffer(one["data"][192:208], dtype=np.int8)  # 16 个 int8 子块比例
+    d = struct.unpack("<e", one["data"][208:210])[0]  # 一个 fp16 超块比例
+    restored = np.zeros(256)
+    for half in range(2):  # 两个 128 值的大半块
+        for l in range(32):
+            at = half * 128 + l
+            pair = [  # 每个字节里摆着 4 个值的一片，按 ggml 的排法解
+                (ql[half * 64 + l] & 0xF) | ((qh[half * 32 + l] & 3) << 4),
+                (ql[half * 64 + 32 + l] & 0xF) | (((qh[half * 32 + l] >> 2) & 3) << 4),
+                (ql[half * 64 + l] >> 4) | (((qh[half * 32 + l] >> 4) & 3) << 4),
+                (ql[half * 64 + 32 + l] >> 4) | (((qh[half * 32 + l] >> 6) & 3) << 4),
+            ]
+            for k in range(4):  # 第 k 片对应 at + 32k
+                restored[at + 32 * k] = d * float(scales[half * 8 + 2 * k + l // 16]) * (pair[k] - 32)
+    assert np.abs(restored - ramp.ravel()).max() < 0.02  # 6 位在 1/32 步长量级
+
+
+def test_q5_k_m_lifts_output_layers(tmp_path):
+    """_M 把 output.weight 与 token_embd.weight 升到 q6_k，其余仍 q5_k；q5_k_s 一层都不抬。"""
+    ramp = np.linspace(-1.0, 1.0, 256, dtype=np.float32).reshape(1, 256)
+    folder = tmp_path / "pair"
+    folder.mkdir()
+    save_file(
+        {
+            "lm_head.weight": ramp,  # 输出层
+            "model.embed_tokens.weight": ramp,  # 词表
+            "model.layers.0.mlp.down_proj.weight": ramp,  # 普通层
+        },
+        str(folder / "m.safetensors"),
+    )
+    Export(Choice(source=folder, out=tmp_path / "m.gguf", quant="q5_k_m")).run()
+    kinds = {one["name"]: one["kind"] for one in read_gguf(tmp_path / "m.gguf")["infos"]}
+    assert kinds["output.weight"] == forge.GGML_Q6_K  # 输出层被抬一档
+    assert kinds["token_embd.weight"] == forge.GGML_Q6_K  # 词表也被抬
+    assert kinds["blk.0.ffn_down.weight"] == forge.GGML_Q5_K  # 普通层还是 5 位
+    Export(Choice(source=folder, out=tmp_path / "s.gguf", quant="q5_k_s")).run()
+    plain = {one["name"]: one["kind"] for one in read_gguf(tmp_path / "s.gguf")["infos"]}
+    assert set(plain.values()) == {forge.GGML_Q5_K}  # 非 _M 档一层都不抬
+
+
+def test_q5_k_pads_narrow_rows(tmp_path):
+    """行宽不是 256 的倍数就补零到块宽，不再整体退 fp32。"""
     out = tmp_path / "n.gguf"
     assert run_forge(tmp_path, "--out", str(out), "--format", "gguf", "--quant", "q5_k_m") == 0
     got = read_gguf(out)
-    kinds = {one["kind"] for one in got["infos"] if not one["name"].endswith("output_norm.weight")}
-    assert forge.GGML_Q5_K not in kinds  # 32 宽的行上不了超块
-    assert forge.GGML_Q8_0 in kinds  # 退到 8 位
+    kinds = {one["name"]: one["kind"] for one in got["infos"]}
+    assert kinds["blk.0.attn_q.weight"] == forge.GGML_Q5_K  # 32 宽的行补到 256 再量化
+    one = next(one for one in got["infos"] if one["name"] == "blk.0.attn_q.weight")
+    assert len(one["data"]) == 4 * 176  # 4 行，每行补成一个超块
+    assert kinds["output_norm.weight"] == forge.GGML_F32  # 一维范数仍然 fp32
 
 
-def test_dropped_fields_listed(tmp_path):
-    """config 里映射不上的字段要进 dropped，不能悄悄丢。"""
+def test_narrow_rows_decode_close(tmp_path):
+    """30 宽的行补到 32 之后能解回近似值，尾巴那两格是补的零。"""
+    rng = np.random.default_rng(23)
+    source = rng.normal(size=(4, 30)).astype(np.float32)
+    folder = one_tensor(tmp_path, "model.layers.0.mlp.gate_proj.weight", source)
+    Export(Choice(source=folder, out=tmp_path / "w.gguf", quant="q8_0")).run()
+    one = next(one for one in read_gguf(tmp_path / "w.gguf")["infos"] if one["kind"] == forge.GGML_Q8_0)
+    assert one["shape"] == (4, 30)  # dims 照原样写，补的零不算进去
+    assert len(one["data"]) == 4 * 34  # 每行补成 32 个值一块
+    restored = []
+    for start in range(0, len(one["data"]), 34):
+        d = struct.unpack("<e", one["data"][start : start + 2])[0]
+        restored.append(np.frombuffer(one["data"][start + 2 : start + 34], dtype=np.int8) * d)
+    got = np.stack(restored)[:, :30]  # 只取真值那 30 格
+    assert np.abs(got - source).max() < 0.02  # 补零没把真值搅坏
+
+
+def test_three_d_tensor_quantized(tmp_path):
+    """三维张量按最外层拆成行量化，dims 原样写回。"""
+    rng = np.random.default_rng(29)
+    source = rng.normal(size=(2, 3, 32)).astype(np.float32)
+    folder = one_tensor(tmp_path, "model.layers.0.mlp.up_proj.weight", source)
+    report = Export(Choice(source=folder, out=tmp_path / "d3.gguf", quant="q8_0")).run()
+    one = next(one for one in read_gguf(tmp_path / "d3.gguf")["infos"] if one["name"] == "blk.0.ffn_up.weight")
+    assert one["kind"] == forge.GGML_Q8_0  # 三维也走量化，不退 fp32
+    assert one["shape"] == (2, 3, 32)  # dims 不变
+    assert len(one["data"]) == 6 * 34  # 最外层摊成 6 行，行行一块
+    assert not any("不是二维" in one for one in report["dropped"])  # 不再记"留 fp32"那条
+
+
+# ---------- 词表 ----------
+
+def test_tokenizer_kv_written(tmp_path):
+    """词表和 merges 要按 tokenizer.ggml.* 写进 kv，特殊 token 的 id 从配置里换。"""
+    out = tmp_path / "t.gguf"
+    assert run_forge(tmp_path, "--out", str(out), "--format", "gguf", "--quant", "q8_0") == 0
+    save = read_gguf(out)["kv"]
+    assert save["tokenizer.ggml.model"] == "gpt2"  # BPE 词表就是这么标
+    assert save["tokenizer.ggml.tokens"] == ["a", "b", "c", "<s>", "</s>", "<pad>"]  # 词按 id 就位
+    assert save["tokenizer.ggml.merges"] == ["a b", "b c"]  # 两种 merges 写法都归一成字符串
+    assert save["tokenizer.ggml.token_type"] == [1, 1, 1, 3, 3, 3]  # 3 是控制符
+    assert save["tokenizer.ggml.bos_token_id"] == 3  # 配置里的 <s> 换成 id
+    assert save["tokenizer.ggml.eos_token_id"] == 4  # </s>
+    assert save["tokenizer.ggml.padding_token_id"] == 5  # <pad>
+
+
+def test_tokenizer_special_ids_default_when_missing(tmp_path):
+    """配置里没给特殊 token 就写默认，并在 dropped 里点名缺了哪条。"""
     folder = ckpt(tmp_path)
-    job = Export(Choice(source=folder, out=tmp_path / "d.gguf", config=folder / "config.json", quant="q8_0"))
-    report = job.run()
-    assert any("torch_dtype" in one for one in report["dropped"])  # 没映射的字段留了名
-    assert not any("num_hidden_layers" in one for one in report["dropped"])  # 映射上的不算丢
+    (folder / "tokenizer.json").write_text(
+        json.dumps({"model": {"type": "BPE", "vocab": {"a": 0}, "merges": []}}), encoding="utf-8"
+    )
+    report = Export(Choice(source=folder, out=tmp_path / "t.gguf", quant="q8_0")).run()
+    save = read_gguf(tmp_path / "t.gguf")["kv"]
+    assert save["tokenizer.ggml.bos_token_id"] == 1  # bos 默认 1
+    assert save["tokenizer.ggml.eos_token_id"] == 2  # eos 默认 2
+    assert save["tokenizer.ggml.padding_token_id"] == forge.NO_ID  # 没有 pad 就是 -1 的补码
+    assert any("bos_token_id" in one for one in report["dropped"])  # 缺哪条说哪条
+
+
+def _varint(value):
+    """protobuf 变长整数，造假的 tokenizer.model 用。"""
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        out.append(byte | (0x80 if value else 0))
+        if not value:
+            return bytes(out)
+
+
+def _piece(text, kind=1):
+    """一条 SentencePiece piece：字段 1 是文本，字段 3 是类型。"""
+    body = b"\x0a" + _varint(len(text.encode())) + text.encode()
+    if kind != 1:
+        body += b"\x18" + _varint(kind)
+    return b"\x0a" + _varint(len(body)) + body
+
+
+def test_tokenizer_model_file(tmp_path):
+    """SentencePiece 的 tokenizer.model 也要能解出词表和类型。"""
+    folder = one_tensor(tmp_path, "model.norm.weight", np.zeros(32, np.float32))
+    model = b"".join([_piece("▁hello"), _piece("<s>", 3), _piece("</s>", 3), _piece("<pad>", 3)])
+    (folder / "tokenizer.model").write_bytes(model)
+    Export(Choice(source=folder, out=tmp_path / "t.gguf", quant="f16")).run()
+    kv = read_gguf(tmp_path / "t.gguf")["kv"]
+    assert kv["tokenizer.ggml.model"] == "llama"  # SentencePiece 就是这套
+    assert kv["tokenizer.ggml.tokens"] == ["▁hello", "<s>", "</s>", "<pad>"]  # 词按顺序解出来
+    assert kv["tokenizer.ggml.token_type"] == [1, 3, 3, 3]  # 类型跟着 piece 走
+    assert kv["tokenizer.ggml.bos_token_id"] == 1  # <s> 的位置
+    assert kv["tokenizer.ggml.padding_token_id"] == 3  # <pad> 的位置
+
+
+def test_tokenizer_missing_is_dropped(tmp_path):
+    """基座目录没词表就把产物标成不能独立跑，不假装有。"""
+    folder = one_tensor(tmp_path, "model.norm.weight", np.zeros(32, np.float32))
+    report = Export(Choice(source=folder, out=tmp_path / "t.gguf", quant="q8_0")).run()
+    assert any("tokenizer.json / tokenizer.model" in one for one in report["dropped"])  # 缺什么点名什么
+    assert "tokenizer.ggml.tokens" not in read_gguf(tmp_path / "t.gguf")["kv"]  # kv 里确实没词表
+
+
+def test_no_tokenizer_switch(tmp_path):
+    """--no-tokenizer 时一条词表 kv 都不写。"""
+    assert run_forge(tmp_path, "--out", str(tmp_path / "t.gguf"), "--format", "gguf", "--no-tokenizer") == 0
+    kv = read_gguf(tmp_path / "t.gguf")["kv"]
+    assert not any(key.startswith("tokenizer.") for key in kv)
 
 
 # ---------- LoRA 合并 ----------
@@ -298,9 +502,56 @@ def test_unknown_format(tmp_path):
     assert run_forge(tmp_path, "--out", str(tmp_path / "o"), "--format", "tflite") == 2
 
 
-def test_onnx_needs_package(tmp_path):
-    code = run_forge(tmp_path, "--out", str(tmp_path / "o"), "--format", "onnx")
-    assert code == 4  # 缺后端按 exit 4
+def test_onnx_needs_package(tmp_path, monkeypatch):
+    """缺 onnx 时按缺包报 exit 4。"""
+    real = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None if name in ("onnx", "torch") else real(name))
+    assert run_forge(tmp_path, "--out", str(tmp_path / "o"), "--format", "onnx") == 4
+
+
+def test_onnx_writes_graph_and_weights(tmp_path):
+    """装得上 torch 和 onnx 时，图要过 checker，权重落旁边同名文件。"""
+    pytest.importorskip("torch")
+    onnx = pytest.importorskip("onnx")
+    out = tmp_path / "m.onnx"
+    assert run_forge(tmp_path, "--out", str(out), "--format", "onnx") == 0
+    model = onnx.load(str(out))
+    onnx.checker.check_model(model)  # 图本身要合法
+    assert [one.name for one in model.graph.input] == ["ids"]  # 只有一个 token id 输入
+    assert sorted(load_file(str(tmp_path / "m.safetensors")))  # 权重整份落在旁边
+
+
+def test_mlx_needs_package(tmp_path, monkeypatch):
+    """缺 mlx_lm 时按缺包报 exit 4。"""
+    real = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None if name == "mlx_lm" else real(name))
+    assert run_forge(tmp_path, "--out", str(tmp_path / "o"), "--format", "mlx") == 4
+
+
+def test_mlx_runs_convert(tmp_path, monkeypatch):
+    """有 mlx_lm 时走子进程，转出来的目录里得有东西。"""
+    stub = tmp_path / "stub"
+    (stub / "mlx_lm").mkdir(parents=True)
+    (stub / "mlx_lm" / "__init__.py").write_text("", encoding="utf-8")
+    (stub / "mlx_lm" / "convert.py").write_text(
+        "import argparse, json\n"
+        "from pathlib import Path\n"
+        "ap = argparse.ArgumentParser()\n"
+        "ap.add_argument('--input')\n"
+        "ap.add_argument('--mlx-path')\n"
+        "args = ap.parse_args()\n"
+        "out = Path(args.mlx_path)\n"
+        "out.mkdir(parents=True, exist_ok=True)\n"
+        "(out / 'config.json').write_text(json.dumps({'input': args.input}))\n"
+        "(out / 'weights.safetensors').write_bytes(b'x')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(stub))  # 进程内找得到 mlx_lm
+    monkeypatch.setenv("PYTHONPATH", str(stub))  # 子进程也找得到
+    out = tmp_path / "mlx"
+    assert run_forge(tmp_path, "--out", str(out), "--format", "mlx") == 0
+    assert (out / "weights.safetensors").is_file()  # 子进程真写了产物
+    assert json.loads((out / "config.json").read_text(encoding="utf-8"))["input"].endswith("ckpt")  # 收到的是基座目录
 
 
 def test_safetensors_roundtrip(tmp_path):

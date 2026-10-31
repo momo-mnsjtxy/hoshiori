@@ -12,19 +12,24 @@
 后端抽成一个纯函数 answer(model, messages, options)：默认拿外部命令，把模板里的 {prompt}
 换成最后一条消息。换 vllm / llama.cpp 只换这一个函数，接口和字段都不动。
 
-网关自己真干的事只有三件：按 IP+自然分钟限流，超了回 429；每个请求一行 JSON 落日志；
-一个请求一个线程。计数和日志两个线程都会改，所以都要过锁。
+网关自己真干的事只有四件：设了 token 就验 Authorization；按 IP+自然分钟限流，超了回 429；
+每个请求一行 JSON 落日志；一个请求一个线程。计数和日志两个线程都会改，所以都要过锁。
 
-Gateway 的五个参数：
+Gateway 的参数：
   model       模型目录或模型名，填进模板的 {model}
   backend     echo 原样回声；cmd 走外部命令
   answer_cmd  命令模板，{prompt} 换成最后一条消息，{model} 换成模型
+  token       要求的令牌，None 就不鉴权；给了就必须带 Authorization: Bearer <token>
   limit       每个 IP 每分钟几条，0 不限
   log         日志路径，None 不写
+
+鉴权在 do_GET 和 do_POST 一开头各拦一次，都走同一个 check_token()，路由分支里不再重复。
+usage 有分词器就真数，没有就按字数估，响应头 x-usage-source 标出用的是哪种。
 
 run(port) 一直占着直到 Ctrl-C；start(port, in_thread=True) 只把服务起好、把 server 交回来，测试用。
 """
 
+import hmac
 import json
 import subprocess
 import threading
@@ -75,11 +80,27 @@ def piece(base: dict, delta: dict, finish) -> bytes:
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")  # 一行 data: 加空行收尾
 
 
-def usage(messages: list, text: str) -> dict:
-    """粗算用量。没接分词器，按字数估，够回执形状用。"""
+def estimate(messages: list, text: str) -> dict:
+    """按字数粗估用量。真分词走不通时用它，够回执形状用。"""
     asked = sum(len(str(m.get("content", ""))) for m in messages)  # 所有消息加起来几个字
     said = len(text)                                               # 回复几个字
     return {"prompt_tokens": asked, "completion_tokens": said, "total_tokens": asked + said}
+
+
+def load_tokenizer(model: str):
+    """模型目录里有 tokenizer.json 就加载它，没有、或者缺 tokenizers 库就回 None。
+
+    None 表示退回字数估算，不是故障：tokenizers 是可选依赖，装上才用得上真分词。
+    只在这里加载一次，之后整个服务生命周期共用，别每个请求重建（重建一次几百毫秒）。
+    """
+    path = Path(model) / "tokenizer.json"  # 分词器跟着模型目录走，只认这一处
+    if not path.is_file():                 # 只给了模型名的，目录里没有分词器
+        return None
+    try:                                   # 缺库就回 None，让上层走估算，这里不抛
+        from tokenizers import Tokenizer
+    except ImportError:
+        return None
+    return Tokenizer.from_file(str(path))  # 读一次，交给网关拿着
 
 
 # --- 收请求 ---
@@ -88,16 +109,20 @@ class Handler(BaseHTTPRequestHandler):
     """一条请求一个线程。只认两条路由，别的回 404。"""
 
     def do_GET(self) -> None:
+        if not self.check_token():                                      # 先验身份，401 不占限流配额
+            return
         gate = self.server.gateway                                      # 这个服务带的网关
-        if not gate.allow(self.client_address[0]):                      # 先过限流
+        if not gate.allow(self.client_address[0]):                      # 过了身份再看限流
             return self.reject(429, "rate_limit_error", "这个 IP 这一分钟用完了")
         if self.route() != "/v1/models":                                # 只有模型列表这一条
             return self.reject(404, "invalid_request_error", "没有这个路径")
         self.send_json(200, {"object": "list", "data": [gate.card()]})  # 身上只挂一个模型，照列表形状回
 
     def do_POST(self) -> None:
+        if not self.check_token():                                                   # 先验身份，401 不占限流配额
+            return
         gate = self.server.gateway                                                   # 这个服务带的网关
-        if not gate.allow(self.client_address[0]):                                   # 先过限流
+        if not gate.allow(self.client_address[0]):                                   # 过了身份再看限流
             return self.reject(429, "rate_limit_error", "这个 IP 这一分钟用完了")
         if self.route() != "/v1/chat/completions":                                   # 只有聊天这一条
             return self.reject(404, "invalid_request_error", "没有这个路径")
@@ -123,6 +148,21 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_stream(gate, text)
         self.send_json(200, gate.completion(messages, text))                         # 不要流就整段回
 
+    def check_token(self) -> bool:
+        """比对 Authorization 头。网关没设 token 就一律放行；不对就回 401 并返回 False。"""
+        token = self.server.gateway.token              # 网关要求的令牌，None 表示不鉴权
+        if token is None:                              # 没开鉴权，默认行为不变
+            return True
+        given = self.headers.get("Authorization", "")  # 形如 "Bearer abc"
+        scheme, _, value = given.partition(" ")        # 拆成方案和令牌，没有空格时 value 为空
+        if scheme.lower() != "bearer":                 # 方案大小写不敏感：Bearer、bearer 都认
+            self.reject(401, "invalid_request_error", "要给 Authorization: Bearer <token>")
+            return False
+        if not hmac.compare_digest(value.strip().encode(), token.encode()):  # 定长比，不按位提前返回
+            self.reject(401, "invalid_request_error", "token 不对")
+            return False
+        return True
+
     def route(self) -> str:
         """去掉查询串的路径。"""
         return self.path.split("?")[0]  # 只比对路径本身
@@ -133,6 +173,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)                                  # 状态行
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))           # 长度先说完
+        self.send_header("x-usage-source", self.server.gateway.usage_source)  # 用量是真数还是估的
         self.end_headers()
         self.wfile.write(raw)                                       # 正文
         self.record(status)                                         # 记一行日志
@@ -147,6 +188,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")  # 逐块吐字用事件流
         self.send_header("Cache-Control", "no-cache")                         # 中间别缓存
+        self.send_header("x-usage-source", gate.usage_source)                 # 用量是真数还是估的
         self.end_headers()
         self.wfile.write(piece(base, {"role": "assistant"}, None))            # 头一块只说角色，照 OpenAI 的规矩
         for part in chunks(text):                                             # 正文一块块来
@@ -174,12 +216,15 @@ class Handler(BaseHTTPRequestHandler):
 class Gateway:
     """一个网关。模型、后端、限流计数、日志都挂在这个实例上。"""
 
-    def __init__(self, model: str, backend: str = "cmd", answer_cmd: str = "", limit: int = 60, log=None, host: str = "127.0.0.1") -> None:
+    def __init__(self, model: str, backend: str = "cmd", answer_cmd: str = "", token: str = None, limit: int = 60, log=None, host: str = "127.0.0.1") -> None:
         self.model = model                                  # 模型目录或名字，填进 {model}
         self.name = Path(model).name or model               # 回执里的模型 id，取末段
         self.backend = backend                              # echo 或 cmd
         self.answer_cmd = answer_cmd                        # cmd 后端的命令模板
         self.reply = echo if backend == "echo" else answer  # 后端定一次，别每个请求再判断
+        self.token = token or None                          # 要求的令牌，None 就不鉴权
+        self.tokenizer = load_tokenizer(model)              # 分词器只在构造里加载一次，没有就 None
+        self.usage_source = "tokenizer" if self.tokenizer else "estimate"  # 用量从哪来，进响应头
         self.limit = limit                                  # 每 IP 每分钟几条，0 不限
         self.host = host                                    # 绑哪个地址，默认只本机
         self.hits = {}                                      # IP → (哪一分钟, 几次)
@@ -222,6 +267,14 @@ class Gateway:
         """模型列表里的一项。"""
         return {"id": self.name, "object": "model", "created": int(time.time()), "owned_by": "hoshiori"}
 
+    def usage(self, messages: list, text: str) -> dict:
+        """算用量。接了分词器就真数，没有就退回字数估算。"""
+        if self.tokenizer is None:                                                    # 没分词器，粗估
+            return estimate(messages, text)
+        asked = sum(len(self.tokenizer.encode(str(m.get("content", ""))).ids) for m in messages)  # 每条消息各数一遍
+        said = len(self.tokenizer.encode(text).ids)                                   # 回复也真数一遍
+        return {"prompt_tokens": asked, "completion_tokens": said, "total_tokens": asked + said}
+
     def completion(self, messages: list, text: str) -> dict:
         """非流式的整段回执，字段照 OpenAI。"""
         answer = {"role": "assistant", "content": text}  # 助手这一条
@@ -231,7 +284,7 @@ class Gateway:
             "created": int(time.time()),                 # 生成时间
             "model": self.name,                          # 落到哪个模型
             "choices": [{"index": 0, "message": answer, "finish_reason": "stop"}],
-            "usage": usage(messages, text),              # 用量
+            "usage": self.usage(messages, text),         # 用量，真数或估的，看响应头
         }
 
     def chunk_base(self) -> dict:
@@ -250,11 +303,12 @@ class Gateway:
         return server
 
     def run(self, port: int) -> None:
-        """起服务并一直跑。端口被占说清原因，Ctrl-C 收摊。"""
+        """起服务并一直跑。端口被占说清原因并给一个能用的下一个端口，Ctrl-C 收摊。"""
         try:                       # 占没占端口在这一步才知道
             server = self.start(port)
         except OSError as busy:    # 端口被别人占了
-            fail("missing", f"端口 {port} 起不来: {busy.strerror}", hint="换一个端口，比如 --port 8081")
+            next_port = port + 1 if port < 65535 else 1024                  # 顺手给一个还合法的下一个口
+            fail("missing", f"端口 {port} 起不来: {busy.strerror}", hint=f"换一个端口，比如 --port {next_port}")
         print(f"网关已起: http://127.0.0.1:{port}/v1  (POST /v1/chat/completions · GET /v1/models)")
         print(f"模型 {self.name} · 后端 {self.backend} · 每分钟 {self.limit or '不限'} 条")
         print(f"日志 {self.log_path or '不写'}")

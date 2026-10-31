@@ -3,12 +3,14 @@
 调用示例：
   ori weave --in data/raw.jsonl --out bolt --name zh-mix --license cc0
   ori weave --in a.jsonl --in b.jsonl --threshold 0.9
+  ori weave --in data/raw.jsonl --out bolt --store bolt     # 索引落到 bolt/index，百万级语料用
   cat a.jsonl | ori weave --in - --out bolt
 
 检查只在这里做一次：输入有没有给、长度范围合不合逻辑。剩下的规矩原样交给 features。
 """
 
 import json
+import os
 from pathlib import Path
 
 from features import duplicate
@@ -20,6 +22,11 @@ from utils.fail import fail
 
 def command(args) -> int:
     """跑一趟 weave。"""
+    store = Path(args.store) if args.store else None  # 索引落盘目录，不给就全程在内存
+    if store is not None:  # 落盘先试目录，建不出来就别等跑到一半才炸
+        if store.exists() and not store.is_dir():  # 指到一个文件上，mkdir 只会给出奇怪的报错
+            fail("input", f"--store 指到了一个文件: {store}", hint="换一个目录")
+        _check_store(store / "index")
     if not args.inputs:  # 没有输入就无从收
         fail("input", "至少要给一个 --in", hint="例: --in data/a.jsonl")
     if args.min_chars < 0 or args.max_chars < 0:
@@ -39,6 +46,7 @@ def command(args) -> int:
         algo=args.algo,
         keep_duplicates=args.keep_duplicates,
         dry_run=args.dry_run,
+        store_dir=store,
     )
 
     logs.begin(out)  # 面板侧的记录进 out/loom.jsonl
@@ -52,3 +60,15 @@ def command(args) -> int:
     print(f"\n产物 {out}/bolt.jsonl · {out}/card.json · {out}/fingerprint.json")
     print(f"收下 {summary['kept']} 条（{summary['keep_rate']:.1%}），重复 {counts.duplicated} 条，拒收 {sum(counts.refused.values())} 条")
     return 0
+
+
+def _check_store(store: Path) -> None:
+    """落盘目录要能建、能写。"""
+    if store.exists() and not store.is_dir():  # 同名文件占了位置
+        fail("input", f"落盘位置不是目录: {store}", hint="--store 指一个目录")
+    try:
+        store.mkdir(parents=True, exist_ok=True)  # 目录先建出来
+    except OSError as bad:  # 没权限、路径上挡着别的
+        fail("input", f"落盘目录建不出来: {store}", hint=str(bad))
+    if not os.access(store, os.W_OK):  # 建得出来但写不进
+        fail("input", f"落盘目录写不了: {store}", hint="换一个有写权限的目录")

@@ -289,13 +289,14 @@ class Panel(http.server.BaseHTTPRequestHandler):
             return self.gone("这一边没有 card.json，先跑一趟 ori weave")
         left = _read_json(card)
         right = None
-        if other:                                         # other 本来就要指别处，所以不走 _at
+        if other:                                         # other 是另一份产物，本来就在本根之外，所以故意不过 _at
             other_card = Path(other).expanduser().resolve() / "card.json"
             right = _read_json(other_card) if other_card.is_file() else None  # 那边没卡就留空
         rhs = _card_html(right, "那边") if right else "<div class='card'><h1>那边</h1><p class='note'>没给目录，或者那边没有 card.json</p></div>"
         body = (
             f"<h1>对比</h1><form><input name='other' value='{_esc(other)}' placeholder='另一个产物目录，例如 out/bolt'>"
             "<button>比</button></form>"
+            "<p class='note'>对比的目录不受本面板根目录限制（比的就是别处的产物），只读它的 card.json。</p>"
             f"<div class='grid'>{_card_html(left, '这一边')}{rhs}</div>"
         )
         return 200, _page("对比", body, "/compare")

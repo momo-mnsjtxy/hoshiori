@@ -41,6 +41,7 @@ def parser() -> argparse.ArgumentParser:
     weave = below.add_parser("weave", help="数据：收、洗、去重、打指纹、出卡")
     weave.add_argument("--in", dest="inputs", action="append", required=True, help="输入，可给多次；- 走标准输入")
     weave.add_argument("--out", default="bolt", help="产物目录，默认 bolt")
+    weave.add_argument("--store", default=None, help="去重索引落盘到 <目录>/index，百万级语料用；默认只在内存")
     weave.add_argument("--name", default="weave", help="数据集名")
     weave.add_argument("--license", default="unknown", help="来源许可")
     weave.add_argument("--fields", default="text,content,raw,body", help="正文字段优先序，逗号分")
@@ -64,9 +65,13 @@ def parser() -> argparse.ArgumentParser:
     check = below.add_parser("validate", help="验一份配方")
     check.add_argument("recipe")
 
-    spin = below.add_parser("spin", help="训练：开跑前先出账")
+    spin = below.add_parser("spin", help="训练：出账后真跑")
     spin.add_argument("recipe")
     spin.add_argument("--dry-run", action="store_true", help="出完账就停")
+    spin.add_argument("--steps", type=int, default=0, help="跑多少步，给了就覆盖 epochs 换算；带 --resume 时是从断点再跑这么多步")
+    spin.add_argument("--save-every", type=int, help="每多少步存一档，0 只存收尾")
+    spin.add_argument("--resume", help="从哪一档接着跑；给目录，auto 取产物目录里最新")
+    spin.add_argument("--out", help="产物目录，默认 out/run-<时间戳>")
 
     judge = below.add_parser("judge", help="评测")
     judge.add_argument("recipe", nargs="?")
@@ -76,12 +81,14 @@ def parser() -> argparse.ArgumentParser:
     judge.add_argument("--min-delta", type=float, help="允许掉多少总分，缺省读配方 eval.gate")
     judge.add_argument("--limit", type=int, default=0, help="每套最多跑几题，0 不限")
     judge.add_argument("--out", default="out/judge", help="报告目录，默认 out/judge")
+    judge.add_argument("--import-lm-eval", action="append", help="导入 lm-eval 任务成套件，给了就只导入")
 
     forge = below.add_parser("forge", help="导出")
     forge.add_argument("recipe")
     forge.add_argument("--out", required=True, help="产物文件或目录，必填")
     forge.add_argument("--format", action="append", dest="formats", help="导出格式，可给多次")
-    forge.add_argument("--quant", action="append", help="量化档，可给多次：f16 / q8_0 / q5_k_m")
+    forge.add_argument("--quant", action="append", help="量化档，可给多次：f16 / q8_0 / q6_k / q5_k_s / q5_k_m")
+    forge.add_argument("--no-tokenizer", action="store_true", help="不导词表，产物就不能独立跑")
 
     serve = below.add_parser("serve", help="起一个 OpenAI 兼容的服务")
     serve.add_argument("model")
@@ -91,6 +98,7 @@ def parser() -> argparse.ArgumentParser:
     serve.add_argument("--limit", type=int, default=60, help="每 IP 每分钟几条，0 不限")
     serve.add_argument("--log", default="gateway.jsonl", help="请求日志路径，一行一条 JSON")
     serve.add_argument("--host", default="127.0.0.1", help="监听地址，默认只本机")
+    serve.add_argument("--token", default="", help="要求 Authorization: Bearer <token>，不给就不鉴权")
 
     loom = below.add_parser("loom", help="打开面板")
     loom.add_argument("out", nargs="?", default="bolt", help="产物目录，默认 bolt")

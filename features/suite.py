@@ -6,6 +6,7 @@
   names = suite.scan(where)                 # 目录里现在有哪些套件文件
   one = suite.read(where / "zh-lite.yaml")  # 读一整套，坏文件当场报错
   one.tasks[0].prompt                       # 第一题的题面
+  suite.write(where / "new.yaml", one)      # 写一整套，写完自己读回来验
 
 套件长这样（tasks 里每项一题，rule 决定这题怎么判）：
   name: zh-lite
@@ -100,6 +101,23 @@ def read(path: Path) -> Suite:
         tasks=tasks,                                                       # 全部题目
         path=path,                                                         # 来自哪个文件
     )
+
+
+def write(path: Path, one: Suite, head: str = "") -> None:
+    """把一整套题写成套件文件，写完立刻读回来验形状。
+
+    head 是文件最上面的说明行（来源、题数这类）。键名只有这里定义，导入器不用自己拼。
+    """
+    tasks = []                                                    # 要写出去的题目
+    for task in one.tasks:                                        # 一题一题按规则摊平
+        need = RULES[task.rule]                                   # 这条规则配的那个字段
+        item = {"id": task.id, "prompt": task.prompt, "rule": task.rule}
+        item[need] = getattr(task, need)                          # 只写这条规则要的字段
+        if task.why:                                              # 出题意图有就带上
+            item["why"] = task.why
+        tasks.append(item)
+    yaml_io.write(path, {"name": one.name, "desc": one.desc, "tasks": tasks}, head)
+    read(path)                                                    # 读回来，形状不对当场停
 
 
 def check(data: dict, path: Path) -> None:

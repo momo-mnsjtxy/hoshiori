@@ -84,6 +84,15 @@ def test_light_mutation_caught():
     assert dup.result.dropped == 1
 
 
+def test_light_mutation_caught_with_store(tmp_path):
+    """同一段话只动空白，落盘索引也判得出来；热层故意压到 2 条键，逼它往盘上挤。"""
+    dup = duplicate.Duplicate(duplicate.Rule(threshold=0.9), store=tmp_path, hot=2)
+    assert dup.check(BASE) is None
+    assert dup.check(_light(BASE)) == 0
+    assert dup.result.dropped == 1
+    dup.close()
+
+
 def test_threshold_layers():
     tight = duplicate.Duplicate(duplicate.Rule(threshold=0.95))
     tight.check(BASE)

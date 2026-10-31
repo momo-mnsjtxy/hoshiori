@@ -12,14 +12,16 @@
 
 | 能力 | 状态 |
 | --- | --- |
-| `ori weave`：收 JSONL/TXT/目录/stdin/链接，规范化、MinHash 去重、指纹、数据集卡 | 可用 |
+| `ori weave`：收 JSONL/TXT/目录/stdin/链接，规范化、MinHash 去重（索引可落盘分片）、指纹、数据集卡 | 可用 |
+| `ori spin`：真训练，自搭 decoder-only + LoRA、分块交叉熵、断点续训 | 可用（CPU / 单卡，nf4 与多卡待接） |
 | `ori import lmlab`：把 lmlab 的 yaml 转成配方，逐条差异清单 | 可用 |
 | `ori validate`：配方校验，报错指到字段并给候选 | 可用 |
 | `ori judge`：跑评测套件、三格式报告、对基线走回归门，掉分退出 1 | 可用 |
-| `ori forge`：safetensors → GGUF（f16/q8_0/q5_k_m）、LoRA 合并 | 可用（onnx/mlx 待接） |
-| `ori serve`：OpenAI 兼容网关，流式、限流、请求日志 | 可用（后端 echo / 外部命令） |
+| `ori judge --import-lm-eval`：把 lm-eval 任务导成自己的套件 | 可用 |
+| `ori forge`：safetensors → GGUF（f16/q8_0/q6_k/q5_k_s/q5_k_m 含 _M 抬升）、词表导出、LoRA 合并、onnx | 可用（mlx 待 macOS 复验） |
+| `ori serve`：OpenAI 兼容网关，流式、限流、请求日志、令牌鉴权、真分词 usage | 可用（后端 echo / 外部命令） |
 | `ori loom`：只读面板，五页看卡、样本、拒收、进度、对比 | 可用 |
-| `ori spin --dry-run`：训练计划表与显存估算 | 可用（实跑接训练后端） |
+| `ori spin --dry-run`：训练计划表与显存估算 | 可用 |
 | `ori doctor`：环境自检 | 可用 |
 
 ## 装

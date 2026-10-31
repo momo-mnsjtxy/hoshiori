@@ -4,16 +4,19 @@
   ori judge sft.warp.yaml --suite zh-lite --answer-cmd 'echo {prompt}'
   ori judge sft.warp.yaml --suite format-lite --limit 3 --out out/r
   ori judge sft.warp.yaml --suite zh-lite --baseline out/base/report.json
+  ori judge --import-lm-eval tasks/demo.yaml     # 只导题库，不跑评测
 
 --answer-cmd 里的 {prompt} 会换成题面，所以不绑死任何模型后端；
 不给就退回回显占位，把题面当答案，报告里标 backend: echo。
+给了 --import-lm-eval 就只跑导入：把 lm-eval 任务导成 features/suites 下的套件文件，
+打印每份的题数与丢弃规则数，不读配方、不评测。
 检查只在这里做一次：配方在不在、--limit 是不是负数、套件认不认得出、基线在不在。
 """
 
 import subprocess
 from pathlib import Path
 
-from features import gate, recipe, report, scorer, suite
+from features import gate, lm_eval, recipe, report, scorer, suite
 from utils.fail import fail
 
 TIMEOUT = 300  # 一道题的答案命令最多等几秒，卡死要能自己出来
@@ -21,6 +24,8 @@ TIMEOUT = 300  # 一道题的答案命令最多等几秒，卡死要能自己出
 
 def command(args) -> int:
     """跑套件、判分、落报告；给了基线就比完返回门的退出码。"""
+    if args.import_lm_eval:                                                   # 给了就只导题
+        return run_import(args.import_lm_eval)
     if not args.recipe:                                                       # 没给配方
         fail("input", "要给一份配方", hint="例: ori judge sft.warp.yaml --suite zh-lite")
     if args.limit < 0:                                                        # 限题数写负了
@@ -70,6 +75,18 @@ def command(args) -> int:
     outcome = gate.check(payload, gate.load(baseline), min_delta)             # 跟基线比
     print(outcome.say())
     return outcome.exit_code                                                  # 掉了就非零
+
+
+def run_import(paths: list) -> int:
+    """把 lm-eval 任务导成套件，打印每份的题数和丢弃规则数。"""
+    results = lm_eval.import_all(paths, suite.folder())                       # 落到内置套件目录
+    for one in results:                                                       # 一份一行回话
+        print(one.say())
+    print(f"\n共导 {sum(one.tasks for one in results)} 题，写了 {len(results)} 份套件。")
+    dropped = sum(len(one.dropped) for one in results)                        # 丢弃的规则总数
+    if dropped:                                                               # 有丢弃就指到报告
+        print(f"有 {dropped} 条规则认不出，都写在各自套件旁边的 .report.md 里。")
+    return 0
 
 
 def gate_allowed(data: dict, given: float) -> float:

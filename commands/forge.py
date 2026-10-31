@@ -5,10 +5,12 @@
   ori forge sft.warp.yaml --out out/full.gguf --format gguf            # 不量化，fp16
   ori forge sft.warp.yaml --out out --format gguf --quant q5_k_m --quant q8_0
   ori forge sft.warp.yaml --out out/merged --format safetensors
+  ori forge sft.warp.yaml --out out/m.onnx --format onnx     # 图 + 旁边同名 .safetensors 权重
+  ori forge sft.warp.yaml --out out/mlx --format mlx         # 产物是目录，交给 mlx_lm.convert
 
-检查只在这里做一次：格式认不认、量化档认不认、--out 给没给、权重在不在。
+检查只在这里做一次：格式认不认、量化档认不认、--out 给没给、权重在不在、后端包在不在。
 剩下的转换全交给 features.forge，命令层不碰字节。
-onnx 和 mlx 要额外的包，缺了就按缺包报 exit 4，说清缺哪个，别硬转出来骗人。
+onnx 要 torch 和 onnx，mlx 要 mlx_lm，缺了就按缺包报 exit 4，说清缺哪个，别硬转出来骗人。
 配方的 model.path 指向带 adapter_config.json 的目录时，先合并再导，合并交给 features.merge。
 """
 
@@ -21,8 +23,8 @@ from utils.fail import fail
 
 FORMATS = {"safetensors", "gguf", "onnx", "mlx"}  # 认的四类产物
 NEED = (("numpy", "读写权重数组"), ("safetensors", "读写 safetensors"))  # 转换必备的两个包
-SUFFIX = {"safetensors": ".safetensors", "gguf": ".gguf"}  # 能真转的两类各自的扩展名
-BACKEND = {"onnx": "onnx", "mlx": "mlx"}  # 转不了的两类各自缺的包
+SUFFIX = {"safetensors": ".safetensors", "gguf": ".gguf", "onnx": ".onnx", "mlx": ""}  # 各类产物的后缀，mlx 是目录
+BACKEND = {"onnx": ("torch", "onnx"), "mlx": ("mlx_lm",)}  # 转这两类各自缺的包
 
 
 def command(args) -> int:
@@ -42,12 +44,9 @@ def command(args) -> int:
         fail("input", f"不认识的格式: {', '.join(unknown)}", hint="可用 " + " / ".join(sorted(FORMATS)))
 
     for one in formats:  # 后端缺包先拦，别导完一半才炸
-        need = BACKEND.get(one)
-        if not need:  # 能真转的两类跳过
-            continue
-        if importlib.util.find_spec(need) is None:  # 包不在就按缺包报，说清装哪个
-            fail("missing", f"转 {one} 要 {need} 包", hint=f"pip install {need}")
-        fail("missing", f"{one} 的转换后端还没接上", hint=f"装好 {need} 也还是这一步，先导 gguf")
+        for need in BACKEND.get(one, ()):  # 这个格式要的包一个个看
+            if importlib.util.find_spec(need) is None:  # 缺哪个就报哪个
+                fail("missing", f"转 {one} 要 {need} 包", hint=f"pip install {need}")
 
     quants = args.quant or (data.get("forge") or {}).get("quant") or ["f16"]  # 量化档，默认不量化
     bad = [one for one in quants if one not in forge.QUANTS]  # 认不出的档
@@ -67,6 +66,8 @@ def command(args) -> int:
             format=fmt,  # 目标格式
             quant=quant,  # 量化档
             config=config if config.exists() else None,  # 结构配置，没有就不写结构参数
+            tokenizer=here if here.is_dir() else None,  # 词表跟着要导的基座走
+            with_tokenizer=not args.no_tokenizer,  # --no-tokenizer 时只出权重
             name=data.get("name") or at.stem,  # 名字进 general.name
             tensors=tensors,  # 合并过就直接给数组，没合并就是 None
         )
@@ -118,5 +119,5 @@ def plan_out(out: Path, formats: list, quants: list) -> list:
     for fmt in formats:  # 每个格式一份
         for quant in (quants if fmt == "gguf" else ["f16"]):  # 量化只对 gguf 有意义
             name = "model" if len(quants) == 1 else f"model.{quant}"  # 多档时档位写进文件名
-            targets.append((fmt, quant, out / f"{name}{SUFFIX[fmt]}"))
+            targets.append((fmt, quant, out / f"{name}{SUFFIX[fmt]}"))  # mlx 没有后缀，落成一个目录
     return targets

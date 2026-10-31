@@ -13,11 +13,16 @@
   3. 分带 bands：把指纹切成 8 段比，任意一段全等就是候选；候选再回算真实重合度过线才算重复。
 
 为什么最后要回算：分带只看"有没有一段全等"，低相似度也会撞车，不回算会误杀。
+分带这张表交给 features.index：默认还在内存，给了 store 目录就按热/温/冷三层落到盘上，
+百万级语料不再顶内存。窗口集合也不留内存，回算时按下标从索引里读回来。
 """
 
 import hashlib
 import re
+from array import array
 from dataclasses import dataclass, field
+
+from features import index
 
 KEEP = re.compile(r"[^\W_]+", re.UNICODE)  # 只留字母、数字、汉字；下划线和标点都不要
 PRIME = 2147483647  # 2^31-1。哈希乘数压在这个宽度内，乘积超不过 2^63，numpy 不会静默溢出
@@ -127,18 +132,21 @@ class Result:
 
 
 class Duplicate:
-    """重复判定的索引。一次 weave 用一个实例。"""
+    """重复判定的索引。一次 weave 用一个实例。
 
-    def __init__(self, rule: Rule) -> None:
+    store 给 None 就纯内存；给了目录就把分带索引交给 features.index 落盘，
+    窗口集合跟着记录走，回算时按下标读回来，不留内存。hot 是热层容量，只有落盘时才起作用。
+    """
+
+    def __init__(self, rule: Rule, store=None, hot: int = index.HOT) -> None:
         self.rule = rule
         rule.rows = rule.rows or rows_for(rule.threshold, rule.count)  # 没给就按阈值推算
         if rule.count % rule.rows:
             raise ValueError("指纹长度要被段内行数整除")
         self.result = Result()
         self._sign = make_sign(rule.seed, rule.count)  # 提前选好实现，别在循环里反复判断
-        self._bands = {}  # 每段的特征 → 落在这个特征上的下标们
-        self._windows = []  # 每条已收样本的窗口集合，回算用
-        self._signs = []  # 每条已收样本的指纹，关掉回算时用它估
+        self._index = index.Index(store, hot=hot, key_size=rule.rows * 4)  # 段内的值拼成定长键，键 → 下标
+        self._taken = 0  # 已收样本数，同时也是下一条样本的下标
 
     def check(self, text: str) -> int:
         """返回命中的下标；没命中就入索引并返回 None。"""
@@ -146,31 +154,46 @@ class Duplicate:
         windows = set(values)  # 回算要的是集合
         sig = self._sign(values)  # 本条指纹
 
+        keys = list(self._bands(sig))  # 本条的分带键，查和登记都用它，只算一次
         hits = set()  # 候选下标
-        for band in range(self.rule.count // self.rule.rows):
-            start = band * self.rule.rows
-            key = bytes().join(sig[start + i].to_bytes(8, "big") for i in range(self.rule.rows))  # 这一段的值
-            hits.update(self._bands.get(key, ()))  # 这一段全等的历史下标
+        for key in keys:
+            hits.update(self._index.get(key))  # 这一段全等的历史下标
 
         best, hit = 0.0, None
-        for index in sorted(hits):  # 候选不多，逐个回算真实重合度
-            score = overlap(windows, self._windows[index]) if self.rule.exact else self._estimate(sig, self._signs[index])
+        for index_at in sorted(hits):  # 候选不多，逐个回算真实重合度
+            other_sig, other_windows = self._index.record(index_at)  # 对方的签名和窗口，盘上的读回来
+            score = overlap(windows, other_windows) if self.rule.exact else self._estimate(sig, other_sig)
             if score >= self.rule.threshold and score > best:  # 过线且比之前的更像
-                best, hit = score, index
+                best, hit = score, index_at
 
-        mine = len(self._signs)
-        self._signs.append(sig)  # 先登记本条，不管重不重复都要留在索引里做后续的比较源
-        self._windows.append(windows)
+        mine = self._taken
+        self._taken += 1
         if hit is not None:  # 判掉，只记不重复登记
             self.result.dropped += 1
             self.result.pairs.append((mine, hit, round(best, 4)))
             return hit
         self.result.kept += 1
-        for band in range(self.rule.count // self.rule.rows):  # 不重复才进索引
-            start = band * self.rule.rows
-            key = bytes().join(sig[start + i].to_bytes(8, "big") for i in range(self.rule.rows))
-            self._bands.setdefault(key, []).append(mine)
+        for key in keys:  # 不重复才进索引
+            self._index.put(key, mine, sig, windows)  # 记录随第一条键一起进索引
         return None
+
+    def save(self) -> None:
+        """落盘。纯内存时什么也不做。"""
+        if self._index.store is not None:
+            self._index.save()
+
+    def close(self) -> None:
+        """关掉索引占的文件。纯内存时什么也不做。"""
+        if self._index.store is not None:
+            self._index.close()
+
+    def _bands(self, sig: list):
+        """指纹切成段，每段的值按大端拼成一个定长键。逐个 to_bytes 太慢，走 array 一把过。"""
+        for band in range(self.rule.count // self.rule.rows):
+            start = band * self.rule.rows
+            block = array("I", sig[start : start + self.rule.rows])  # 指纹值都小于 2^31，4 字节够
+            block.byteswap()  # 统一成大端，换台机器也一样
+            yield block.tobytes()
 
     def _estimate(self, left: list, right: list) -> float:
         """不回算时用指纹估算：两个指纹一样的位置占多少。"""

@@ -39,6 +39,16 @@ FIELDS = {
         "path": str,  # 基座目录或权重文件
         "dtype": str,  # 载入权重时的精度
         "params_b": (int, float),  # 参数量（十亿），只给显存估算用；写 3 或 3.0 都行
+        "geometry": {
+            "d_model": int,  # 隐藏维度
+            "layers": int,  # 层数
+            "heads": int,  # 注意力头数
+            "d_head": int,  # 每头宽度，heads × d_head 要等于 d_model
+            "vocab": int,  # 词表大小
+            "max_seq_len": int,  # 最长序列
+            "rope_base": (int, float),  # RoPE 底数，写 10000 或 10000.0 都行
+            "tie": bool,  # 输出层是否复用词表权重
+        },
     },
     "data": {
         "files": list,  # 训练数据，weave 出来的 bolt.jsonl
@@ -61,6 +71,9 @@ FIELDS = {
         "max_grad_norm": float,  # 梯度裁剪阈值
         "seed": int,  # 随机种子，复现要用
         "grad_checkpoint": bool,  # 用时间换显存
+        "max_steps": int,  # 总步数，给了就不按 epochs 换算
+        "save_every": int,  # 每多少步存一档，0 只在收尾存
+        "log_every": int,  # 每多少步报一次 loss
         "lora": {
             "r": int,  # 低秩秩数，越大越占参数
             "alpha": int,  # 缩放分子，实际缩放是 alpha/r
