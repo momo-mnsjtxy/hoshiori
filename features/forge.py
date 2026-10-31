@@ -32,9 +32,15 @@ q6_k 的 6 位同样拆成低 4 位与高 2 位，是 ggml 的 Q6_K 超块结构
 补出来的零只占字节，读的一方按 dims 取前面的真值，尾巴丢掉。
 三维张量按最外层摊平成行，走同一条行量化路径，dims 原样写回。
 
+q6_k 的逐子块比例不是拍出来的数，是像上游 make_qx_quants 那样迭代搜出来的：
+初值仍是 -max/32，之后每轮在基准值附近摆一圈候选，量一次算一次 rmse，只留最好的，3 轮收住。
+标定见 tests/test_forge.py 里那份对照用例：同一份张量，迭代版的重构误差要比 -max/32 低一截。
+
 tokenizer 从基座目录的 tokenizer.json（或 tokenizer.model）导出词表与 merges，
 kv 缺哪一条、读不出来都记进 dropped：产物离开仓库能不能独立跑，看这一栏。
-onnx 走 torch.onnx.export（图 + 旁边的 safetensors 权重），mlx 走 mlx_lm.convert 子进程。
+onnx 走 torch.onnx.export 导整张因果图（词表 → N 层 → 归一 → 输出层），权重落旁边同名 safetensors，
+导完过 onnx.checker，再拿 onnxruntime 跟 torch 对拍 logits；mlx 走 mlx_lm.convert 子进程，
+Linux 上跑不了 mlx，就把命令、参数、临时目录布局打出来（--verbose），--mlx-print-only 只打印不执行。
 """
 
 import json
@@ -101,6 +107,30 @@ LAYER_NAMES = {
     "post_attention_layernorm.weight": "ffn_norm.weight",
 }
 LAYER = re.compile(r"model\.layers\.(\d+)\.(.+)")  # 认层号和后缀
+BLK = re.compile(r"blk\.(\d+)\.(.+)")  # onnx 那边反着认：ggml 名字拆回（层号, 后缀）
+
+# onnx 图里的参数名，由 NAMES / LAYER_NAMES 反推着写。point 是给 torch 模块挂参数用的名字。
+ONNX_NAMES = {
+    "token_embd.weight": "embed.weight",
+    "output_norm.weight": "norm.weight",
+    "output.weight": "head.weight",
+}
+ONNX_LAYER_NAMES = {
+    "attn_q.weight": "attn.q.weight",
+    "attn_k.weight": "attn.k.weight",
+    "attn_v.weight": "attn.v.weight",
+    "attn_output.weight": "attn.o.weight",
+    "ffn_gate.weight": "feed.gate.weight",
+    "ffn_up.weight": "feed.up.weight",
+    "ffn_down.weight": "feed.down.weight",
+    "attn_norm.weight": "attention_norm.weight",
+    "ffn_norm.weight": "feed_norm.weight",
+}
+ONNX_SEQ = 8  # 导出用的序列长度：图按这个长度固定下来，跑的时候也要喂同样长
+ONNX_RELATIVE_MAX = 1e-4  # 自检的 logits 相对误差上限，差过线就是图导坏了
+
+Q6_UNITS = (1.0, 0.125, 0.03125)  # 迭代的轮数与每轮候选的步长单位，一条一轮，先粗后细，照 make_qx_quants 的 3 轮
+Q6_STEPS = (-3, -2, -1, 1, 2, 3)  # 每轮的候选偏移，正负都有，避开 0（比例不动就白量一次）
 
 
 @dataclass
@@ -117,6 +147,8 @@ class Choice:
     name: str = "hoshiori-export"  # 写进 general.name
     dropped: list = field(default_factory=list)  # 映射不上、只能丢的项，跑完给人看
     tensors: dict = None  # 外面已经读过（比如合并完）就直接给数组，不再读盘
+    verbose: bool = False  # 把要执行的命令、参数、目录布局都打出来
+    mlx_print_only: bool = False  # mlx 只打印不执行，方便在 macOS 上照抄
 
 
 class Export:
@@ -161,66 +193,243 @@ class Export:
         return {"tensors": len(tensors), "bytes": self.choice.out.stat().st_size, "dropped": self.choice.dropped}
 
     def _onnx(self, tensors: dict) -> dict:
-        """导 ONNX：图只做词表投影，权重另外落一份 safetensors，dims 全在权重里。"""
+        """导 ONNX：整张因果图，权重落旁边，导完过 checker，再跟 torch 对拍 logits。"""
         import torch  # 只有这条路要 torch
         from safetensors.numpy import save_file  # 权重落旁边，onnx 文件里只存图
 
-        head = "token_embd.weight" if "token_embd.weight" in tensors else next(  # 前向用词表，没有就用第一个二维权
-            name for name, one in tensors.items() if one.ndim == 2
-        )
-        weights = {name: torch.from_numpy(np.ascontiguousarray(one.astype(np.float32))) for name, one in tensors.items()}  # torch 张量
-
-        class Project(torch.nn.Module):
-            """把词表挂成参数的空图：前向就是一次投影，够导出、够对拍。"""
-
-            def __init__(self) -> None:
-                super().__init__()
-                self.weight = torch.nn.Parameter(weights[head])  # 词表当参数挂住
-
-            def forward(self, ids):
-                return torch.nn.functional.embedding(ids, self.weight)  # 查表，batch × 1 个 id → 隐藏向量
-
+        config = json.loads(Path(self.choice.config).read_text(encoding="utf-8")) if self.choice.config else {}  # 结构配置，没有就全靠权重形状推
+        module, ids = onnx_graph(tensors, config, torch)  # 同构模块加一批假 token
         self.choice.out.parent.mkdir(parents=True, exist_ok=True)
         side = self.choice.out.with_suffix(".safetensors")  # 权重文件，和 onnx 同名不同后缀
-        save_file({name: one.numpy() for name, one in weights.items()}, str(side))  # 权重整份落盘
+        save_file({name: np.ascontiguousarray(one.astype(np.float32)) for name, one in tensors.items()}, str(side))  # 权重整份落盘
+        if self.choice.verbose:  # 把这张图的输入输出摆出来
+            print(f"onnx 输入 input_ids int64 {tuple(ids.shape)}，输出 logits，opset 14")
         # dynamo=False 走 TorchScript 那条老路：只要 torch 和 onnx，不额外要 onnxscript。
         torch.onnx.export(
-            Project().eval(),  # 模块本身
-            torch.zeros(1, 1, dtype=torch.long),  # 一批一个假 token id
+            module,  # 拼好的模块
+            ids,  # 一批一个，长度 ONNX_SEQ 的假 token
             str(self.choice.out),  # 图写到哪
-            input_names=["ids"],  # 输入名
-            output_names=["hidden"],  # 输出名
+            input_names=["input_ids"],  # 输入名
+            output_names=["logits"],  # 输出名，前向只出每个位置的词表打分
             opset_version=14,  # 14 是各家运行时都吃得下的版本
             dynamo=False,  # 走老 exporter，见上面那行
         )
+        import onnx  # 只有这条路要 onnx
+
+        onnx.checker.check_model(onnx.load(str(self.choice.out)))  # 图本身要合法，不合规当场报
+        error, note = verify_graph(self.choice.out, module, ids)  # 有 onnxruntime 就真跑一遍对数
+        if error is not None and error > ONNX_RELATIVE_MAX:  # 差过线就是图导坏了
+            fail("error", f"onnx 图和 torch 对不上，相对误差 {error:.2e}", hint="换 opset 或看这个算子有没有实现")
+        if self.choice.verbose:  # 自检结论也打出来
+            print(f"  {note}")
         kept = self.choice.out.stat().st_size + side.stat().st_size  # 图加权重一起算产出
-        return {"tensors": len(tensors), "bytes": kept, "dropped": self.choice.dropped + [f"权重另存 {side.name}，onnx 只存图"]}
+        return {"tensors": len(tensors), "bytes": kept, "dropped": self.choice.dropped + [f"权重另存 {side.name}，onnx 只存图", note]}
 
     def _mlx(self, tensors: dict) -> dict:
-        """导 MLX：交给 mlx_lm.convert 子进程，产物是一个目录。"""
+        """导 MLX：把 mlx_lm.convert 的命令、参数、临时目录布局打出来；--mlx-print-only 只打印不跑。"""
         from safetensors.numpy import save_file  # 合并过的权重得先落盘才交给子进程
 
         folder = self.choice.out  # mlx 的产物是目录，不是单文件
         folder.parent.mkdir(parents=True, exist_ok=True)
         source = Path(self.choice.source)  # 一般直接指基座目录
-        with tempfile.TemporaryDirectory() as scratch:  # 合并结果基座目录上没有，摊到临时目录去
-            if self.choice.tensors:  # 不摊的话转出来的是没合并的基座
-                source = Path(scratch)
-                save_file(tensors, str(source / "model.safetensors"))  # 合并后的权重
-                shutil.copy2(self.choice.config, source / "config.json")  # 结构配置照抄
+        merged = bool(self.choice.tensors)  # 合并过的权重基座目录上没有，只能摊到临时目录
+        scratch = Path(tempfile.mkdtemp(prefix="hoshiori-mlx-")) if merged else None  # 临时目录，打印时也得有个路径
+        command = [  # 要执行的命令，转换器只认整目录
+            sys.executable,
+            "-m",
+            "mlx_lm.convert",
+            "--input",
+            str(scratch if merged else source),
+            "--mlx-path",
+            str(folder),
+        ]
+        if self.choice.verbose or self.choice.mlx_print_only:  # 要在 macOS 上照抄的就是这几行
+            print(f"mlx 转换（产物目录 {folder}）：")
+            if merged:  # 合并过的权重要先摊到临时目录
+                print(f"  临时目录 {scratch}：写 model.safetensors、config.json、tokenizer*")
+            else:  # 直接读基座目录，不摊
+                print(f"  直接读基座目录 {source}，不摊临时目录")
+            print("  命令：" + " ".join(f'"{one}"' if " " in one else one for one in command))  # 路径带空格就加引号，照抄不会断
+        if self.choice.mlx_print_only:  # 只打印，不执行
+            if scratch:  # 打印用的临时目录顺手收掉
+                shutil.rmtree(scratch, ignore_errors=True)
+            return {"tensors": len(tensors), "bytes": 0, "dropped": self.choice.dropped + ["--mlx-print-only，只打印没执行"]}
+        try:
+            if scratch:  # 合并后的权重、结构配置、词表都摊到临时目录
+                save_file(tensors, str(scratch / "model.safetensors"))  # 合并后的权重
+                shutil.copy2(self.choice.config, scratch / "config.json")  # 结构配置照抄
                 words = Path(self.choice.tokenizer or self.choice.source)  # 词表跟着基座，没有就用权重目录
                 for one in ("tokenizer.json", "tokenizer.model", "tokenizer_config.json"):  # 词表也带上
                     if (words / one).exists():
-                        shutil.copy2(words / one, source / one)
-            run = subprocess.run(  # 转换器要整目录，指给它要转的那份
-                [sys.executable, "-m", "mlx_lm.convert", "--input", str(source), "--mlx-path", str(folder)],
-                capture_output=True,  # 输出自己收
-                text=True,
-            )
+                        shutil.copy2(words / one, scratch / one)
+            run = subprocess.run(command, capture_output=True, text=True)  # 输出自己收
+        finally:
+            if scratch:  # 成不成都把临时目录扫干净
+                shutil.rmtree(scratch, ignore_errors=True)
         if run.returncode:  # 转失败了把最后一段 stderr 摆出来
             fail("error", f"mlx 转换失败: {run.stderr.strip()[-400:]}", hint="单独跑一次 mlx_lm.convert 看完整输出")
         written = sum(one.stat().st_size for one in folder.rglob("*") if one.is_file())  # 目录里写出来的全部字节
         return {"tensors": len(tensors), "bytes": written, "dropped": self.choice.dropped}
+
+
+# --- onnx 整图 ---
+
+def onnx_local_name(name: str):
+    """ggml 名字换成 onnx 模块里的参数名。不进图的返回 None。"""
+    if name in ONNX_NAMES:  # 词表、输出层这种整名
+        return ONNX_NAMES[name]
+    found = BLK.fullmatch(name)  # 层内的按后缀
+    if found and found.group(2) in ONNX_LAYER_NAMES:
+        return f"layers.{found.group(1)}.{ONNX_LAYER_NAMES[found.group(2)]}"
+    return None
+
+
+def onnx_graph(tensors: dict, config: dict, torch):
+    """按权重里的名字拼一个和 features.model 同构的最小模块，权重真灌进去，返回（模块, 假 token）。
+
+    名字对不上 features.model 的张量（没映射过的）不进图，缺的张量保持随机初值（种子写死）。
+    这样只有几个张量的小权重也能导出一张完整图，全张量的权重导出来就是原样的那一摞。
+    几何从权重形状推，推不出来才看 config：形状是硬事实，config 只是补充。
+    """
+    from torch import nn  # 只有这条路要 nn
+
+    torch.manual_seed(0)  # 缺的张量按这个种子起，两次跑出来的图一样
+    found = {name: torch.from_numpy(np.ascontiguousarray(one.astype(np.float32))) for name, one in tensors.items()}  # 全换成 torch 张量
+
+    def pick(suffix: str):  # 第一个带这个层内后缀的张量，小权重常常只有第 0 层
+        return next((one for name, one in found.items() if BLK.fullmatch(name) and name.endswith(suffix)), None)
+
+    embed = found.get("token_embd.weight")  # 词表权重决定词表大小和隐藏维
+    hidden = int(embed.shape[1]) if embed is not None else int(config.get("hidden_size") or 128)  # 隐藏维
+    vocab = int(embed.shape[0]) if embed is not None else int(config.get("vocab_size") or 128)  # 词表大小
+    layers = 1 + max((int(one.split(".")[1]) for one in found if BLK.fullmatch(one)), default=-1)  # 层数按最大的层号推
+    layers = layers or int(config.get("num_hidden_layers") or 1)  # 一个层权重都没有才照配置，至少一层
+    query = pick("attn_q.weight")  # 注意力的输出宽度从 q_proj 的形状来
+    d_attn = int(query.shape[0]) if query is not None else hidden  # 没有 q_proj 就按隐藏维
+    gate = pick("ffn_gate.weight")  # 前馈的中间宽度从门控那一路来
+    wide = int(gate.shape[0]) if gate is not None else hidden * 4  # 没有就按惯例 4 倍
+    wanted = int(config.get("head_dim") or 0)  # 配置给的头宽优先，但得能整除且是偶数（rope 要成对转）
+    count = int(config.get("num_attention_heads") or 0)  # 配置给的头数
+    if not wanted and count and d_attn % count == 0:
+        wanted = d_attn // count  # 只给头数就自己除出来
+    head_dim = wanted if wanted and wanted % 2 == 0 and d_attn % wanted == 0 else (2 if d_attn % 2 == 0 else 1)  # 用不了就退到最保守的偶数
+    heads = d_attn // head_dim  # 头数由头宽定，保证 heads × head_dim 正好铺满
+    ctx = int(config.get("max_position_embeddings") or ONNX_SEQ)  # 上下文长度
+    seq = max(1, min(ONNX_SEQ, ctx))  # 输入长度不超出上下文
+    theta = float(config.get("rope_theta") or 10000.0)  # rope 底数
+    tie = "output.weight" not in found  # 没有独立输出层就拿词表权重转置当输出层
+
+    step = torch.arange(seq, dtype=torch.float32)  # 每个位置一个标量
+    pair = torch.arange(0, head_dim, 2, dtype=torch.float32)  # 每两维一组
+    angle = step[:, None] * (theta ** (-pair / head_dim))[None, :]  # 位置乘频率，得到每组的旋转角
+    cos, sin = angle.cos()[None, None], angle.sin()[None, None]  # 补批和头两维，好跟张量对齐
+
+    def rotate(x):  # 相邻两维当一对转，和 features/model.py 的 rotate 一个算法
+        if head_dim % 2:  # 头宽是奇数就配不成对，原样返回
+            return x
+        pairs = x.view(*x.shape[:-1], -1, 2)  # 头宽拆成 组 × 组内两值
+        left, right = pairs[..., 0], pairs[..., 1]  # 一组的两个分量
+        turned = torch.stack((-right, left), dim=-1)  # 旋转 90 度
+        return (pairs * cos.unsqueeze(-1) + turned * sin.unsqueeze(-1)).flatten(-2)  # 按角度混完拼回头宽
+
+    class RMS(nn.Module):
+        """按最后一维的均方根归一。eps 和 features/model.py 一样是 1e-6。"""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(hidden))  # 学出来的缩放，初始 1
+
+        def forward(self, x):
+            return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * self.weight  # 归一后乘回缩放
+
+    class Attention(nn.Module):
+        """多头因果注意力，参数名缩写成 q / k / v / o。"""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.q = nn.Linear(hidden, d_attn, bias=False)  # 查询
+            self.k = nn.Linear(hidden, d_attn, bias=False)  # 键
+            self.v = nn.Linear(hidden, d_attn, bias=False)  # 值
+            self.o = nn.Linear(d_attn, hidden, bias=False)  # 拼回隐藏维
+            self.mask = torch.triu(torch.ones(seq, seq, dtype=torch.bool), diagonal=1)  # 上三角遮掉未来
+
+        def forward(self, x):
+            batch, steps, _ = x.shape  # 批、序列、隐藏维
+            split = lambda part: part.view(batch, steps, heads, head_dim).transpose(1, 2)  # 拆成（批, 头, 序列, 头宽）
+            query, key, value = rotate(split(self.q(x))), rotate(split(self.k(x))), split(self.v(x))  # 查询键转位置，值不动
+            scores = (query @ key.transpose(-2, -1)) * (head_dim ** -0.5)  # 缩放点积
+            scores = scores.masked_fill(self.mask, float("-inf"))  # 因果遮罩
+            out = torch.softmax(scores, dim=-1) @ value  # 加权求和
+            return self.o(out.transpose(1, 2).reshape(batch, steps, -1))  # 头拼回去再投影
+
+    class Feed(nn.Module):
+        """前馈：门控乘值，再压回隐藏维。"""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.gate = nn.Linear(hidden, wide, bias=False)  # 门控那一路
+            self.up = nn.Linear(hidden, wide, bias=False)  # 值那一路
+            self.down = nn.Linear(wide, hidden, bias=False)  # 压回隐藏维
+
+        def forward(self, x):
+            return self.down(torch.nn.functional.silu(self.gate(x)) * self.up(x))  # 两路相乘就是门控
+
+    class Block(nn.Module):
+        """一层：两道 pre-norm 裹着注意力和前馈，各自带残差。"""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.attention_norm = RMS()  # 进注意力前先归一
+            self.attn = Attention()  # 注意力
+            self.feed_norm = RMS()  # 进前馈前再归一
+            self.feed = Feed()  # 前馈
+
+        def forward(self, x):
+            x = x + self.attn(self.attention_norm(x))  # 注意力这一跳
+            return x + self.feed(self.feed_norm(x))  # 前馈这一跳
+
+    class Graph(nn.Module):
+        """整摞：查表 → 逐层 → 收尾归一 → 输出层。"""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.embed = nn.Embedding(vocab, hidden)  # 词表
+            self.layers = nn.ModuleList([Block() for _ in range(layers)])  # 一摞层
+            self.norm = RMS()  # 收尾归一
+            self.head = None if tie else nn.Linear(hidden, vocab, bias=False)  # 独立输出层，共用时就是 None
+
+        def forward(self, ids):
+            x = self.embed(ids)  # 查表
+            for block in self.layers:  # 一层一层往下走
+                x = block(x)
+            x = self.norm(x)  # 收尾归一
+            return x @ self.embed.weight.T if self.head is None else self.head(x)  # 共用词表就直接拿转置投影
+
+    module = Graph().eval()  # 先搭好架子
+    state = {}  # 要灌进去的权重
+    for name, one in found.items():
+        local = onnx_local_name(name)  # 换算成模块里的参数名
+        if local is not None:  # 认不出的不进图
+            state[local] = one
+    module.load_state_dict(state, strict=False)  # 缺的保持随机初值
+    ids = (torch.arange(seq, dtype=torch.long) % vocab)[None]  # 一批一个，长度 seq 的假 token
+    return module, ids
+
+
+def verify_graph(path: Path, module, ids) -> tuple:
+    """有 onnxruntime 就真跑一遍对拍，返回（logits 相对误差, 说明）；没装返回（None, 说明）。"""
+    import torch
+
+    try:
+        import onnxruntime as runtime  # 只有这条路要它
+    except ImportError:  # 缺包只跳过数值对拍，checker 已经过过
+        return None, "没装 onnxruntime，数值没对拍（只过了 checker）"
+    session = runtime.InferenceSession(str(path), providers=["CPUExecutionProvider"])  # 只在本机 CPU 上跑
+    with torch.no_grad():  # 对拍不需要梯度
+        want = module(ids).numpy()  # torch 这一侧的结果
+    got = session.run(None, {"input_ids": ids.numpy()})[0]  # onnx 这一侧的结果
+    error = float(np.max(np.abs(got - want)) / max(float(np.max(np.abs(want))), 1e-12))  # 除以最大值算相对误差
+    return error, f"onnx 对拍 logits 相对误差 {error:.2e}（上限 {ONNX_RELATIVE_MAX:g}）"
 
 
 # --- 读权重 ---
@@ -561,20 +770,56 @@ def q5_k(rows: np.ndarray) -> bytes:
     return bytes(out)
 
 
-def q6_k(rows: np.ndarray) -> bytes:
-    """q6_k：每 256 个值一块，6 位有符号，低 4 位与高 2 位分开存。"""
+def q6_error(block: np.ndarray, scale: np.ndarray) -> np.ndarray:
+    """按一组比例量化再还原，返回每个子块的均方误差。"""
+    with np.errstate(divide="ignore", invalid="ignore"):  # 候选比例可能正好是 0（第一轮 offset -1），除法会喊一声
+        q = np.clip(np.rint(block / scale[:, None]), -32, 31)  # 6 位有符号就是 -32~31，inf 被 clip 成 31
+    return np.mean((q * scale[:, None] - block) ** 2, axis=1)  # 均方误差，比 rmse 少开一次方
+
+
+def q6_scales(block: np.ndarray) -> np.ndarray:
+    """给 16 个子块各挑一个比例：初值 -max/32，再迭代几轮候选，只留误差最低的。
+
+    初值和符号照 make_qx_quants 的约定：取子块绝对值最大的那个值取负再除 32。
+    取负是因为 q6_k 存的是有符号 6 位、范围 -32~31，正极值要落在负端那 32 格上。
+    上游在初值之后接着走几轮最小二乘；这里是同一个意思的直接搜法：每轮在基准值附近摆 ±1 到 ±3 个单位，
+    量一次算一次 rmse，只留最好的，3 轮收住（Q6_UNITS 一条一轮）。
+    单位要从 1 收到 1/8 再到 1/32，是因为子块之间的量级可能差几倍（只给细的走不出去），
+    最优也常常只离初值几个百分点（只给粗的收不准）。
+    实测：把极值正好压在 -32 上的 -max/32 对 rmse 偏大；极值不占主导的子块（极值被远值顶走、
+    或者斜坡这种整段都要精度）能降两成以上，普通正态张量也有几个百分点。对照用例见 tests/test_forge.py。
+    """
+    base = -block[np.arange(block.shape[0]), np.abs(block).argmax(1)] / 32  # 初值，子块极值取负除 32
+    best = base.copy()
+    best_err = q6_error(block, best)  # 初值的误差，后面只跟它比
+    for unit in Q6_UNITS:  # 一轮比一轮细
+        for offset in Q6_STEPS:  # 六个候选逐个量
+            candidate = best * (1 + offset * unit)  # 只缩放比例，不动值
+            error = q6_error(block, candidate)  # 这个候选的误差
+            better = error < best_err  # 逐子块比，好的就留下
+            best = np.where(better, candidate, best)
+            best_err = np.where(better, error, best_err)
+    return best
+
+
+def q6_k(rows: np.ndarray, refine: bool = True) -> bytes:
+    """q6_k：每 256 个值一块，6 位有符号，低 4 位与高 2 位分开存。
+
+    refine=False 退回旧的一拍脑袋版本（比例就是 -max/32，不迭代），对照用例拿它当基准。
+    """
     out = bytearray()
     for row in rows.astype(np.float32):  # 一行行来
         for start in range(0, row.size, 256):  # 256 个值一个超块
             block = row[start : start + 256].reshape(16, 16)  # 16 个子块，每块 16 个值
-            top = block[np.arange(16), np.abs(block).argmax(1)]  # 各子块绝对值最大的那个值，符号跟着它
-            scale = -top / 32  # 子块的最优比例，符号与极值相反，是 make_qx_quants 的约定
+            scale = q6_scales(block) if refine else -block[np.arange(16), np.abs(block).argmax(1)] / 32  # 子块比例
             peak = scale[int(np.abs(scale).argmax())]  # 超块里绝对值最大的那个比例，带符号
             if not peak:  # 整块全零，比例和量化值全留 0
                 out += bytes(208) + np.float16(0).tobytes()  # 128+64+16 个零加一个 0 比例
                 continue
             iscale = -128 / peak  # 比例之间换算用的倒数，照 ggml 的写法
             ls = np.clip(np.rint(iscale * scale), -128, 127).astype(np.int8)  # 子块比例相对超块取整，-128 也留着
+            flat = ls == 0  # 取整成 0 的子块
+            ls[flat & (scale != 0)] = np.where(scale[flat & (scale != 0)] > 0, 1, -1)  # 有值却落到 0 的给一格，不然整块被抹平
             d = np.float16(-peak / 128)  # 超块比例存 fp16，符号带着极值的方向
             q = np.zeros(256, dtype=np.int8)
             for j in range(16):  # 16 个子块逐个量化

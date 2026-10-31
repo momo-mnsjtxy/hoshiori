@@ -4,9 +4,14 @@
   from features.model import Geometry, Model
   geo = Geometry.from_recipe(recipe)      # 读 d_model、layers、heads、d_head、vocab、max_seq_len、rope_base、tie
   model = Model(geo)                      # 按几何搭架子，权重随机起
-  model.load(Path("ckpt"))                # 续训：把同名张量逐个灌回去
+  model.load(Path("ckpt"))                # 灌权重：把同名张量逐个灌回去
+  model.quantize("nf4")                   # 灌完之后、建优化器之前压成 4bit；返回真压了没有
   logits = model(ids)                     # 形状 (批, 序列, 词表)
   model.save(Path("out/1"))               # 存成 model.safetensors
+
+量化的时序不能换：先把权重灌进 fp32 的线层，再换层压下去；先压再灌的话，safetensors 里的 fp32 数字没地方放。
+压过之后量化层自己不带梯度，能训的只剩 LoRA 的 A/B；没挂件时训练器没有可训参数，命令层会拦。
+没有卡的时候量不了，quantize 保持 fp32 并 warn 一行，不崩。
 
 一层长这样：RMSNorm → 因果注意力（带 RoPE）→ 残差 → RMSNorm → 前馈 → 残差。
 整摞是 pre-norm，最后一道 RMSNorm 之后接输出层；tie 为真时输出层直接复用词表权重。
@@ -25,11 +30,14 @@ import torch
 from safetensors.torch import load_file, save_file
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
+from utils import logs
 from utils.fail import fail
 
 EPS = 1e-6  # RMSNorm 的分母下限，免得分母是 0 时除出无穷
 DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16, "nf4": torch.float32, "int8": torch.float32}
+QUANT = {"nf4", "int8"}  # 真要压下去的精度；其余是普通 dtype，压不压都不经过 bitsandbytes
 
 
 @dataclass
@@ -74,6 +82,29 @@ class RMSNorm(nn.Module):
         """归一并缩放，形状不变。"""
         scale = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + EPS)  # 均方根的倒数
         return x * scale * self.weight  # 乘回可学缩放
+
+
+def whole(one: torch.Tensor) -> torch.Tensor:
+    """把参数拼回整份、去梯度、落 CPU。fsdp2 下拿到的是分片，直接写盘只会得到一块。"""
+    return (one.full_tensor() if hasattr(one, "full_tensor") else one).detach().cpu().contiguous()  # full_tensor 会跨进程把分片拼回来
+
+
+def compute_dtype() -> torch.dtype:
+    """量化层内部算账用的类型：卡认 bf16 就用它，不认就 fp16。"""
+    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+
+def _quant(old: nn.Linear, precision: str, bnb, device: torch.device) -> nn.Module:
+    """照原层的形状造一个量化层，把冻结的权重搬过去；落到卡上那一步才真压。"""
+    if precision == "nf4":  # 4bit
+        new = bnb.nn.Linear4bit(old.in_features, old.out_features, bias=old.bias is not None, compute_dtype=compute_dtype(), quant_type="nf4")  # 4bit 线层，算的时候临时升到 compute_dtype
+        new.weight = bnb.nn.Params4bit(old.weight.detach(), requires_grad=False, quant_type="nf4")  # 先挂 fp 数据，交给后面的 .to 压成 4bit
+    else:  # int8
+        new = bnb.nn.Linear8bitLt(old.in_features, old.out_features, bias=old.bias is not None, has_fp16_weights=False)  # int8 线层
+        new.weight = bnb.nn.Int8Params(old.weight.detach(), requires_grad=False, has_fp16_weights=False)  # 同样等落卡时压，第一次前向才真做
+    if old.bias is not None:  # 有偏置就搬过去冻住
+        new.bias = nn.Parameter(old.bias.detach().clone(), requires_grad=False)
+    return new.to(device)  # 落卡即量化
 
 
 def rope_cache(length: int, width: int, base: float, dtype: torch.dtype) -> tuple:
@@ -176,6 +207,8 @@ class Model(nn.Module):
         super().__init__()
         self.geo = geo  # 几何留在身上，存盘和报数都要用
         self.dtype = geo.dtype(precision)  # 权重类型
+        self.grad_checkpoint = False  # 打开后前向分段重算，用时间换显存；训练器按配方设
+        self.quantized = False  # 压过量化层没有
         self.model = Core(geo, self.dtype)  # 主体
         self.lm_head = None if geo.tie else nn.Linear(geo.d_model, geo.vocab, bias=False)  # 不共用就单独一层
         for name, one in self.named_parameters():  # 残差两路的输出投影按层数缩小，深堆时激活不炸
@@ -185,7 +218,10 @@ class Model(nn.Module):
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         """前向，返回每个位置的词表打分。"""
-        x = self.model(ids)  # 走完整摞
+        if self.grad_checkpoint and self.training:  # 重算模式：中间激活不驻留，反向时把这一段前向再跑一遍
+            x = checkpoint(self.model, ids, use_reentrant=False)  # 只留输入和输出
+        else:  # 常规一次过
+            x = self.model(ids)  # 走完整摞
         if self.lm_head is None:  # 共用词表就直接拿词表权重做输出
             return x @ self.model.embed_tokens.weight.T  # (批, 序列, 词表)
         return self.lm_head(x)  # 独立输出层
@@ -194,13 +230,19 @@ class Model(nn.Module):
         """参数量，只含真正占参数的张量。"""
         return sum(one.numel() for one in self.parameters())  # 逐个累加
 
-    def save(self, folder: Path) -> None:
-        """把权重写成 folder/model.safetensors。共用的输出层不单独存。"""
-        folder.mkdir(parents=True, exist_ok=True)  # 目录没建就先建
-        state = {name.replace(".base.weight", ".weight"): one.detach().cpu().contiguous() for name, one in self.state_dict().items()}  # 全拷到 CPU；挂了低秩时把 base 那一层去掉
+    def save(self, folder: Path, write: bool = True) -> dict:
+        """把权重写成 folder/model.safetensors。共用的输出层不单独存。
+
+        write 为假时只把整份张量拼出来不落盘：fsdp2 下拼分片是跨进程的，每个进程都得走一遍，
+        但同一份文件只让 0 号写。返回拼好的那一份，调用方要用还能用。
+        """
+        state = {name.replace(".base.weight", ".weight"): whole(one) for name, one in self.state_dict().items()}  # 全拷到 CPU；挂了低秩时把 base 那一层去掉
         if self.geo.tie:  # 共用时 lm_head 就是词表的副本
             state.pop("lm_head.weight", None)  # 删掉副本，载入时会补回来
-        save_file(state, str(folder / "model.safetensors"))  # 整份写出去
+        if write:  # 只有 0 号真写文件
+            folder.mkdir(parents=True, exist_ok=True)  # 目录没建就先建
+            save_file(state, str(folder / "model.safetensors"))  # 整份写出去
+        return state
 
     def load(self, source: Path) -> None:
         """从文件或目录里读同名张量灌回来。名字缺一个就报错，不静默跳过。"""
@@ -215,6 +257,30 @@ class Model(nn.Module):
                 if found is None:  # 确实缺
                     fail("input", f"权重里没有 {name}", where=str(source), hint="几何要和存盘那份一致")
                 tensor.copy_(found.to(tensor.dtype))  # 灌回去
+
+    def quantize(self, precision: str, device: torch.device = None) -> bool:
+        """把所有权重线层换成 bitsandbytes 的量化层，返回真压了没有。
+
+        device 不给就按当前那张卡；测试里在无卡机器上灌 cpu 也能走完这条路径。
+        压完把自己身上所有参数冻住：量化层没有梯度，其余参数在 QLoRA 里也不该动。
+        """
+        if precision not in QUANT:  # fp32 / bf16 / fp16 / fp8 不走这条路，本来就已经是真类型
+            return False
+        if device is None and not torch.cuda.is_available():  # 没卡就没地方放量化层
+            logs.warn("spin", "量化要卡，按 fp32 跑", precision=precision)
+            return False
+        device = device or torch.device("cuda", torch.cuda.current_device())  # 默认落到当前那张卡
+        import bitsandbytes as bnb  # 真走量化才导，没装也不影响 fp32 训练
+        for name, one in list(self.named_modules()):  # 名字连着父模块，才知道换掉的是谁的哪个属性
+            if not isinstance(one, nn.Linear):  # 只换权重线层，归一和词表不动
+                continue
+            parent = self.get_submodule(name.rpartition(".")[0]) if "." in name else self  # 父模块；lm_head 没有点就挂在模型上
+            setattr(parent, name.rpartition(".")[2], _quant(one, precision, bnb, device))  # 就地换掉那一层
+        self.to(device)  # 词表、归一这些没量的参数也搬上卡
+        for one in self.parameters():  # 量化层自己没梯度，其余也一律冻上
+            one.requires_grad_(False)
+        self.quantized = True
+        return True
 
     def config(self, precision: str) -> dict:
         """给导出和排查用的结构描述，字段名照 HF 的 config.json。"""

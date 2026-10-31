@@ -18,6 +18,7 @@ import torch
 from safetensors.torch import load_file, save_file
 from torch import nn
 
+from features.model import whole
 from utils.fail import fail
 
 SUFFIX_A, SUFFIX_B = ".lora_A.weight", ".lora_B.weight"  # 一对低秩矩阵的名字尾巴，merge.py 按它剥基座名
@@ -82,23 +83,26 @@ def trainable(model: nn.Module) -> list:
     return [one for one in model.parameters() if one.requires_grad]
 
 
-def save(model: nn.Module, folder: Path, base: Path = None) -> None:
+def save(model: nn.Module, folder: Path, base: Path = None, write: bool = True) -> dict:
     """只把 A/B 存成 folder/adapter.safetensors，旁边写一份 adapter_config.json。
 
     base 是挂载的基座目录，写进配置给 forge 合并用；从随机权重起的就是空串。
+    write 为假时只拼张量不落盘，理由同 Model.save：fsdp2 下拼分片每个进程都得走一遍。
     """
     import json
 
     found = layers(model)  # 全部挂件
     state = {}  # 要落盘的张量
     for name, one in found.items():  # 一层的 A、B 配成一对
-        state[name + ".weight" + SUFFIX_A] = one.A.detach().cpu().contiguous()  # 基座名 + lora_A
-        state[name + ".weight" + SUFFIX_B] = one.B.detach().cpu().contiguous()  # 基座名 + lora_B
-    folder.mkdir(parents=True, exist_ok=True)  # 目录先建
-    save_file(state, str(folder / "adapter.safetensors"))  # 一对对写出去
-    first = next(iter(found.values()))  # 取一层问形状，配置里要写清维度
-    config = {"r": first.r, "lora_alpha": round(first.scale * first.r, 6), "target_modules": list(found), "peft_type": "LORA", "base_model_name_or_path": str(base or "")}  # merge.py 读 r 和 lora_alpha，forge 读基座路径
-    (folder / "adapter_config.json").write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")  # 配置跟权重放一起
+        state[name + ".weight" + SUFFIX_A] = whole(one.A)  # 基座名 + lora_A
+        state[name + ".weight" + SUFFIX_B] = whole(one.B)  # 基座名 + lora_B
+    if write:  # 只有 0 号真写文件
+        folder.mkdir(parents=True, exist_ok=True)  # 目录先建
+        save_file(state, str(folder / "adapter.safetensors"))  # 一对对写出去
+        first = next(iter(found.values()))  # 取一层问形状，配置里要写清维度
+        config = {"r": first.r, "lora_alpha": round(first.scale * first.r, 6), "target_modules": list(found), "peft_type": "LORA", "base_model_name_or_path": str(base or "")}  # merge.py 读 r 和 lora_alpha，forge 读基座路径
+        (folder / "adapter_config.json").write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")  # 配置跟权重放一起
+    return state
 
 
 def load(model: nn.Module, source: Path) -> None:

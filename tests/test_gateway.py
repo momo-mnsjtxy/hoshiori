@@ -85,6 +85,13 @@ def test_chat_answers_string(alive):
     assert body["choices"][0]["message"]["content"] == "你好"
 
 
+def stream(url, body=None, token=None):
+    """打一条流式聊天，返回状态码和切成事件行的原文。空行只是块分隔，不看。"""
+    asked = {"model": "echo-model", "messages": [{"role": "user", "content": "数到十"}], "stream": True, **(body or {})}
+    status, raw, headers = post(url, "/v1/chat/completions", asked, token)
+    return status, [line for line in raw.splitlines() if line.strip()], headers
+
+
 def test_chat_streams_sse(alive):
     _, url = alive
     status, body, _ = post(url, "/v1/chat/completions", {"model": "echo-model", "messages": [{"role": "user", "content": "数到十"}], "stream": True})
@@ -94,6 +101,38 @@ def test_chat_streams_sse(alive):
     assert lines[-1] == "data: [DONE]"                                 # 末尾必须是结束标记
     said = "".join(json.loads(line[6:])["choices"][0]["delta"].get("content", "") for line in lines[:-1])
     assert said == "数到十"                                               # 拼回来就是原文
+
+
+def test_stream_without_stream_options_keeps_shape(alive):
+    """不给 stream_options 时形状照旧：一块 usage 都不多，最后一块是空 delta 加 stop。"""
+    _, url = alive
+    status, lines, _ = stream(url)
+    assert status == 200
+    assert lines[-1] == "data: [DONE]"
+    blocks = [json.loads(line[6:]) for line in lines[:-1]]              # 结束标记之前都是正文块
+    assert all("usage" not in block for block in blocks)                # 没要多就不给用量
+    last = blocks[-1]["choices"][0]
+    assert last["delta"] == {}                                          # 最后一块不带增量
+    assert last["finish_reason"] == "stop"                              # 只报停止原因
+
+
+def test_stream_include_usage_adds_block_before_done(alive):
+    """要了 include_usage：[DONE] 前补一块 choices 为空的块，带完整用量，并标出用量来源。"""
+    _, url = alive
+    status, lines, headers = stream(url, {"stream_options": {"include_usage": True}})
+    assert status == 200
+    assert headers["x-usage-source"] == "estimate"                      # 没有分词器时只可能是估的
+    assert lines[-1] == "data: [DONE]"
+    used = json.loads(lines[-2][6:])                                    # 倒数第二条就是用量那一块
+    assert used["choices"] == []                                        # 用量块没有增量
+    assert used["object"] == "chat.completion.chunk"                    # 还是流式块的形状
+    assert used["id"] == json.loads(lines[0][6:])["id"]                 # 和正文块同一个回执 id
+    assert used["usage"] == {"prompt_tokens": 3, "completion_tokens": 3, "total_tokens": 6}  # 问 3 字回 3 字，估算口径
+    stop = json.loads(lines[-3][6:])["choices"][0]                      # 用量块紧接在 stop 块后面
+    assert stop["finish_reason"] == "stop"
+    assert all("usage" not in json.loads(line[6:]) for line in lines[:-2])  # 只有那一块带用量
+    said = "".join(json.loads(line[6:])["choices"][0]["delta"].get("content", "") for line in lines[:-3])
+    assert said == "数到十"                                               # 正文拼回来还是原文
 
 
 def test_limit_returns_429():
@@ -153,6 +192,26 @@ def test_bearer_scheme_ignores_case(guarded):
     with pytest.raises(urllib.error.HTTPError) as bad:
         urllib.request.urlopen(ask_, timeout=5)
     assert bad.value.code == 401
+
+
+def test_token_with_spaces_survives_header():
+    """令牌自己带空格：方案名之后整段都算令牌，少了后面一截就不算同一个令牌。"""
+    gate = Gateway("echo-model", backend="echo", token="a b c", limit=60, log=None)  # 令牌里有空格
+    server = gate.start(0, in_thread=True)
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        status, body, _ = ask(url, "a b c")     # "Bearer a b c" 整段都是令牌
+        assert status == 200
+        assert body["choices"][0]["message"]["content"] == "你好"
+        status, _, _ = ask(url, "a b")          # 只切到第一个空格就断的老写法会认错这个
+        assert status == 401
+        ask_ = urllib.request.Request(url + "/v1/models", headers={"Authorization": "Bearer   a b c"})  # 方案后多留空格也认
+        with urllib.request.urlopen(ask_, timeout=5) as back:
+            assert back.status == 200
+    finally:
+        server.shutdown()
+        server.server_close()
+        gate.close()
 
 
 # --- 用量 ---

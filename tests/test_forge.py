@@ -50,6 +50,52 @@ def one_tensor(tmp_path, name, array):
     return folder
 
 
+def full_ckpt(tmp_path):
+    """造一套几何自洽的小权重：层数、头数、头宽、前馈宽度、输出层全在，够导一张完整的因果图。
+
+    heads × head_dim 正好等于 hidden，和 features.model 的约束一致，所以这张图的形状是真结构。
+    """
+    folder = tmp_path / "full"
+    folder.mkdir()
+    rng = np.random.default_rng(31)
+    hidden, heads, head_dim, layers, vocab, wide = 32, 2, 16, 2, 32, 64
+
+    def one(*shape):  # 一份小方差权重，量级和真训练出来的差不多
+        return (rng.normal(size=shape) * 0.2).astype(np.float32)
+
+    tensors = {"model.embed_tokens.weight": one(vocab, hidden), "model.norm.weight": one(hidden)}
+    tensors["lm_head.weight"] = one(vocab, hidden)  # 不共用词表的输出层
+    for index in range(layers):  # 每层的九个张量一个不少
+        at = f"model.layers.{index}."
+        tensors[at + "self_attn.q_proj.weight"] = one(hidden, hidden)
+        tensors[at + "self_attn.k_proj.weight"] = one(hidden, hidden)
+        tensors[at + "self_attn.v_proj.weight"] = one(hidden, hidden)
+        tensors[at + "self_attn.o_proj.weight"] = one(hidden, hidden)
+        tensors[at + "mlp.gate_proj.weight"] = one(wide, hidden)
+        tensors[at + "mlp.up_proj.weight"] = one(wide, hidden)
+        tensors[at + "mlp.down_proj.weight"] = one(hidden, wide)
+        tensors[at + "input_layernorm.weight"] = one(hidden) + 1
+        tensors[at + "post_attention_layernorm.weight"] = one(hidden) + 1
+    save_file(tensors, str(folder / "model.safetensors"))
+    (folder / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "hoshiori",
+                "hidden_size": hidden,
+                "num_hidden_layers": layers,
+                "num_attention_heads": heads,
+                "head_dim": head_dim,
+                "vocab_size": vocab,
+                "max_position_embeddings": 16,
+                "rope_theta": 10000.0,
+                "tie_word_embeddings": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return folder
+
+
 def tokenizer_files(folder):
     """给权重目录补一份词表和一份特殊 token 配置。"""
     (folder / "tokenizer.json").write_text(
@@ -149,6 +195,28 @@ def run_forge(tmp_path, *extra):
     if not (tmp_path / "ckpt").exists():
         ckpt(tmp_path)
     return main.run(["forge", str(warp(tmp_path)), *extra])
+
+
+def decode_q6(data: bytes, rows: int) -> np.ndarray:
+    """按 q6_k 的字节布局解开，返回 (行, 256) 的还原值。低 4 位、高 2 位、子块比例三处都要拼回来。"""
+    out = np.zeros((rows, 256))
+    for index in range(rows):  # 一块 210 字节，一行一块
+        block = data[index * 210 : (index + 1) * 210]
+        ql, qh = block[:128], block[128:192]  # 低 4 位与高 2 位
+        scales = np.frombuffer(block[192:208], dtype=np.int8)  # 16 个 int8 子块比例
+        d = struct.unpack("<e", block[208:210])[0]  # 一个 fp16 超块比例
+        for half in range(2):  # 两个 128 值的大半块
+            for l in range(32):
+                at = half * 128 + l
+                pair = [  # 每个字节里摆着 4 个值的一片，照 ggml 的排法解
+                    (ql[half * 64 + l] & 0xF) | ((qh[half * 32 + l] & 3) << 4),
+                    (ql[half * 64 + 32 + l] & 0xF) | (((qh[half * 32 + l] >> 2) & 3) << 4),
+                    (ql[half * 64 + l] >> 4) | (((qh[half * 32 + l] >> 4) & 3) << 4),
+                    (ql[half * 64 + 32 + l] >> 4) | (((qh[half * 32 + l] >> 6) & 3) << 4),
+                ]
+                for k in range(4):  # 第 k 片对应 at + 32k
+                    out[index, at + 32 * k] = d * float(scales[half * 8 + 2 * k + l // 16]) * (pair[k] - 32)
+    return out
 
 
 # ---------- GGUF 写入与回读 ----------
@@ -265,6 +333,25 @@ def test_q6_k_block_layout(tmp_path):
             for k in range(4):  # 第 k 片对应 at + 32k
                 restored[at + 32 * k] = d * float(scales[half * 8 + 2 * k + l // 16]) * (pair[k] - 32)
     assert np.abs(restored - ramp.ravel()).max() < 0.02  # 6 位在 1/32 步长量级
+
+
+def test_q6_k_rmse_iteration_beats_approx():
+    """同一份随机张量：rmse 迭代版的重构误差要比 -max/32 近似版低 15% 以上。
+
+    张量造的是「一条窄带 + 一成远值」：远值把 -max/32 顶得很大，窄带那 15 个值全被压成一格；
+    rmse 迭代会把比例缩下来、让远值去截断，窄带才回得来。这是子块内极值不占主导时最吃亏的样子。
+    """
+    rng = np.random.default_rng(57)
+    want = (rng.normal(0, 0.02, size=(8, 256)) + 1.37).astype(np.float32)  # 窄带
+    want[rng.random((8, 256)) < 0.1] = 3.0  # 一成的远值，把极值抬走
+    approx = decode_q6(forge.q6_k(want, refine=False), 8)  # 旧的一拍脑袋版
+    refined = decode_q6(forge.q6_k(want), 8)  # rmse 迭代版
+
+    def error(got):  # 还原值和原值的 rmse，越小越好
+        return float(np.sqrt(np.mean((got - want) ** 2)))
+
+    assert error(refined) <= error(approx) * 0.85  # 低 15% 以上；实测这一份是 25% 出头
+    assert error(refined) < error(approx)  # 至少方向对，别出现偶然相等
 
 
 def test_q5_k_m_lifts_output_layers(tmp_path):
@@ -509,16 +596,45 @@ def test_onnx_needs_package(tmp_path, monkeypatch):
     assert run_forge(tmp_path, "--out", str(tmp_path / "o"), "--format", "onnx") == 4
 
 
-def test_onnx_writes_graph_and_weights(tmp_path):
-    """装得上 torch 和 onnx 时，图要过 checker，权重落旁边同名文件。"""
+def test_onnx_writes_full_graph(tmp_path):
+    """整张因果图要能导出来：checker 过、输入输出对、权重落旁边同名文件。"""
     pytest.importorskip("torch")
     onnx = pytest.importorskip("onnx")
+    folder = full_ckpt(tmp_path)
     out = tmp_path / "m.onnx"
-    assert run_forge(tmp_path, "--out", str(out), "--format", "onnx") == 0
+    report = Export(Choice(source=folder, out=out, format="onnx", config=folder / "config.json")).run()
     model = onnx.load(str(out))
     onnx.checker.check_model(model)  # 图本身要合法
-    assert [one.name for one in model.graph.input] == ["ids"]  # 只有一个 token id 输入
+    assert [one.name for one in model.graph.input] == ["input_ids"]  # 输入只有一个 token id
+    assert [one.name for one in model.graph.output] == ["logits"]  # 输出是每个位置的词表打分
+    nodes = {one.op_type for one in model.graph.node}  # 图里真的有点积、softmax、查表这些算子
+    assert {"MatMul", "Softmax", "Gather"} <= nodes
+    assert len(model.graph.input) == 1  # past 是可省的，不塞输入
     assert sorted(load_file(str(tmp_path / "m.safetensors")))  # 权重整份落在旁边
+    assert any("onnx 对拍" in one for one in report["dropped"])  # 自检结论进了出账
+
+
+def test_onnx_graph_matches_torch_logits(tmp_path):
+    """整图导出的 logits 要和 torch 那边的 logits 对得上，相对误差 < 1e-4。"""
+    torch = pytest.importorskip("torch")
+    runtime = pytest.importorskip("onnxruntime")
+    import onnx
+
+    folder = full_ckpt(tmp_path)
+    out = tmp_path / "m.onnx"
+    Export(Choice(source=folder, out=out, format="onnx", config=folder / "config.json")).run()
+    onnx.checker.check_model(onnx.load(str(out)))
+    # 重新按同一份权重把图搭一遍，拿来跟 onnx 的产物对数
+    tensors = forge.rename(forge.load(folder), [])
+    config = json.loads((folder / "config.json").read_text(encoding="utf-8"))
+    module, ids = forge.onnx_graph(tensors, config, torch)
+    with torch.no_grad():
+        want = module(ids).numpy()
+    session = runtime.InferenceSession(str(out), providers=["CPUExecutionProvider"])
+    got = session.run(None, {"input_ids": ids.numpy()})[0]
+    assert want.shape == got.shape == (1, 8, 32)  # 一批、8 步、词表 32
+    error = float(np.max(np.abs(got - want)) / float(np.max(np.abs(want))))  # 相对最大值
+    assert error < 1e-4  # 导出来的图算得对，不是只是长得像
 
 
 def test_mlx_needs_package(tmp_path, monkeypatch):
@@ -526,6 +642,21 @@ def test_mlx_needs_package(tmp_path, monkeypatch):
     real = importlib.util.find_spec
     monkeypatch.setattr(importlib.util, "find_spec", lambda name: None if name == "mlx_lm" else real(name))
     assert run_forge(tmp_path, "--out", str(tmp_path / "o"), "--format", "mlx") == 4
+
+
+def test_mlx_print_only(tmp_path, monkeypatch, capsys):
+    """--mlx-print-only 只把命令、参数、目录布局打出来，不跑子进程，也不要求装 mlx_lm。"""
+    real = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None if name == "mlx_lm" else real(name))
+    out = tmp_path / "mlx"
+    assert run_forge(tmp_path, "--out", str(out), "--format", "mlx", "--mlx-print-only") == 0
+    printed = capsys.readouterr().out
+    assert "mlx_lm.convert" in printed  # 命令名打出来了，能照抄
+    assert "--mlx-path" in printed  # 参数也打出来了
+    assert str(out) in printed  # 产物目录写清了
+    assert str(tmp_path / "ckpt") in printed  # 输入从哪个基座目录来也写清了
+    assert "print-only" in printed  # 出账里点明这次没执行
+    assert not list(out.glob("*.safetensors"))  # 一个文件都没真转出来
 
 
 def test_mlx_runs_convert(tmp_path, monkeypatch):

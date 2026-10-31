@@ -49,6 +49,8 @@ FIELDS = {
             "rope_base": (int, float),  # RoPE 底数，写 10000 或 10000.0 都行
             "tie": bool,  # 输出层是否复用词表权重
         },
+        "tokenizer": str,  # 词表文件，给了就按它编，没给按字节取模兜底
+        "teacher": str,  # distill 的教师权重
     },
     "data": {
         "files": list,  # 训练数据，weave 出来的 bolt.jsonl
@@ -71,9 +73,15 @@ FIELDS = {
         "max_grad_norm": float,  # 梯度裁剪阈值
         "seed": int,  # 随机种子，复现要用
         "grad_checkpoint": bool,  # 用时间换显存
+        "health": (str, {"stop", "warn"}),  # 指标坏了怎么办：stop 存一档再退（退出码 1）/ warn 只喊一声
         "max_steps": int,  # 总步数，给了就不按 epochs 换算
         "save_every": int,  # 每多少步存一档，0 只在收尾存
         "log_every": int,  # 每多少步报一次 loss
+        "group": int,  # 对齐任务一组几条候选
+        "beta": float,  # DPO 的 KL 强弱
+        "clip_ratio": float,  # GRPO / PPO 的裁剪区间
+        "kl_coef": float,  # GRPO 的 KL 罚系数
+        "temperature": float,  # distill 的温度
         "lora": {
             "r": int,  # 低秩秩数，越大越占参数
             "alpha": int,  # 缩放分子，实际缩放是 alpha/r
@@ -107,7 +115,7 @@ def load(path: Path, seen: tuple = ()) -> dict:
         return data
     parent_path = (path.parent / parent).resolve()  # 按当前文件的位置找父配方，换目录启动也找得到
     if not parent_path.exists():
-        fail("input", f"extends 指的父配方不存在: {parent}", where=str(path), hint=f"放到 {parent_path}，或�� extends")
+        fail("input", f"extends 指的父配方不存在: {parent}", where=str(path), hint=f"放到 {parent_path}，或改 extends")
     return _merge(load(parent_path, (*seen, path)), data)
 
 
@@ -132,6 +140,10 @@ def check(data: dict) -> None:
     train = data.get("train") or {}  # 没写就当空，下面逐项看
     if train.get("strategy") in {"ddp", "fsdp2"} and not train.get("devices"):
         fail("schema", "多卡不给 devices 就不知道该用哪几张", where="train.devices", hint="例: [0, 1]")
+    if data.get("task") == "distill" and not (data.get("model") or {}).get("teacher"):
+        fail("schema", "蒸馏要给 model.teacher 指教师权重", where="model.teacher")
+    if data.get("task") in {"grpo", "rloo", "ppo"} and (data.get("train") or {}).get("group", 0) and (data.get("train") or {})["group"] < 2:
+        fail("schema", "组相对任务一组至少要两条", where="train.group", hint="常见 4 到 8")
     if (data.get("forge") or {}).get("formats") and not (data.get("forge") or {}).get("out"):
         fail("schema", "给了导出格式就要给导出目录", where="forge.out", hint="例: out/gguf")
 

@@ -5,12 +5,14 @@
   ori forge sft.warp.yaml --out out/full.gguf --format gguf            # 不量化，fp16
   ori forge sft.warp.yaml --out out --format gguf --quant q5_k_m --quant q8_0
   ori forge sft.warp.yaml --out out/merged --format safetensors
-  ori forge sft.warp.yaml --out out/m.onnx --format onnx     # 图 + 旁边同名 .safetensors 权重
+  ori forge sft.warp.yaml --out out/m.onnx --format onnx     # 整张因果图 + 旁边同名 .safetensors 权重
   ori forge sft.warp.yaml --out out/mlx --format mlx         # 产物是目录，交给 mlx_lm.convert
+  ori forge sft.warp.yaml --out out --format mlx --mlx-print-only --verbose   # 只打印要跑的命令，在 macOS 上照抄
 
 检查只在这里做一次：格式认不认、量化档认不认、--out 给没给、权重在不在、后端包在不在。
 剩下的转换全交给 features.forge，命令层不碰字节。
-onnx 要 torch 和 onnx，mlx 要 mlx_lm，缺了就按缺包报 exit 4，说清缺哪个，别硬转出来骗人。
+onnx 要 torch 和 onnx，mlx 要 mlx_lm，缺了就按缺包报 exit 4，说清缺哪个，别硬转出来骗人；
+--mlx-print-only 只打印命令，所以走这条路时 mlx_lm 缺了也照过。
 配方的 model.path 指向带 adapter_config.json 的目录时，先合并再导，合并交给 features.merge。
 """
 
@@ -44,6 +46,8 @@ def command(args) -> int:
         fail("input", f"不认识的格式: {', '.join(unknown)}", hint="可用 " + " / ".join(sorted(FORMATS)))
 
     for one in formats:  # 后端缺包先拦，别导完一半才炸
+        if one == "mlx" and args.mlx_print_only:  # 只打印时不用真跑 mlx_lm
+            continue
         for need in BACKEND.get(one, ()):  # 这个格式要的包一个个看
             if importlib.util.find_spec(need) is None:  # 缺哪个就报哪个
                 fail("missing", f"转 {one} 要 {need} 包", hint=f"pip install {need}")
@@ -70,6 +74,8 @@ def command(args) -> int:
             with_tokenizer=not args.no_tokenizer,  # --no-tokenizer 时只出权重
             name=data.get("name") or at.stem,  # 名字进 general.name
             tensors=tensors,  # 合并过就直接给数组，没合并就是 None
+            verbose=args.verbose,  # --verbose 把命令、参数、目录布局打出来
+            mlx_print_only=args.mlx_print_only,  # --mlx-print-only 只打印不执行
         )
         report = forge.Export(job).run()  # 转换交给 features
         print(f"{fmt} {quant} → {at}（{report['bytes']} 字节，{report['tensors']} 个张量）")

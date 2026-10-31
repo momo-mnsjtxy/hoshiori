@@ -8,3 +8,6 @@ imported/
 build/
 dist/
 .pytest_cache/
+.probe/
+.bench/
+.work/

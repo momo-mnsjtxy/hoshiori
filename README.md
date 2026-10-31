@@ -13,7 +13,7 @@
 | 能力 | 状态 |
 | --- | --- |
 | `ori weave`：收 JSONL/TXT/目录/stdin/链接，规范化、MinHash 去重（索引可落盘分片）、指纹、数据集卡 | 可用 |
-| `ori spin`：真训练，自搭 decoder-only + LoRA、分块交叉熵、断点续训 | 可用（CPU / 单卡，nf4 与多卡待接） |
+| `ori spin`：真训练，七种任务族（sft/pretrain/distill/dpo/grpo/ppo/rloo）、LoRA、nf4/int8、ddp/fsdp2、健康停止、断点续训 | 可用 |
 | `ori import lmlab`：把 lmlab 的 yaml 转成配方，逐条差异清单 | 可用 |
 | `ori validate`：配方校验，报错指到字段并给候选 | 可用 |
 | `ori judge`：跑评测套件、三格式报告、对基线走回归门，掉分退出 1 | 可用 |
@@ -43,7 +43,8 @@ ori weave --in 你的数据.jsonl --out bolt --name zh-mix --license cc0
 # 2. 写配方：extends 继承、白名单校验
 ori validate sft.warp.yaml
 
-# 3. 出账，看显存放不放得下
+# 3. 学一个词表，再出账看显存放不放得下
+ori vocab --in bolt/bolt.jsonl --out vocab.json --size 32000
 ori spin sft.warp.yaml --dry-run
 
 # 4. 从别家迁过来

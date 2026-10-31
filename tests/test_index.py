@@ -1,4 +1,4 @@
-"""落盘索引的测试：三层各自能查、热层满了会挤、片会滚、落盘能读回来、两种模式判定一样。
+"""落盘索引的测试：三层各自能查、热层满了会挤、片会滚、转冷是流式的、落盘能读回来、两种模式判定一样。
 
 约定：用 8 字节的假键和 3 个假窗口，不跑真实的指纹，省时间；
 分带键的真实长度由 features/duplicate.py 按段内行数给。
@@ -78,15 +78,36 @@ def test_warm_rolls_new_shard(tmp_path):
     assert sum(shard.count for shard in index._warm) + len(index._live) == 12  # 记录不丢
 
 
-def test_cold_keeps_first_key_only(tmp_path):
+def test_cold_keeps_every_key(tmp_path):
+    index = Index(tmp_path, hot=1, per_shard=2, warm=2, key_size=8)
+    fill(index, 40, bands=3)  # 四十条三条键：桶只有 256 个，必然有记录几条键落进同一个桶
+    assert index._cold  # 温层攒够上限后最老的片转冷
+    for sample in range(40):  # 每一条的每一条键都要撞得上，不能只撞第一条
+        for band in range(3):
+            assert index.get(keyed(sample, band)) == [sample]
+        assert index.record(sample)[1] == windows_for(sample)  # 窗口压过也读得回来
+    assert list(tmp_path.glob("cold-*.k*"))  # 全部键按桶压在盘上，不是只留第一条
+
+
+def test_cold_conversion_is_streaming(tmp_path):
+    index = Index(tmp_path, hot=1, per_shard=2, warm=2, key_size=8)
+    seen = []  # 转冷每走一步，钩子报一次内存里还压着几条记录
+    index.watch = seen.append
+    fill(index, 12)
+    assert index._cold  # 确实转过冷
+    assert seen and max(seen) == 1  # 峰值就是一条，不攒整片
+    assert set(seen) <= {0, 1}  # 每一步都只可能是 0 条或 1 条
+
+
+def test_cold_removes_original_shard(tmp_path):
     index = Index(tmp_path, hot=1, per_shard=2, warm=2, key_size=8)
     fill(index, 12)
-    assert index._cold  # 温层攒够上限后最老的片转冷
-    sample = 0  # 最老的那条一定已经在冷层
-    assert index.get(keyed(sample, 0)) == [sample]  # 第一条键还能粗筛到
-    assert index.get(keyed(sample, 1)) == []  # 第二条键不留，靠温层补
-    assert index.record(sample)[1] == windows_for(sample)  # 窗口压过也读得回来
-    assert not list(tmp_path.glob("cold-*.key"))  # 冷层不留键表
+    assert index._cold
+    alive = {shard.serial for shard in index._warm}  # 还在温层的片号
+    for pattern in ("warm-*.rec", "warm-*.off", "warm-*.key", "warm-*.bkt"):
+        for one in tmp_path.glob(pattern):  # 转过冷的片文件要当场删干净
+            assert int(one.stem.split("-")[1]) in alive, one.name
+    assert len(list(tmp_path.glob("warm-*.rec"))) == len(alive)  # 只剩没转冷的那几片
 
 
 def test_warm_files_carry_key_table(tmp_path):
@@ -95,6 +116,39 @@ def test_warm_files_carry_key_table(tmp_path):
     assert list(tmp_path.glob("warm-*.rec"))
     assert list(tmp_path.glob("warm-*.bkt"))  # 温层带键表桶
     assert not list(tmp_path.glob("cold-*.rec"))
+
+
+# 子进程里一路塞到转冷若干次，量这个进程的峰值内存。单片峰值和连转峰值必须分开进程，
+# 同一进程里第二次的峰值会把前一次的算进去。
+COLD_PEAK = """
+import sys
+sys.path.insert(0, {root!r})
+from features.index import Index
+
+def keyed(sample, band):
+    return sample.to_bytes(4, "big") + band.to_bytes(4, "big")
+
+index = Index({store!r}, hot=2000, per_shard=2000, warm=2000, key_size=8)  # 片缩到 2000 条，跑得快
+for sample in range({count}):  # 每条两个键，跟别的用例一个形状
+    for band in range(2):
+        index.put(keyed(sample, band), sample, [sample] * 4, {{sample}})
+assert len(index._cold) >= {cold}, len(index._cold)  # 确实连转了这么多次
+print(int([line.split()[1] for line in open("/proc/self/status") if line.startswith("VmHWM")][0]))
+"""
+
+
+def _cold_peak(store: Path, count: int, cold: int) -> int:
+    """在子进程里塞到转冷 cold 片，返回峰值内存 kB。"""
+    snippet = COLD_PEAK.format(root=str(ROOT), store=str(store), count=count, cold=cold)
+    done = subprocess.run([sys.executable, "-c", snippet], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    return int(done.stdout.strip())
+
+
+def test_multi_cold_peak_bounded(tmp_path):
+    single = _cold_peak(tmp_path / "one", 4_500, 1)  # 只转一片
+    multi = _cold_peak(tmp_path / "many", 12_000, 5)  # 连转五片
+    assert multi <= single * 1.2  # 每片搬完就放开，峰值不跟着片数涨
 
 
 # ---------- 落盘与读回 ----------
@@ -130,10 +184,11 @@ def test_reload_after_cold(tmp_path):
     index.save()
     index.close()
 
-    assert list(store.glob("cold-*.first"))  # 冷层粗筛表跟着片落了盘
+    assert list(store.glob("cold-*.k*"))  # 冷层键桶跟着片落了盘
     assert not list(store.glob("cold-*.key"))  # 键表随片一起不要了
     back = Index(store, key_size=8)
     assert back.get(keyed(0, 0)) == [0]
+    assert back.get(keyed(0, 1)) == [0]  # 第二条键读回来也撞得上
     assert back.record(0)[1] == windows_for(0)  # 压缩的记录还能拆开
     back.close()
 

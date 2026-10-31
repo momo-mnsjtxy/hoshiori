@@ -20,11 +20,16 @@ Gateway 的参数：
   backend     echo 原样回声；cmd 走外部命令
   answer_cmd  命令模板，{prompt} 换成最后一条消息，{model} 换成模型
   token       要求的令牌，None 就不鉴权；给了就必须带 Authorization: Bearer <token>
+              令牌自己可以带空格，方案名后面整段都算令牌，首尾空白不算
   limit       每个 IP 每分钟几条，0 不限
   log         日志路径，None 不写
 
 鉴权在 do_GET 和 do_POST 一开头各拦一次，都走同一个 check_token()，路由分支里不再重复。
 usage 有分词器就真数，没有就按字数估，响应头 x-usage-source 标出用的是哪种。
+
+流式默认不给 usage，最后一块是空 delta 加 finish_reason。
+请求体带 stream_options: {"include_usage": true} 时，在 [DONE] 前多补一块 choices 为空的块，
+带上完整 usage：不少客户端靠这一块记用量，缺了它上游就算不出账。
 
 run(port) 一直占着直到 Ctrl-C；start(port, in_thread=True) 只把服务起好、把 server 交回来，测试用。
 """
@@ -78,6 +83,12 @@ def piece(base: dict, delta: dict, finish) -> bytes:
     choice = {"index": 0, "delta": delta, "finish_reason": finish}               # 这一块的增量
     chunk = {**base, "choices": [choice]}                                        # 拼成完整的一块
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")  # 一行 data: 加空行收尾
+
+
+def usage_piece(base: dict, usage: dict) -> bytes:
+    """拼带用量的那一块。choices 是空数组，用量单独占一块，照 OpenAI 的 include_usage。"""
+    chunk = {**base, "choices": [], "usage": usage}                               # 空 choices 加用量
+    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")    # 一行 data: 加空行收尾
 
 
 def estimate(messages: list, text: str) -> dict:
@@ -145,7 +156,8 @@ class Handler(BaseHTTPRequestHandler):
         except RuntimeError as bad:                                                  # 后端自己报的错，原样告诉调用方
             return self.reject(500, "server_error", str(bad))
         if body.get("stream"):                                                       # 要流就一块块吐
-            return self.send_stream(gate, text)
+            want_usage = bool((body.get("stream_options") or {}).get("include_usage"))  # 要不要那块用量
+            return self.send_stream(gate, messages, text, want_usage)
         self.send_json(200, gate.completion(messages, text))                         # 不要流就整段回
 
     def check_token(self) -> bool:
@@ -154,11 +166,12 @@ class Handler(BaseHTTPRequestHandler):
         if token is None:                              # 没开鉴权，默认行为不变
             return True
         given = self.headers.get("Authorization", "")  # 形如 "Bearer abc"
-        scheme, _, value = given.partition(" ")        # 拆成方案和令牌，没有空格时 value 为空
+        scheme, _, value = given.partition(" ")        # 只按第一个空格把方案名切下来
+        value = value.strip()                          # 剩下的整段都是令牌：令牌自己带空格也不会被切断，首尾空白不算
         if scheme.lower() != "bearer":                 # 方案大小写不敏感：Bearer、bearer 都认
             self.reject(401, "invalid_request_error", "要给 Authorization: Bearer <token>")
             return False
-        if not hmac.compare_digest(value.strip().encode(), token.encode()):  # 定长比，不按位提前返回
+        if not hmac.compare_digest(value.encode(), token.encode()):  # 定长比，不按位提前返回
             self.reject(401, "invalid_request_error", "token 不对")
             return False
         return True
@@ -182,8 +195,8 @@ class Handler(BaseHTTPRequestHandler):
         """按 OpenAI 的错误形状回一个失败。"""
         self.send_json(status, {"error": {"message": message, "type": kind, "code": status}})
 
-    def send_stream(self, gate, text: str) -> None:
-        """把回复拆成 SSE 块逐条吐，末尾给 [DONE]。"""
+    def send_stream(self, gate, messages: list, text: str, with_usage: bool = False) -> None:
+        """把回复拆成 SSE 块逐条吐，末尾给 [DONE]。要用量就在 [DONE] 前补一块空的 choices 带 usage。"""
         base = gate.chunk_base()                                              # 每块共用的 id、模型、时间
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")  # 逐块吐字用事件流
@@ -194,6 +207,8 @@ class Handler(BaseHTTPRequestHandler):
         for part in chunks(text):                                             # 正文一块块来
             self.wfile.write(piece(base, {"content": part}, None))
         self.wfile.write(piece(base, {}, "stop"))                             # 倒数第二块带 stop
+        if with_usage:                                                        # 要了用量才补这一块，不要就保持原样
+            self.wfile.write(usage_piece(base, gate.usage(messages, text)))    # 和整段回执同一套算法，不另算一份
         self.wfile.write(b"data: [DONE]\n\n")                                 # 最后一块是结束标记
         self.wfile.flush()
         self.record(200)                                                      # 记一行日志

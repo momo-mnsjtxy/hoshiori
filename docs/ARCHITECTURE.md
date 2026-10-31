@@ -30,6 +30,12 @@ main.py                   入口：认命令、接错误、给退出码
 | features/plan.py | 训练计划与显存估算 | 无 |
 | features/migration.py | 外部配置转配方 | 无 |
 | features/woof.py | 混配比例 | 无 |
+| features/index.py | 去重索引三层（热内存 / 温分片 / 冷压缩） | 索引目录 |
+| features/model.py | 自搭 decoder-only 与量化换层 | 权重 | 
+| features/lora.py | 低秩旁路挂载与合并 | adapter 文件 |
+| features/tokenizer.py | 字节级 BPE 词表，训练与导出共用 | vocab.json |
+| features/alignment.py | 偏好数据与五种对齐损失 | 无 |
+| features/trainer.py | 训练循环、续训、分布式、健康停止 | 权重与状态 |
 | features/forge.py | 权重转换与量化 | 产物文件 |
 | features/merge.py | adapter 合并 | 无 |
 | features/suite.py | 评测套件装载 | 无 |
@@ -38,6 +44,7 @@ main.py                   入口：认命令、接错误、给退出码
 | features/gate.py | 回归门比对 | 无 |
 | features/gateway.py | OpenAI 兼容服务 | 请求日志 |
 | features/loom.py | 只读面板 | 无 |
+| commands/vocab.py | 学词表 | vocab.json |
 | utils/fail.py | 带类型和退出码的错误 | 无 |
 | utils/logs.py | 终端输出与 loom.jsonl | loom.jsonl |
 | utils/yaml_io.py | yaml 读写 | 无 |

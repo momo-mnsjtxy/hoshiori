@@ -7,6 +7,7 @@
   ori serve out/merged --token abc123
 
 给了 --token 就要求每条请求带 Authorization: Bearer <token>，不对或缺都回 401；不给就谁都能打。
+令牌自己可以有空格（比如 --token "a b c"），方案名后面整段都算令牌，首尾空白不算。
 
 检查只在这里做一次：模型在不在、端口范围、后端取值、cmd 后端有没有命令、日志目录在不在、token 空不空。
 起服务、鉴权、限流、落日志都在 features.gateway，这个文件只把参数搬过去。
@@ -20,9 +21,9 @@ from utils.fail import fail
 
 def command(args) -> int:
     """核对参数后起网关，一直跑到 Ctrl-C。"""
-    token = (args.token or "").strip()                 # 首尾空格看不见，先去掉再比
+    token = (args.token or "").strip()                 # 首尾空格看不见，先去掉再比；中间的空格是令牌的一部分
     if args.token and not token:                       # 给了 --token 却只有空格
-        fail("input", "--token 是空的", hint="换一个没有空格的令牌，或者干脆不给")
+        fail("input", "--token 是空的", hint="给一个有内容的令牌，或者干脆不给")
     given = Path(args.model).expanduser()              # 参数可能是目录，也可能只是个模型名
     if "/" in args.model and not given.is_dir():       # 带斜杠的当路径，目录必须在
         fail("input", f"模型目录不在: {args.model}", hint="先训练或合并出一个目录，或者只给模型名")

@@ -23,6 +23,7 @@ COMMANDS = {
     "weave": "commands.weave",
     "import": "commands.import_lmlab",
     "validate": "commands.validate",
+    "vocab": "commands.vocab",
     "spin": "commands.spin",
     "judge": "commands.judge",
     "forge": "commands.forge",
@@ -62,6 +63,12 @@ def parser() -> argparse.ArgumentParser:
     old.add_argument("--out", default="imported", help="输出目录")
     old.add_argument("--force", action="store_true", help="覆盖已有文件")
 
+    vocab = below.add_parser("vocab", help="从语料学一个词表")
+    vocab.add_argument("--in", dest="inputs", action="append", required=True, help="语料，可给多次")
+    vocab.add_argument("--out", required=True, help="词表写到哪")
+    vocab.add_argument("--size", type=int, default=8000, help="词表大小，至少 259")
+    vocab.add_argument("--limit", type=int, default=2000, help="每种来源最多读几条")
+
     check = below.add_parser("validate", help="验一份配方")
     check.add_argument("recipe")
 
@@ -72,6 +79,7 @@ def parser() -> argparse.ArgumentParser:
     spin.add_argument("--save-every", type=int, help="每多少步存一档，0 只存收尾")
     spin.add_argument("--resume", help="从哪一档接着跑；给目录，auto 取产物目录里最新")
     spin.add_argument("--out", help="产物目录，默认 out/run-<时间戳>")
+    spin.add_argument("--launch", default="plain", choices=["plain", "torchrun"], help="怎么起进程：plain 本进程跑；torchrun 按配方的 devices 起多卡")
 
     judge = below.add_parser("judge", help="评测")
     judge.add_argument("recipe", nargs="?")
@@ -89,6 +97,8 @@ def parser() -> argparse.ArgumentParser:
     forge.add_argument("--format", action="append", dest="formats", help="导出格式，可给多次")
     forge.add_argument("--quant", action="append", help="量化档，可给多次：f16 / q8_0 / q6_k / q5_k_s / q5_k_m")
     forge.add_argument("--no-tokenizer", action="store_true", help="不导词表，产物就不能独立跑")
+    forge.add_argument("--verbose", action="store_true", help="把要执行的命令、参数、目录布局都打出来")
+    forge.add_argument("--mlx-print-only", action="store_true", help="mlx 只打印命令和目录布局，不执行")
 
     serve = below.add_parser("serve", help="起一个 OpenAI 兼容的服务")
     serve.add_argument("model")

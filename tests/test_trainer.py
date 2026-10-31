@@ -5,14 +5,21 @@
   词表 64 是故意比字节值小，顺带验字节取模那条路；序列压到 24，别让小矩阵撑大时间。
 """
 
+import importlib.util
 import json
+import math
 import shutil
+import socket
+import sys
+import time
+import types
 
 import pytest
 import torch
 from torch.nn import functional as F
 
 import main
+from commands import spin
 from features import lora, model, trainer
 
 
@@ -166,3 +173,262 @@ def test_spin_refuses_obvious_overflow(tmp_path):
     if shutil.which("nvidia-smi") is None:  # 没卡先卡在要卡那条，验不到显存
         pytest.skip("没有卡，轮不到显存那条")
     assert main.run(["spin", str(recipe), "--steps", "2", "--out", str(tmp_path / "out")]) == 2  # 按填错退回
+
+
+# ---------- 量化 ----------
+
+def test_quantize_falls_back_on_cpu(geo, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)  # 当成没有卡
+    net = model.Model(geo)
+    assert net.quantize("nf4") is False  # 压不动就老实返回没压
+    assert net.quantized is False and net.model.layers[0].mlp.up_proj.weight.dtype is torch.float32  # 还是 fp32 的普通线层
+    assert net(torch.randint(0, geo.vocab, (1, 6))).shape == (1, 6, geo.vocab)  # 回退后照样能跑
+    assert net.quantize("fp32") is False  # 本来就不是要压的精度
+
+
+def test_quantize_swaps_layers_and_freezes(geo, monkeypatch):
+    stub = _bnb_stub(monkeypatch)  # 拿一个假 bitsandbytes 顶上，机器上没装包也能走这条路径
+    net = model.Model(geo)
+    assert net.quantize("nf4", device=torch.device("cpu")) is True  # 真压了
+    assert net.quantized
+    assert isinstance(net.model.layers[0].self_attn.q_proj, stub.nn.Linear4bit)  # 权重线层被换成了 4bit 层
+    assert not isinstance(net.model.norm, stub.nn.Linear4bit)  # 归一不动
+    assert all(not one.requires_grad for one in net.parameters())  # 量化层自己没梯度，其余也冻上
+    assert net(torch.randint(0, geo.vocab, (1, 6))).shape == (1, 6, geo.vocab)  # 假层就是普通线层，前向形状照旧
+
+
+def test_quantized_only_trains_lora(geo, files, tmp_path, monkeypatch):
+    _bnb_stub(monkeypatch)
+    net = model.Model(geo)
+    net.quantize("nf4", device=torch.device("cpu"))
+    job = trainer.Trainer(net, geo, short(geo, files, tmp_path / "run", steps=2, save_every=0, precision="nf4", lora={"r": 4, "alpha": 8, "dropout": 0.0, "target": ["w_q"]}))  # 压过就只挂件可训
+    assert job.params and all(name.endswith((".A", ".B")) for name, _ in net.named_parameters() if _.requires_grad)  # 能训的只剩 A/B
+    assert job.run() == 2  # 真跑两步不炸
+    assert (tmp_path / "run" / "step-000002" / "adapter.safetensors").is_file()  # 只落挂件
+
+
+# ---------- 健康检查 ----------
+
+def health_recipe(tmp_path, health="stop", steps=25):
+    """一份会走到健康检查的配方；几何压到能秒过的尺寸。"""
+    recipe = tmp_path / "s.warp.yaml"
+    recipe.write_text(
+        "version: 1\ntask: pretrain\nmodel:\n  geometry:\n    d_model: 32\n    layers: 1\n    heads: 2\n    d_head: 16\n    vocab: 64\n"
+        f"data:\n  files: [bolt.jsonl]\ntrain:\n  batch_size: 1\n  lr: 0.01\n  max_steps: {steps}\n  health: {health}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "bolt.jsonl").write_text(json.dumps({"text": "一小段话够训练"}, ensure_ascii=False), encoding="utf-8")  # 一条样本
+    return recipe
+
+
+def test_health_stops_on_nan(tmp_path, monkeypatch):
+    recipe = health_recipe(tmp_path)  # 默认 stop
+    out = tmp_path / "out"
+
+    def fake(self):  # 三步 NaN
+        self.last_tokens, self.last_norm = 1000, 0.5
+        return float("nan")
+
+    monkeypatch.setattr(trainer.Trainer, "_update", fake)
+    assert main.run(["spin", str(recipe), "--out", str(out)]) == 1  # 坏了就退 1
+    meta = json.loads((out / "run.json").read_text(encoding="utf-8"))  # 原因落在 run.json 里
+    assert "NaN" in meta["health"]["reason"] and meta["health"]["step"] == 3  # 第三步踩线
+    assert (out / "step-000003" / "state.json").is_file()  # 停之前存了一档
+
+
+def test_health_stops_on_big_norm(tmp_path, monkeypatch):
+    recipe = health_recipe(tmp_path)
+    out = tmp_path / "out"
+
+    def fake(self):  # 梯度范数一直炸
+        self.last_tokens, self.last_norm = 1000, 2e3
+        return 1.0
+
+    monkeypatch.setattr(trainer.Trainer, "_update", fake)
+    assert main.run(["spin", str(recipe), "--out", str(out)]) == 1
+    meta = json.loads((out / "run.json").read_text(encoding="utf-8"))
+    assert "梯度范数" in meta["health"]["reason"] and meta["health"]["step"] == 5  # 第五步才成立
+    assert (out / "step-000005" / "state.json").is_file()
+
+
+def test_health_stops_on_slow_throughput(tmp_path, monkeypatch):
+    recipe = health_recipe(tmp_path)
+    out = tmp_path / "out"
+
+    def fake(self):  # 每步都慢一点点，第二十二步突然更慢
+        self.last_tokens, self.last_norm = 1000, 0.5
+        time.sleep(0.06 if self.step == 22 else 0.006)
+        return 1.0
+
+    monkeypatch.setattr(trainer.Trainer, "_update", fake)
+    assert main.run(["spin", str(recipe), "--out", str(out)]) == 1
+    meta = json.loads((out / "run.json").read_text(encoding="utf-8"))
+    assert "吞吐" in meta["health"]["reason"] and meta["health"]["step"] == 22  # 攒够 20 步基线后第一步就踩线
+    assert (out / "step-000022" / "state.json").is_file()
+
+
+def test_health_warn_keeps_going(tmp_path, monkeypatch):
+    recipe = health_recipe(tmp_path, health="warn", steps=5)
+    out = tmp_path / "out"
+
+    def fake(self):  # 一直 NaN 也不停
+        self.last_tokens, self.last_norm = 1000, 0.5
+        return float("nan")
+
+    monkeypatch.setattr(trainer.Trainer, "_update", fake)
+    assert main.run(["spin", str(recipe), "--out", str(out)]) == 0  # 只是喊一声，跑完为止
+    assert (out / "step-000005" / "state.json").is_file()  # 照样跑满
+    assert "health" not in json.loads((out / "run.json").read_text(encoding="utf-8"))  # 没有停机原因
+
+
+# ---------- 分布式 ----------
+
+def test_single_process_dist_branch_runs(geo, files, tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCAL_RANK", "0")  # 冒充 torchrun 起的进程
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", str(_port()))  # 随便一个空口
+    out = tmp_path / "run"
+    job = trainer.Trainer(model.Model(geo), geo, short(geo, files, out, steps=2, save_every=0, strategy="ddp"))  # 单进程走 ddp 分支
+    assert (job.rank, job.world, job.lead) == (0, 1, True)  # 单进程就是 0 号，存盘打日志都归它
+    job.run()
+    assert not torch.distributed.is_initialized()  # 收尾把组拆了
+    assert (out / "step-000002" / "state.json").is_file()  # 产物照落
+
+
+def test_grad_checkpoint_switches_forward(geo, files, tmp_path):
+    net = model.Model(geo)
+    job = trainer.Trainer(net, geo, short(geo, files, tmp_path / "run", steps=2, save_every=0, grad_checkpoint=True))
+    assert net.grad_checkpoint is True  # 配方开关传到了模型上
+    job.run()
+    assert job.history and all(math.isfinite(one) for one in job.history)  # 重算那一版照样出有限 loss
+
+
+def test_spin_launch_torchrun(tmp_path):
+    if shutil.which("torchrun") is None:
+        pytest.skip("没有 torchrun")
+    recipe = tmp_path / "s.warp.yaml"  # 单卡也给 torchrun 起，验的是命令拼得对
+    recipe.write_text(
+        "version: 1\ntask: pretrain\nmodel:\n  geometry:\n    d_model: 32\n    layers: 1\n    heads: 2\n    d_head: 16\n    vocab: 64\n"
+        "data:\n  files: [bolt.jsonl]\ntrain:\n  batch_size: 1\n  lr: 0.01\n  strategy: ddp\n  devices: [0]\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "bolt.jsonl").write_text(json.dumps({"text": "一小段话够训练"}, ensure_ascii=False), encoding="utf-8")
+    out = tmp_path / "out"
+    assert main.run(["spin", str(recipe), "--steps", "2", "--save-every", "0", "--out", str(out), "--launch", "torchrun"]) == 0  # 子进程跑通
+    assert (out / "step-000002" / "state.json").is_file()  # 0 号进程存下了档
+
+
+def _port() -> int:
+    """挑一个空口给 rendezvous。"""
+    with socket.socket() as one:
+        one.bind(("127.0.0.1", 0))
+        return one.getsockname()[1]
+
+
+def _bnb_stub(monkeypatch):
+    """一个假的 bitsandbytes：够让量化路径整条跑完，不做真压缩。"""
+    stub = types.ModuleType("bitsandbytes")  # 假包
+
+    class Params4bit(torch.nn.Parameter):  # 参数壳，量化层挂权重用
+        def __new__(cls, data, requires_grad=False, quant_type="nf4", quant_storage=None):
+            return super().__new__(cls, data, requires_grad)
+
+    class Linear4bit(torch.nn.Linear):  # 形状和行为都照普通线层，够验换层
+        def __init__(self, in_features, out_features, bias=True, compute_dtype=None, quant_type="nf4", compress_statistics=True):
+            super().__init__(in_features, out_features, bias=bias)
+
+    class Int8Params(torch.nn.Parameter):
+        def __new__(cls, data, requires_grad=False, has_fp16_weights=False):
+            return super().__new__(cls, data, requires_grad)
+
+    class Linear8bitLt(torch.nn.Linear):
+        def __init__(self, in_features, out_features, bias=True, has_fp16_weights=False):
+            super().__init__(in_features, out_features, bias=bias)
+
+    stub.nn = types.SimpleNamespace(Linear4bit=Linear4bit, Params4bit=Params4bit, Linear8bitLt=Linear8bitLt, Int8Params=Int8Params)
+    monkeypatch.setitem(sys.modules, "bitsandbytes", stub)
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)  # 假包里 compute_dtype 落到 fp16 也不炸
+    return stub
+
+
+def test_spin_quant_without_bnb_reports_missing(tmp_path, monkeypatch):
+    recipe = health_recipe(tmp_path, steps=2)  # 几何和数据的架子复用
+    text = recipe.read_text(encoding="utf-8").replace("health: stop", "health: stop\n  precision: nf4\n  lora: {r: 4, alpha: 8}")
+    recipe.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(spin, "_has_cuda", lambda: True)  # 假装有卡
+    real = importlib.util.find_spec  # 真找法留着，别的包照找
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *rest: None if name == "bitsandbytes" else real(name, *rest))
+    assert main.run(["spin", str(recipe), "--steps", "2", "--out", str(tmp_path / "out")]) == 4  # 缺包按 4 退
+
+
+def test_spin_quant_alone_refuses_without_lora(tmp_path, monkeypatch):
+    recipe = health_recipe(tmp_path, steps=2)
+    text = recipe.read_text(encoding="utf-8").replace("health: stop", "health: stop\n  precision: nf4")
+    recipe.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(spin, "_has_cuda", lambda: True)  # 假装有卡
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *rest: object())  # 假装包都在
+    monkeypatch.setattr(model.Model, "quantize", lambda self, precision, device=None: True)  # 假装真压了
+    assert main.run(["spin", str(recipe), "--steps", "2", "--out", str(tmp_path / "out")]) == 2  # 量化层没梯度，没挂件就填错
+
+
+# ---------- 任务族与词表 ----------
+
+def _prefs(tmp_path):
+    """造一份偏好对数据。"""
+    path = tmp_path / "pref.jsonl"
+    rows = [{"prompt": "织：", "chosen": f"好的第{i}条", "rejected": f"差的第{i}条"} for i in range(8)]
+    path.write_text("\n".join(json.dumps(one, ensure_ascii=False) for one in rows), encoding="utf-8")
+    return [path]
+
+
+def _groups(tmp_path):
+    """造一份带奖励的组数据。"""
+    path = tmp_path / "groups.jsonl"
+    rows = [{"prompt": "织：", "responses": [f"候选{i}{n}" for n in "甲乙丙丁"], "rewards": [1.0, 0.5, 0.2, 0.0]} for i in range(8)]
+    path.write_text("\n".join(json.dumps(one, ensure_ascii=False) for one in rows), encoding="utf-8")
+    return [path]
+
+
+def test_vocab_sets_embedding_size(geo, files, tmp_path):
+    from features import tokenizer
+
+    vocab = tokenizer.Vocab.train(files, vocab_size=300, limit=20)  # 从样本学一个小词表
+    small = model.Model(geo)  # 词表还是 64 的模型
+    geo.vocab = vocab.size  # 有词表就以它为准
+    net = model.Model(geo)
+    assert sum(one.numel() for one in net.parameters()) > sum(one.numel() for one in small.parameters())  # 词表变大，词嵌入跟着长
+    job = trainer.Trainer(net, geo, short(geo, files, tmp_path / "run", vocab=vocab, steps=3))
+    assert job.run() == 3  # 按词表编码也能跑
+
+
+def test_dpo_one_step(geo, files, tmp_path):
+    net = model.Model(geo)
+    job = trainer.Trainer(net, geo, short(geo, _prefs(tmp_path), tmp_path / "run", task="dpo", steps=2))
+    assert job.run() == 2  # 偏好对这条路能走完
+    assert math.isfinite(job.history[-1])  # 损失是个正常数
+    assert job.ref_model is not None  # 参考模型建起来了
+
+
+@pytest.mark.parametrize("task", ["grpo", "rloo", "ppo"])
+def test_group_tasks_run(geo, tmp_path, task):
+    net = model.Model(geo)
+    job = trainer.Trainer(net, geo, short(geo, _groups(tmp_path), tmp_path / "run", task=task, steps=1, group=4))
+    assert job.run() == 1  # 组相对这一路能走完
+
+
+def test_distill_needs_teacher(geo, files, tmp_path):
+    net = model.Model(geo)
+    with pytest.raises(Exception):  # 没给教师就得当场报
+        trainer.Trainer(net, geo, short(geo, files, tmp_path / "run", task="distill", steps=1))
+
+
+def test_distill_runs_with_teacher(geo, files, tmp_path):
+    teacher_dir = tmp_path / "teacher"
+    teacher_dir.mkdir()
+    model.Model(geo).save(teacher_dir)  # 拿一份权重当教师
+    net = model.Model(geo)
+    job = trainer.Trainer(net, geo, short(geo, files, tmp_path / "run", task="distill", steps=1, teacher=teacher_dir))
+    assert job.run() == 1  # 蒸馏能跑
+    assert job.teacher is not None  # 教师建起来了
