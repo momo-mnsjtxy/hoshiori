@@ -1,4 +1,5 @@
-"""落盘索引的测试：三层各自能查、热层满了会挤、片会滚、转冷是流式的、落盘能读回来、两种模式判定一样。
+"""落盘索引的测试：三层各自能查、热层满了会挤、片会滚、桶表按片落在盘上、转冷是流式且按批刷、
+落盘能读回来、两种模式判定一样。
 
 约定：用 8 字节的假键和 3 个假窗口，不跑真实的指纹，省时间；
 分带键的真实长度由 features/duplicate.py 按段内行数给。
@@ -13,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from features import duplicate
-from features.index import Index
+from features.index import BUCKET_KEEP, COLD_BATCH, Index
 
 ROOT = Path(__file__).resolve().parent.parent  # 仓库根，压测的子进程要在这儿跑
 
@@ -91,12 +92,26 @@ def test_cold_keeps_every_key(tmp_path):
 
 def test_cold_conversion_is_streaming(tmp_path):
     index = Index(tmp_path, hot=1, per_shard=2, warm=2, key_size=8)
-    seen = []  # 转冷每走一步，钩子报一次内存里还压着几条记录
+    seen = []  # 转冷每走一步，钩子报一次缓冲里还压着几条记录
     index.watch = seen.append
     fill(index, 12)
     assert index._cold  # 确实转过冷
-    assert seen and max(seen) == 1  # 峰值就是一条，不攒整片
-    assert set(seen) <= {0, 1}  # 每一步都只可能是 0 条或 1 条
+    assert seen  # 钩子确实报过
+    assert max(seen) < COLD_BATCH  # 这一片连一批都没攒满，更不会攒整片
+    assert min(seen) == 1  # 一条一条攒，不一次压一批进去
+
+
+def test_cold_flushes_in_batches(tmp_path):
+    """片长过一批：满一批就刷出去、缓冲清空，峰值还是一批的量。"""
+    index = Index(tmp_path, hot=1, per_shard=COLD_BATCH + 100, warm=COLD_BATCH + 100, key_size=8)
+    seen = []  # 每搬一条报一次缓冲里压着几条
+    index.watch = seen.append
+    fill(index, COLD_BATCH + 200)
+    assert index._cold  # 攒满的片转过冷了
+    assert max(seen) <= COLD_BATCH  # 从没超过一批
+    assert 0 in seen  # 满一批就刷，刷完缓冲是空的
+    for sample in (0, COLD_BATCH, COLD_BATCH + 100):  # 转过冷的键照样查得到
+        assert index.get(keyed(sample, 0)) == [sample]
 
 
 def test_cold_removes_original_shard(tmp_path):
@@ -104,18 +119,53 @@ def test_cold_removes_original_shard(tmp_path):
     fill(index, 12)
     assert index._cold
     alive = {shard.serial for shard in index._warm}  # 还在温层的片号
-    for pattern in ("warm-*.rec", "warm-*.off", "warm-*.key", "warm-*.bkt"):
+    for pattern in ("warm-*.rec", "warm-*.off", "warm-*.key", "warm-*.bkt[0-9]*"):
         for one in tmp_path.glob(pattern):  # 转过冷的片文件要当场删干净
             assert int(one.stem.split("-")[1]) in alive, one.name
     assert len(list(tmp_path.glob("warm-*.rec"))) == len(alive)  # 只剩没转冷的那几片
+
+
+def test_cold_deletes_bucket_slices(tmp_path):
+    """转过冷的片，桶片跟着片号一起删掉，不留一堆死文件。"""
+    index = Index(tmp_path, hot=1, per_shard=2, warm=2, key_size=8)
+    fill(index, 12)
+    assert index._cold
+    alive = {shard.serial for shard in index._warm}
+    left = [one for one in tmp_path.glob("warm-*.bkt[0-9]*") if int(one.stem.split("-")[1]) not in alive]
+    assert not left  # 转冷的片一片桶片都不剩
+    assert list(tmp_path.glob("cold-*.k*"))  # 键没丢，换到冷层的桶文件里了
 
 
 def test_warm_files_carry_key_table(tmp_path):
     index = Index(tmp_path, hot=1, per_shard=2, warm=100, key_size=8)  # 温层管够，不转冷
     fill(index, 6)
     assert list(tmp_path.glob("warm-*.rec"))
-    assert list(tmp_path.glob("warm-*.bkt"))  # 温层带键表桶
+    assert list(tmp_path.glob("warm-*.bkt[0-9]*"))  # 温层带键表桶，桶表按片落在盘上
     assert not list(tmp_path.glob("cold-*.rec"))
+
+
+# ---------- 桶表落盘 ----------
+
+def test_bucket_table_on_disk_still_finds(tmp_path):
+    """桶表落在盘上，缓存清光了也能按桶查回来。"""
+    index = Index(tmp_path, hot=1, per_shard=200_000, warm=100_000, key_size=8)
+    fill(index, 400)  # 八百条键，桶落在几个片里
+    slices = list(tmp_path.glob("warm-*.bkt[0-9]*"))
+    assert len(slices) > 1  # 桶表真的分成几片落了盘
+    assert sum(one.stat().st_size for one in slices) > 0  # 盘上有内容，不是空壳
+    for shard in index._warm:  # 内存里一份都不留，照样查得出来
+        shard.table.kept.clear()
+    for sample in (0, 137, 399):
+        assert index.get(keyed(sample, 0)) == [sample]
+
+
+def test_bucket_cache_stays_small(tmp_path):
+    """命中过的桶只留几百个，够查就行，不跟着键数涨。"""
+    index = Index(tmp_path, hot=1, per_shard=200_000, warm=100_000, key_size=8)
+    fill(index, 400)  # 八百条键，八百个桶左右，超过缓存上限
+    for shard in index._warm:
+        assert len(shard.table.kept) <= BUCKET_KEEP  # 缓存被压在上限以内
+    assert index.get(keyed(0, 0)) == [0]  # 缓存丢了也查得到
 
 
 # 子进程里一路塞到转冷若干次，量这个进程的峰值内存。单片峰值和连转峰值必须分开进程，
@@ -219,6 +269,19 @@ def test_same_verdict_memory_and_disk(tmp_path):
     memory = duplicate.Duplicate(duplicate.Rule(threshold=0.8))
     disk = duplicate.Duplicate(duplicate.Rule(threshold=0.8), store=tmp_path, hot=3)
     assert [memory.check(text) for text in texts] == [disk.check(text) for text in texts]
+    assert memory.result.dropped == disk.result.dropped
+    disk.close()
+
+
+def test_same_verdict_through_cold(tmp_path):
+    """一路转冷也不改判定：同一批语料，内存版和落盘版逐条一模一样。"""
+    texts = corpus()
+    memory = duplicate.Duplicate(duplicate.Rule(threshold=0.8))
+    disk = duplicate.Duplicate(duplicate.Rule(threshold=0.8), store=tmp_path, hot=3)
+    disk._index.per_shard = 4  # 片缩到四条、温层只留八条，几百条语料会一路转冷
+    disk._index.warm = 8
+    assert [memory.check(text) for text in texts] == [disk.check(text) for text in texts]
+    assert disk._index._cold  # 确实走到了冷层那条路
     assert memory.result.dropped == disk.result.dropped
     disk.close()
 

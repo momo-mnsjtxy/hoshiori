@@ -20,7 +20,8 @@
 
 三层，越往下越省内存、越慢：
   热层  内存里的 LRU，默认 5 万条键，查得最快；装不下就从头成批挤出去。
-  温层  每片 20 万条的顺序文件，记录靠偏移表按需映射读，写只往片尾追加；键走盘上哈希桶。
+  温层  每片 20 万条的顺序文件，记录靠偏移表按需映射读，写只往片尾追加；
+        键走盘上哈希桶，桶表本身也按片落在盘上，内存里只留几百个最近碰过的桶。
   冷层  温层攒够一个上限，最老的片转成压缩片：整片逐条流式搬，一条读完压完写完就放开，
         原片文件当场删掉（不留空壳占 inode）；每条的全部键按桶压在 `cold-NNNN.kBBBB` 里，
         查的时候只解一个桶，再和桶里条目的键集求交，命中才交出那条记录的键。
@@ -33,6 +34,11 @@
 为什么偏移表放盘上：一片 20 万条 × 8 字节就是 1.6MB，冷层留几百片光偏移就白分了内存；
 按条追加进 `.off`，读时 mmap 切一刀只碰要读的那 8 字节。
 为什么用内存映射：温层是按偏移跳着读的，mmap 切片比拼一次 seek 再 read 少一次拷贝。
+为什么桶表也要落盘：一片 20 万条的桶表是 12.8MB，温层留几片就是几十上百 MB。原来整份铺成
+映射，映射过的页会一直算在常驻内存里，百万条实测把这个进程顶到 2GB（内存比从 10.1 掉到 7.9）。
+改成按桶切片落盘、内存只留最近碰过的几百个桶，这部分从几十 MB 压到几百个整数。
+为什么桶片里用 pread/pwrite 而不是映射：桶是 8 字节的链头，读一次写一次就完，铺映射会把页
+重新顶回常驻内存；桶片数按片算下来只有二三十个，文件一直开着也不会用光 fd。
 为什么键表是哈希桶不是排序段：排序段查一次要把所有段各二分一遍，实测 6 万次查要 12 秒；
 哈希桶查一次只翻一两条链，同样的次数一秒出头。
 为什么位置表压成一个数：一条样本一行位置，两个 8 字节数组是 16MB/百万条，
@@ -41,6 +47,7 @@
 
 import json
 import mmap
+import os
 import shutil
 import zlib
 from array import array
@@ -60,6 +67,10 @@ CHUNK = 4096  # 冷层一个桶里攒到多少字节就压了落地；一片桶 
 MIN_BUCKET = 256  # 冷层一片最少几个桶。桶太少，每次查都要解一大段
 MAX_BUCKET = 2048  # 冷层一片最多几个桶。桶太多，盘上摊一堆小文件
 PER_BUCKET = 512  # 一个桶平均装多少条键，按片里的键数反推桶数用
+BUCKET_SLICE = 65_536  # 温层桶表一片多少个桶。一片 512KB；一片温层 160 万桶摊成 25 个文件，
+                       # 五个温片一百二三十个常开的文件，离 1024 的 fd 上限还远
+BUCKET_KEEP = 512  # 内存里最多留几个最近碰过的桶。桶是 8 字节的链头，512 个就是几千字节
+COLD_BATCH = 2_000  # 转冷时每搬多少条就把攒着的键缓冲整个刷出去，批的大小见 _to_cold 里的说明
 
 
 class Live:
@@ -74,11 +85,88 @@ class Live:
         self.left = 0  # 热层里还剩几条键指着它，归零才准落盘
 
 
+class BucketTable:
+    """温层的哈希桶表，按片落在盘上：每片 BUCKET_SLICE 个桶，一片一个 `warm-NNNN.bktSSSS` 文件。
+
+    内存里只留 BUCKET_KEEP 个最近碰过的桶（桶号 → 链头），其余现读现写：
+    读一次 pread 8 字节，写一次 pwrite 8 字节。桶片满不满不由片自己管，
+    桶号是 crc32 取模出来的，落在哪个片是散列说了算，所以片一直只往后长内容、不用滚。
+    """
+
+    __slots__ = ("base", "kept", "_files")
+
+    def __init__(self, store: Path, serial: int) -> None:
+        self.base = store / f"warm-{serial:04d}.bkt"  # 片文件名的前缀，后头接四位片号
+        self.kept = OrderedDict()  # 桶号 → 链头；末尾是刚用过的，超上限从头丢
+        self._files = {}  # 片号 → 打开的文件；片数有上限，一直开着也不会用光 fd
+
+    def get(self, where: int) -> int:
+        """桶里那串的头（条目号 + 1）。0 就是空桶。"""
+        head = self.kept.get(where)
+        if head is None:  # 缓存里没有，去盘上读这 8 字节
+            head = int.from_bytes(self._read(where), "big")
+        self._keep(where, head)
+        return head
+
+    def set(self, where: int, head: int) -> None:
+        """改桶的头。盘上写完顺手把缓存换成新值，不回读。"""
+        self._write(where, head.to_bytes(8, "big"))
+        self._keep(where, head)
+
+    def files(self) -> list:
+        """已经落在盘上的桶片文件。转冷搬完按它删。"""
+        return sorted(self.base.parent.glob(f"{self.base.name}*"))
+
+    def close(self) -> None:
+        """关掉开着的桶片文件，缓存一起清掉。"""
+        for handle in self._files.values():
+            handle.close()
+        self._files.clear()
+        self.kept.clear()
+
+    def _keep(self, where: int, head: int) -> None:
+        """记进缓存并挪到"最近"那一头，超上限就把最久没碰的丢掉。"""
+        self.kept[where] = head
+        self.kept.move_to_end(where)
+        if len(self.kept) > BUCKET_KEEP:
+            self.kept.popitem(last=False)
+
+    def _read(self, where: int) -> bytes:
+        """从盘上读一个桶的链头；这片还没建过就是空桶。"""
+        handle = self._handle(where)
+        if handle is None:  # 这片一个桶都还没写过
+            return b"\0" * 8
+        return os.pread(handle.fileno(), 8, (where % BUCKET_SLICE) * 8)
+
+    def _write(self, where: int, raw: bytes) -> None:
+        """把链头写回盘上它自己的那 8 字节。"""
+        handle = self._handle(where, make=True)
+        os.pwrite(handle.fileno(), raw, (where % BUCKET_SLICE) * 8)
+
+    def _handle(self, where: int, make: bool = False):
+        """这个桶所在片的文件。没开过就开；make 为真时连片文件一起建出来。"""
+        at = where // BUCKET_SLICE
+        handle = self._files.get(at)
+        if handle is not None:  # 这片开着
+            return handle
+        path = Path(f"{self.base}{at:04d}")
+        if not path.exists():  # 第一次落到这片
+            if not make:  # 只读的话不用建
+                return None
+            path.touch()
+            handle = path.open("r+b")
+            handle.truncate(BUCKET_SLICE * 8)  # 片定长，桶的位置不用再按文件长度算
+        else:
+            handle = path.open("r+b")
+        self._files[at] = handle
+        return handle
+
+
 class Shard:
     """一片盘上的文件。
 
     温层：`warm-NNNN.rec` 顺序记记录（每条带长度头），`warm-NNNN.off` 是按条追加的偏移表，
-    `warm-NNNN.bkt` 是哈希桶，`warm-NNNN.key` 是键条目（键 + 下标 + 同桶的下一条）。
+    `warm-NNNN.bktSSSS` 是分片的哈希桶，`warm-NNNN.key` 是键条目（键 + 下标 + 同桶的下一条）。
     冷层：`cold-NNNN.rec` 同样的记录格式，但每条单独 zlib 压缩；偏移表照旧；
     键表按桶分文件 `cold-NNNN.kBBBB`，一条记录一个条目（下标 + 键数 + 全部键），整段 zlib 压。
     """
@@ -92,7 +180,7 @@ class Shard:
         self.rec = store / f"{layer}-{serial:04d}.rec"
         self.off = store / f"{layer}-{serial:04d}.off"  # 按条追加的偏移表
         self.key = store / f"warm-{serial:04d}.key" if layer == "warm" else None
-        self.bkt = store / f"warm-{serial:04d}.bkt" if layer == "warm" else None
+        self.table = BucketTable(store, serial) if buckets and layer == "warm" else None
         self.count = 0  # 这片收了多少条
         self._out = self.rec.open("a+b")  # 记录只往片尾追加；a+ 才能给 mmap 当底座
         self._off_out = self.off.open("a+b")  # 偏移表同样只往后追加
@@ -107,11 +195,6 @@ class Shard:
         self._off_span = 0  # 偏移表映射铺到多大
         self._key_span = 0  # 键条目映射铺到多大
         self._pending = {}  # 冷层桶号 → 还没压走的条目字节；落地一块就清一块
-        self._buckets = None  # 温层桶表的读写映射，开片时按桶数一次铺好
-        if self.buckets and layer == "warm":
-            self._bkt = self.bkt.open("a+b")
-            self._bkt.truncate(self.buckets * 8)  # 桶表定长，开头就占住
-            self._buckets = mmap.mmap(self._bkt.fileno(), self.buckets * 8)
 
     def append(self, body: bytes) -> int:
         """追加一条记录，返回片内位置。冷层的 body 进文件前先压缩。"""
@@ -164,7 +247,7 @@ class Shard:
         head = self._bucket(where)  # 桶里原来那串的头
         self._keys_out.write(key + sub.to_bytes(8, "big") + head.to_bytes(8, "big"))  # 新条目接在最前
         self._key_bytes = at + self.entry
-        self._buckets[where * 8 : where * 8 + 8] = (at // self.entry + 1).to_bytes(8, "big")  # 桶改指新条目
+        self.table.set(where, at // self.entry + 1)  # 桶改指新条目
 
     def find(self, key: bytes) -> list:
         """找键，返回落在它上面的下标。顺着桶里的链一条条比。"""
@@ -204,7 +287,7 @@ class Shard:
         """这片在盘上占的文件。落盘复制和转冷后删除都按它走。"""
         ones = [self.rec, self.off]
         if self.layer == "warm":
-            ones += [self.key, self.bkt]
+            ones += [self.key] + self.table.files()
         else:
             ones += sorted(self.rec.parent.glob(f"cold-{self.serial:04d}.k*"))  # 键桶用几个建几个
         return [one for one in ones if one is not None and one.exists()]
@@ -249,8 +332,7 @@ class Shard:
 
     def _bucket(self, where: int) -> int:
         """桶里那串的头（条目号 + 1）。0 就是空桶。"""
-        at = where * 8
-        return int.from_bytes(self._buckets[at : at + 8], "big")
+        return self.table.get(where)
 
     def _mapped_records(self):
         """记录文件的只读映射，盖不住片尾就重铺。"""
@@ -298,17 +380,20 @@ class Shard:
         return self._key_map
 
     def stream_from_file(self):
-        """转冷前收拾好自己：缓冲写出去，映射全撤掉。
+        """转冷前收拾好自己：缓冲写出去，映射撤掉，桶表跟着关。
 
         映射的页是常驻的，整片顺序搬的时候用不着它；撤掉再顺手顺序读，内存里只压着一条。
+        桶表也一样：转冷要按它把键摊回冷片，但不必留几百个桶的缓存。
         """
         self.flush()
-        for name in ("_rec_map", "_key_map", "_buckets"):
+        for name in ("_rec_map", "_key_map"):
             one = getattr(self, name, None)
             if one is not None:
                 one.close()
                 setattr(self, name, None)
         self._off_map_close()
+        if self.table is not None:
+            self.table.close()
 
     def _off_map_close(self) -> None:
         """撤掉偏移表映射。"""
@@ -324,22 +409,20 @@ class Shard:
         self._off_out.flush()
         if self._keys_out is not None:
             self._keys_out.flush()
-        if self._buckets is not None:
-            self._buckets.flush()
 
     def close(self) -> None:
         """把缓冲写出去，再关映射、关文件。不落盘就关的话，热层里剩的东西才真没了。"""
         self.flush()  # 盘上已经有的先补齐，冷层攒着的桶段落完地再关
-        for one in (self._rec_map, self._off_map, self._key_map, self._buckets):
+        for one in (self._rec_map, self._off_map, self._key_map):
             if one is not None:
                 one.close()
-        self._rec_map = self._off_map = self._key_map = self._buckets = None
+        self._rec_map = self._off_map = self._key_map = None
+        if self.table is not None:
+            self.table.close()
         self._out.close()
         self._off_out.close()
         if self._keys_out is not None:
             self._keys_out.close()
-        if getattr(self, "_bkt", None) is not None:
-            self._bkt.close()
 
     def remove_files(self) -> None:
         """把这片在盘上的文件删掉。转冷搬完原片就没用了，空壳也占 inode。"""
@@ -351,7 +434,7 @@ class Index:
     """分带键 → 下标的映射。一次 weave 用一个实例。
 
     store 给 None 就是纯内存：热层不淘汰，记录全留在内存里，行为和没有这个类时一样。
-    watch 给一个可调用对象，转冷时每走一步都会把「内存里还压着几条记录」报给它用。
+    watch 给一个可调用对象，转冷时会把「缓冲里还压着几条记录」报给它用，刷出去就报 0。
     """
 
     def __init__(self, store=None, hot: int = HOT, per_shard: int = SHARD, warm: int = WARM, key_size: int = 32) -> None:
@@ -477,7 +560,7 @@ class Index:
                     shutil.copyfile(one, target / one.name)  # 分块复制，文件再大也不整块读进内存
             shards.append({"serial": shard.serial, "layer": shard.layer, "count": shard.count, "buckets": shard.buckets})
         manifest = {
-            "version": 2,  # 清单格式版本。2 起记录里带全部键、冷层带键桶
+            "version": 3,  # 清单格式版本。2 起记录里带全部键、冷层带键桶；3 起温层桶表是分片文件
             "key_size": self.key_size,
             "hot": self.hot,
             "per_shard": self.per_shard,
@@ -516,7 +599,7 @@ class Index:
         return self._warm[-1]
 
     def _open_warm(self) -> Shard:
-        """开一片新的温层。"""
+        """开一片新的温层。桶表按这片能装多少条键放宽度，桶多撞车少。"""
         self._serial += 1
         shard = Shard(self.store, self._serial, "warm", self.key_size, max(1024, self.per_shard * BUCKET))
         self._shards[shard.serial] = shard
@@ -524,10 +607,13 @@ class Index:
         return shard
 
     def _to_cold(self, shard: Shard) -> None:
-        """把一片温层转成冷层：逐条流式搬，搬完把原片文件删掉。
+        """把一片温层转成冷层：逐条流式搬，搬完把原片文件、桶片一起删掉。
 
         每条只走「读一条 → 压一条 → 写一条」，写完当场放开，内存里不攒整片；
-        键随记录按桶落地，一段攒满就压走，内存只留没满的那点。
+        键随记录按桶攒着，攒够 COLD_BATCH 条就整个刷出去、缓冲清空，常驻只有一批。
+        为什么是 2000：一片 20 万条的键表是 6.4MB，2000 条的一批约 2MB，是它的一个零头；
+        批再大就要多占内存，批再小则每批都要把两千来个桶文件各开一遍，白费力气。
+        为什么还留 CHUNK：单个桶攒满 CHUNK 就先压走，一个桶里的条目不会被一批切碎。
         """
         self._warm.remove(shard)
         self._warm_rows -= shard.count
@@ -535,7 +621,8 @@ class Index:
         cold = Shard(self.store, self._serial, "cold", self.key_size, self._cold_buckets(shard))
         self._shards[cold.serial] = cold
         self._cold.append(cold)
-        shard.stream_from_file()  # 缓冲落盘、映射撤掉，接着顺序读
+        shard.stream_from_file()  # 缓冲落盘、映射与桶表关掉，接着顺序读
+        buffered = 0  # 这一批已经攒了几条键还没刷出去
         try:
             with shard.rec.open("rb") as source:
                 for _ in range(shard.count):  # 逐条搬，一条一条来
@@ -544,17 +631,19 @@ class Index:
                     sub = int.from_bytes(body[:8], "big")  # 这条的下标
                     keys = _keys_of(body, self.key_size)  # 这条的全部键
                     at = cold.append(body)  # 压一条、写一条
-                    cold.bump(keys, sub)  # 键按桶落地
+                    cold.bump(keys, sub)  # 键按桶攒进缓冲
                     self._where[sub] = (cold.serial << POS_BITS) | at  # 位置表改指冷片
-                    if self.watch is not None:  # 钩子：这时候内存里压着这一条
-                        self.watch(1)
                     del body  # 立刻放开，常驻不攒
-                    if self.watch is not None:
-                        self.watch(0)
+                    buffered += 1
+                    if buffered >= COLD_BATCH:  # 一批攒够了，刷出去、缓冲清空
+                        cold.flush()
+                        buffered = 0
+                    if self.watch is not None:  # 钩子：这时候缓冲里还压着几条
+                        self.watch(buffered)
         finally:
-            cold.flush()  # 桶段全压了落地
-            shard.close()  # 源片文件关掉
-            shard.remove_files()  # 原片连 inode 一起删，不留空壳
+            cold.flush()  # 最后不满一批的也刷出去
+            shard.close()  # 源片文件、桶片文件都关掉
+            shard.remove_files()  # 原片连桶片一起删，不留空壳
             del self._shards[shard.serial]
 
     def _cold_buckets(self, shard: Shard) -> int:
@@ -570,7 +659,7 @@ class Index:
         热层容量、片大小这些跟着清单走：接着上一次的设置继续跑，不会突然换一套。
         """
         manifest = json.loads((self.store / MANIFEST).read_text(encoding="utf-8"))
-        if manifest["version"] != 2:  # 格式对不上就别硬读
+        if manifest["version"] != 3:  # 格式对不上就别硬读（2 的温层桶表是整份一个文件，读不回来）
             raise ValueError(f"索引清单版本 {manifest['version']} 不认识")
         self.key_size = manifest["key_size"]
         self.hot = manifest["hot"]
