@@ -1,19 +1,22 @@
 """落盘索引的测试：三层各自能查、热层满了会挤、片会滚、桶表按片落在盘上、转冷是流式且按批刷、
-落盘能读回来、两种模式判定一样。
+转冷在后台不挡 put、关闭会排队排空、压与不压判定一样、落盘能读回来、两种模式判定一样。
 
 约定：用 8 字节的假键和 3 个假窗口，不跑真实的指纹，省时间；
 分带键的真实长度由 features/duplicate.py 按段内行数给。
+转冷改成后台以后，断言「已经转过冷」之前要 settle()：不刹车时后台可能还排着队。
 """
 
 import random
 import subprocess
 import sys
+import threading
+import time
 import warnings
 from pathlib import Path
 
 import pytest
 
-from features import duplicate
+from features import duplicate, index as index_mod
 from features.index import BUCKET_KEEP, COLD_BATCH, Index
 
 ROOT = Path(__file__).resolve().parent.parent  # 仓库根，压测的子进程要在这儿跑
@@ -82,6 +85,7 @@ def test_warm_rolls_new_shard(tmp_path):
 def test_cold_keeps_every_key(tmp_path):
     index = Index(tmp_path, hot=1, per_shard=2, warm=2, key_size=8)
     fill(index, 40, bands=3)  # 四十条三条键：桶只有 256 个，必然有记录几条键落进同一个桶
+    index.settle()  # 等后台把那几片搬完
     assert index._cold  # 温层攒够上限后最老的片转冷
     for sample in range(40):  # 每一条的每一条键都要撞得上，不能只撞第一条
         for band in range(3):
@@ -95,6 +99,7 @@ def test_cold_conversion_is_streaming(tmp_path):
     seen = []  # 转冷每走一步，钩子报一次缓冲里还压着几条记录
     index.watch = seen.append
     fill(index, 12)
+    index.settle()
     assert index._cold  # 确实转过冷
     assert seen  # 钩子确实报过
     assert max(seen) < COLD_BATCH  # 这一片连一批都没攒满，更不会攒整片
@@ -107,6 +112,7 @@ def test_cold_flushes_in_batches(tmp_path):
     seen = []  # 每搬一条报一次缓冲里压着几条
     index.watch = seen.append
     fill(index, COLD_BATCH + 200)
+    index.settle()
     assert index._cold  # 攒满的片转过冷了
     assert max(seen) <= COLD_BATCH  # 从没超过一批
     assert 0 in seen  # 满一批就刷，刷完缓冲是空的
@@ -117,6 +123,7 @@ def test_cold_flushes_in_batches(tmp_path):
 def test_cold_removes_original_shard(tmp_path):
     index = Index(tmp_path, hot=1, per_shard=2, warm=2, key_size=8)
     fill(index, 12)
+    index.settle()
     assert index._cold
     alive = {shard.serial for shard in index._warm}  # 还在温层的片号
     for pattern in ("warm-*.rec", "warm-*.off", "warm-*.key", "warm-*.bkt[0-9]*"):
@@ -129,6 +136,7 @@ def test_cold_deletes_bucket_slices(tmp_path):
     """转过冷的片，桶片跟着片号一起删掉，不留一堆死文件。"""
     index = Index(tmp_path, hot=1, per_shard=2, warm=2, key_size=8)
     fill(index, 12)
+    index.settle()
     assert index._cold
     alive = {shard.serial for shard in index._warm}
     left = [one for one in tmp_path.glob("warm-*.bkt[0-9]*") if int(one.stem.split("-")[1]) not in alive]
@@ -142,6 +150,96 @@ def test_warm_files_carry_key_table(tmp_path):
     assert list(tmp_path.glob("warm-*.rec"))
     assert list(tmp_path.glob("warm-*.bkt[0-9]*"))  # 温层带键表桶，桶表按片落在盘上
     assert not list(tmp_path.glob("cold-*.rec"))
+
+
+# ---------- 转冷在后台 ----------
+
+def slow_conversion(index: Index, spend: float, seen: list = None) -> None:
+    """把转冷换成一个慢的：睡 spend 秒再真搬。同步实现下这 sleep 就是主流程白等的时间。"""
+    real = index._to_cold
+
+    def slow(shard, serial):
+        if seen is not None:  # 谁被搬了，记下来
+            seen.append(shard.serial)
+        time.sleep(spend)
+        real(shard, serial)
+
+    index._to_cold = slow
+
+
+def test_put_does_not_wait_for_cold(tmp_path):
+    """转冷挪到后台以后，灌语料的耗时不再跟着转冷次数长。
+
+    每片转冷故意拖到 0.3 秒：同步实现下这 0.3 秒是灌到一半时白等的，
+    两千条会白等五六秒；后台跑的话灌完只用几十毫秒，片还在队里排着。
+    """
+    index = Index(tmp_path, hot=200, per_shard=200, warm=400, key_size=8)
+    slow_conversion(index, 0.3)
+    began = time.perf_counter()
+    fill(index, 2000)
+    spent = time.perf_counter() - began
+    queued = index._left  # 灌完这会儿后台还剩几片没搬
+    index.settle()
+    assert queued >= 1  # 片还排着队，主流程没等它
+    assert spent < 1.0  # 灌完只用了几十毫秒，不是一路白等到转完
+    assert len(index._cold) == queued  # 排着的都真搬成了冷片
+    assert not index._jobs  # 队列排空
+
+
+def test_close_drains_queue(tmp_path):
+    """close 先把排着队的片搬完再关：关完冷层片数就是触发过转冷的片数。"""
+    index = Index(tmp_path, hot=5, per_shard=20, warm=40, key_size=8)
+    moved = []  # 后台真正搬过的片号
+    slow_conversion(index, 0.01, moved)
+    fill(index, 400)
+    index.close()
+    assert len(index._cold) == len(moved)  # 排着队的全搬完了，一片不剩
+    assert not index._jobs  # 队列空了
+    assert len(list(tmp_path.glob("cold-*.rec"))) == len(moved)  # 真落了盘，不是只在内存记账
+
+
+def test_worker_error_reaches_close(tmp_path):
+    """后台转冷抛异常要能从 close 抛出来，不能静默。"""
+    index = Index(tmp_path, hot=5, per_shard=20, warm=40, key_size=8)
+
+    def boom(shard, serial):
+        raise RuntimeError("转冷挂了")
+
+    index._to_cold = boom
+    fill(index, 100)
+    with pytest.raises(RuntimeError):
+        index.close()
+
+
+def test_read_while_background_converts(tmp_path):
+    """一边灌一边读：后台正搬着片，主线程按老下标回读也不能炸。
+
+    真机上就是这么用的：后台搬片的同一秒，主流程还在按候选下标回读签名。
+    搬完的片文件是删掉的，句柄留着才读得到；这一步没接好会报 mmap 长度大于文件。
+    """
+    index = Index(tmp_path, hot=100, per_shard=1000, warm=2000, key_size=8)  # 千条一片、两千温层
+    stop = threading.Event()
+    hurt = []  # 读挂了就把原因记在这儿，只记第一条
+
+    def reader():
+        while not stop.is_set():
+            for sub in range(index.size()):
+                try:
+                    index.record(sub)  # 按老下标回读
+                    index.get(keyed(sub, 0))  # 顺带查一下键
+                except Exception as boom:
+                    hurt.append(repr(boom))
+                    return
+
+    other = threading.Thread(target=reader)
+    other.start()
+    fill(index, 4000)  # 四片都会转冷；片放大到千条，一次转冷里主线程要回读很多次
+    stop.set()
+    other.join()
+    index.settle()
+    assert not hurt
+    for sample in range(4000):  # 搬完照样查得到
+        assert index.get(keyed(sample, 1)) == [sample]
 
 
 # ---------- 桶表落盘 ----------
@@ -182,6 +280,7 @@ index = Index({store!r}, hot=2000, per_shard=2000, warm=2000, key_size=8)  # 片
 for sample in range({count}):  # 每条两个键，跟别的用例一个形状
     for band in range(2):
         index.put(keyed(sample, band), sample, [sample] * 4, {{sample}})
+index.settle()  # 后台搬完再量峰值
 assert len(index._cold) >= {cold}, len(index._cold)  # 确实连转了这么多次
 print(int([line.split()[1] for line in open("/proc/self/status") if line.startswith("VmHWM")][0]))
 """
@@ -197,7 +296,7 @@ def _cold_peak(store: Path, count: int, cold: int) -> int:
 
 def test_multi_cold_peak_bounded(tmp_path):
     single = _cold_peak(tmp_path / "one", 4_500, 1)  # 只转一片
-    multi = _cold_peak(tmp_path / "many", 12_000, 5)  # 连转五片
+    multi = _cold_peak(tmp_path / "many", 12_000, 4)  # 连转四片
     assert multi <= single * 1.2  # 每片搬完就放开，峰值不跟着片数涨
 
 
@@ -281,9 +380,30 @@ def test_same_verdict_through_cold(tmp_path):
     disk._index.per_shard = 4  # 片缩到四条、温层只留八条，几百条语料会一路转冷
     disk._index.warm = 8
     assert [memory.check(text) for text in texts] == [disk.check(text) for text in texts]
+    disk._index.settle()
     assert disk._index._cold  # 确实走到了冷层那条路
     assert memory.result.dropped == disk.result.dropped
     disk.close()
+
+
+def test_pack_switch_keeps_verdict(tmp_path, monkeypatch):
+    """压与不压，同一批语料的判定逐条一样；不压确实更占盘。"""
+    texts = corpus()
+    memory = duplicate.Duplicate(duplicate.Rule(threshold=0.8))
+    want = [memory.check(text) for text in texts]
+    got = []
+    for name, pack in (("pack", True), ("raw", False)):  # 两种模式各跑一遍，都跟内存版比
+        monkeypatch.setattr(index_mod, "COLD_PACK", pack)
+        disk = duplicate.Duplicate(duplicate.Rule(threshold=0.8), store=tmp_path / name, hot=3)
+        disk._index.per_shard = 4  # 片缩到四条、温层只留八条，几百条语料一路转冷
+        disk._index.warm = 8
+        got.append([disk.check(text) for text in texts])
+        disk.close()
+    assert got[0] == want
+    assert got[1] == want
+    packed = sum(one.stat().st_size for one in (tmp_path / "pack").glob("cold-*.rec"))
+    raw = sum(one.stat().st_size for one in (tmp_path / "raw").glob("cold-*.rec"))
+    assert raw > packed  # 不压确实原样存，占盘更多
 
 
 def test_disk_reload_verdict_unchanged(tmp_path):

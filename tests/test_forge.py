@@ -772,3 +772,22 @@ def test_onnx_accepts_any_sequence_length(tmp_path):
         assert got.shape == want.shape == (1, length, 32)  # 输出长度跟着输入走
         error = float(np.max(np.abs(got - want)) / max(float(np.max(np.abs(want))), 1e-9))
         assert error < 1e-4  # 每个长度都算得对
+
+
+def test_onnx_accepts_batch_greater_than_one(tmp_path):
+    """批维也是动态的：一批两条一起喂，跟逐条喂的结果一致。"""
+    torch = pytest.importorskip("torch")
+    runtime = pytest.importorskip("onnxruntime")
+
+    folder = full_ckpt(tmp_path)
+    out = tmp_path / "b.onnx"
+    Export(Choice(source=folder, out=out, format="onnx", config=folder / "config.json")).run()
+    session = runtime.InferenceSession(str(out), providers=["CPUExecutionProvider"])
+    names = [one.name for one in session.get_inputs()]
+    past = {name: np.zeros((2, 2, 0, 16), dtype=np.float32) for name in names[1:]}  # 批 2、头 2、没有已算过的位、头宽 16
+    ids = np.random.randint(0, 32, (2, 5)).astype(np.int64)  # 同一批里两条互不相干
+    got = session.run(None, {"input_ids": ids, **past})[0]
+    assert got.shape == (2, 5, 32)  # 输出批维跟着输入走
+    single = session.run(None, {"input_ids": ids[:1], **{k: v[:1] for k, v in past.items()}})[0]  # 单独一条
+    error = float(np.max(np.abs(got[:1] - single)) / max(float(np.max(np.abs(single))), 1e-9))
+    assert error < 1e-5  # 批里两条互不影响

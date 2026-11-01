@@ -3,9 +3,13 @@
 
 调用示例：
   python tests/stress_index.py             # 默认 20 万条
-  python tests/stress_index.py 1000000     # 100 万条，几分钟，进度每 10 万条一行
+  python tests/stress_index.py 1000000     # 100 万条，进度每 10 万条一行
   python tests/stress_index.py 200000      # 二十万，一两分钟
   python tests/stress_index.py 200000 190000  # 二十万条，温层上限压到十九万：末尾转冷一片
+  python tests/stress_index.py 1200000 --no-pack  # 冷片不压 zlib：省 CPU，占盘多，看吞吐上限
+
+第八个参数 --no-pack 可以出现在任意位置，走的是 features.index 的 COLD_PACK。
+转冷在后台线程里做（见 features/index.py），所以这里的耗时量的是主流程不被转冷挡住的样子。
 
 为什么先落语料文件：100 万条要是每次现摇随机词，光造数就能吃掉大半时间，
 两种模式还各摇一遍。先写一次文件，两个子进程都读它，才量的是索引本身的代价。
@@ -45,6 +49,9 @@ from features import duplicate
 def peak():  # 这个进程自己的峰值常驻内存，kB
     return int([line.split()[1] for line in open("/proc/self/status") if line.startswith("VmHWM")][0])
 
+if {no_pack}:  # 冷片不压 zlib，省掉整片的压缩
+    from features import index as index_mod
+    index_mod.COLD_PACK = False
 dup = duplicate.Duplicate(duplicate.Rule(), store={store!r}, hot={hot})  # 落盘热层就是容量
 if {warm} > 0:  # 温层上限压小一点，二十万条也能转冷
     dup._index.warm = {warm}
@@ -64,6 +71,8 @@ with open({corpus!r}, encoding="utf-8") as lines:
         if seen % {step} == 0:  # 打点走 stderr，跟最后的结果行分开
             print(f"  {{seen}} 条 · {{time.perf_counter() - started:.0f}} s", file=sys.stderr, flush=True)
 spent = time.perf_counter() - started
+dup._index.settle()  # 后台排着的片搬完，峰值和耗时才是整轮的数
+spent = time.perf_counter() - started
 assert dup.result.kept == {count}, dup.result.kept  # 语料互不重复，一条都不该判掉
 hot_rows = len(dup._index._order) if dup._index.store else -1  # 纯内存没有热层淘汰
 print(hot_rows, before_cold[0] if before_cold else 0, peak(), round(spent, 2), flush=True)
@@ -78,7 +87,7 @@ def make_corpus(path: Path, count: int) -> None:
             out.write("".join(rng.choice(WORDS) for _ in range(20)) + "。\n")  # 每条 20 个词，长度稳定
 
 
-def run(store, hot: int, count: int, corpus: Path, warm: int = 0) -> tuple:
+def run(store, hot: int, count: int, corpus: Path, warm: int = 0, no_pack: bool = False) -> tuple:
     """在一个子进程里跑一遍，返回（热层条数，热层段峰值 kB，跑完峰值 kB，耗时秒）。"""
     snippet = CHILD.format(
         root=str(ROOT),
@@ -88,6 +97,7 @@ def run(store, hot: int, count: int, corpus: Path, warm: int = 0) -> tuple:
         corpus=str(corpus),
         step=STEP,
         warm=warm,
+        no_pack=no_pack,
     )
     began = subprocess.Popen([sys.executable, "-c", snippet], stdout=subprocess.PIPE, stderr=None, text=True)
     result = began.communicate()[0]  # 进度直接透到终端，这里只等最后的数字
@@ -98,11 +108,13 @@ def run(store, hot: int, count: int, corpus: Path, warm: int = 0) -> tuple:
 
 
 def main() -> None:
-    """跑两种模式并打印对比。第一个参数是语料条数，第二个是温层上限（不给就用默认）。"""
-    count = int(sys.argv[1]) if len(sys.argv) > 1 else 200_000
-    warm = int(sys.argv[2]) if len(sys.argv) > 2 else 0  # 0 就是默认温层上限
+    """跑两种模式并打印对比。第一个参数是语料条数，第二个是温层上限（不给就用默认），--no-pack 不压冷片。"""
+    given = [one for one in sys.argv[1:] if one != "--no-pack"]  # 标志位挪出去，剩下的是位置参数
+    no_pack = len(given) != len(sys.argv) - 1  # 参数被挪掉过，就是给了标志
+    count = int(given[0]) if given else 200_000
+    warm = int(given[1]) if len(given) > 1 else 0  # 0 就是默认温层上限
     hot = 50_000  # 和默认热层一样，这个数就是落盘模式的内存地板
-    print(f"语料 {count} 条 · 纯内存与落盘各跑一个子进程，量 VmHWM")
+    print(f"语料 {count} 条 · 冷片{'不压' if no_pack else '压'} zlib · 纯内存与落盘各跑一个子进程，量 VmHWM")
 
     held = tempfile.mkdtemp(prefix="stress-index-")  # 落盘模式的目录，跑完删
     corpus = Path(held) / "corpus.txt"
@@ -112,14 +124,14 @@ def main() -> None:
         print(f"语料 {corpus.stat().st_size / 1e6:.0f} MB，纯内存跑起", flush=True)
         _, _, memory_peak, memory_spent = run(None, hot, count, corpus)  # 纯内存：全留在内存里
         print("落盘跑起", flush=True)
-        hot_rows, before_cold, disk_peak, disk_spent = run(held, hot, count, corpus, warm)  # 落盘：热层封顶
+        hot_rows, before_cold, disk_peak, disk_spent = run(held, hot, count, corpus, warm, no_pack)  # 落盘：热层封顶
     finally:
         import shutil
 
         shutil.rmtree(held, ignore_errors=True)  # 100 万条能摊出好几个 G，别留着
 
-    print(f"纯内存  峰值 {memory_peak / 1024:8.1f} MB  耗时 {memory_spent:6.2f} s")
-    print(f"落盘    热层段峰值 {before_cold / 1024:8.1f} MB  转冷段峰值 {disk_peak / 1024:8.1f} MB  耗时 {disk_spent:6.2f} s")
+    print(f"纯内存  峰值 {memory_peak / 1024:8.1f} MB  耗时 {memory_spent:6.2f} s  {count / memory_spent:8.0f} 条/秒")
+    print(f"落盘    热层段峰值 {before_cold / 1024:8.1f} MB  转冷段峰值 {disk_peak / 1024:8.1f} MB  耗时 {disk_spent:6.2f} s  {count / disk_spent:8.0f} 条/秒")
     if before_cold:  # 这一轮转过冷，两段能分开看
         print(f"        转冷这一段涨了 {(disk_peak - before_cold) / 1024:.1f} MB")
     else:

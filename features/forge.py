@@ -300,12 +300,12 @@ def onnx_names(layers: int) -> tuple:
 
 
 def past_axes(names: list, out_names: list) -> dict:
-    """序列维和 past_len 维都放开，图才能吃任意长度、任意已有长度。"""
-    axes = {"input_ids": {1: "seq"}, "logits": {1: "seq"}}  # 本步长度两头都动态
+    """批维、序列维、past_len 维全放开，图才能吃任意批、任意长度、任意已有长度。"""
+    axes = {"input_ids": {0: "batch", 1: "seq"}, "logits": {0: "batch", 1: "seq"}}  # 批与本步长度两头都动态
     for name in names[1:]:  # past：批、头、past_len、头宽
-        axes[name] = {2: "past_len"}
+        axes[name] = {0: "batch", 2: "past_len"}
     for name in out_names[1:]:  # present：长度是 past_len + seq，另用一个维名
-        axes[name] = {2: "total_len"}
+        axes[name] = {0: "batch", 2: "total_len"}
     return axes
 
 
