@@ -22,7 +22,7 @@
 三层，越往下越省内存、越慢：
   热层  内存里的 LRU，默认 5 万条键，查得最快；装不下就从头成批挤出去。
   温层  每片 50 万条的顺序文件，记录靠偏移表按需映射读，写只往片尾追加；
-        键走盘上哈希桶，桶表本身也按片落在盘上，内存里只留几百个最近碰过的桶；
+        键走哈希桶，桶头是内存里的一格定长数组，只在落盘和读回来的时候整块读写；
         键条目本身按条切成 4096 条一片的 `warm-NNNN.ketSSSS`，按条号 pread，不整份映射。
   冷层  温层攒够一个上限，最老的片转成压缩片：整片逐条流式搬，一条读完压完写完就放开，
         原片文件当场删掉（不留空壳占 inode）；每条的全部键按桶串进 `cold-NNNN.chk`
@@ -49,12 +49,12 @@
 为什么偏移表放盘上：一片 50 万条 × 8 字节就是 4MB，冷层留几百片光偏移就白分了内存；
 按条追加进 `.off`，读时 mmap 切一刀只碰要读的那 8 字节。
 为什么用内存映射：温层是按偏移跳着读的，mmap 切片比拼一次 seek 再 read 少一次拷贝。
-为什么桶表也要落盘：一片 50 万条的桶表是 32MB，温层留几片就是几十上百 MB。原来整份铺成
-映射，映射过的页会一直算在常驻内存里，百万条实测把这个进程顶到 2GB（内存比从 10.1 掉到 7.9）。
-改成按桶切片落盘、内存只留最近碰过的几百个桶，这部分从几十 MB 压到几百个整数。
-为什么桶片里用 pread/pwrite 而不是映射：桶是 8 字节的链头，读一次写一次就完，铺映射会把页
-重新顶回常驻内存；桶片数按片算下来几十个，一个温片（1M 上限两片）一百多个文件，一直在
-1024 的 fd 上限里头。
+为什么桶表在内存里：查一次键就要一个桶头，桶头走盘就是每条键一次系统调用，实测每条键两次
+系统调用（读头、走链）能吃掉三分之一的登记时间。一片 50 万条是 800 万个桶 × 8 字节 = 64MB，
+按片算、片一搬完就放掉（`BucketTable.drop`），不随语料涨。
+为什么桶表整块读写而不是逐条：桶头是随机地址，逐条落盘等于每条键再搭一次 pwrite；
+它只在 save/close 时整块写一次、读回来时整块读一次，平时一次都不碰盘。
+为什么不用映射：映射过的页算进常驻内存，跟没释放一样；这里就是堆上一格数组。
 为什么键表是哈希桶不是排序段：排序段查一次要把所有段各二分一遍，实测 6 万次查要 12 秒；
 哈希桶查一次只翻一两条链，同样的次数一秒出头。
 为什么键表条目不压缩：一条记录一个桶一般只落一条键，条目块十六七字节，zlib 压完反而更长；
@@ -88,14 +88,13 @@ MANIFEST = "index.json"  # 落盘的清单文件名，加载时按它认目录
 EVICT = 20  # 热层满了每次挤掉容量的几分之一；一条一条挤太零碎
 BUCKET = 16  # 温层桶数取一片能装多少条键的几倍。桶多撞车少，桶本身也要占文件：
              # 桶是查一次键就要走一遍的链头，链长一半、查就快一半；一片五十万条是 800 万桶
-             # × 8 字节 = 64MB，比 8 的 32MB 贵一倍，换来的是别把时间花在链上
+             # × 8 字节 = 64MB，比 8 的 32MB 贵一倍，换来的是别把时间花在链上。
+             # 这是温层唯一一块按片定的内存，片一搬完就放掉（BucketTable.drop）
 MIN_BUCKET = 1024  # 冷层一片最少几个桶。桶太少，每条链都要走很长
 MAX_BUCKET = 4_000_000  # 冷层一片最多几个桶。再多，桶头区自己就比键还占地方
 PER_BUCKET = 4  # 一个桶平均装几条键，按片里的键数反推桶数。链长就是这个数：
                 # 查一次冷层只要按桶号 pread 一个桶头再走几条，链长十几条时一条记录三十多个键
                 # 光查就能吃掉几十毫秒
-BUCKET_TABLE = 32_000_000  # 一片的桶表多大就多重：五十万条 × 8（BUCKET）= 400 万个桶 × 8 字节
-                           # = 32MB。这是温层唯一一块按片大小定的内存，片一搬完就放掉
 KET_KEEP = 256  # 全库共用一个键片句柄池。共用是为了跟片数脱钩：片再多也只开这么多
                  # 只当上限用（fd 上限五十多万，几片全开也就一万多）
 
@@ -213,7 +212,6 @@ class Shard:
         self._rec_span = 0  # 记录映射铺到多大
         self._off_span = 0  # 偏移表映射铺到多大
         self._key_entries = 0  # 键表收了多少条条目，片号就是它除以 KEY_SLICE
-        self._ket_out = None  # 正在写的那片键条目文件，只在片尾那条上
         self._ket_seg = (bytearray(), 0, 0)  # 当前片还没落盘的条目：(缓冲, 第一条的条号, 后一条的条号)。
                                             # 换片、落盘时整个换一份新的，读的那边捏着旧的那份照样是完整的一段
 
@@ -482,7 +480,7 @@ class Shard:
                 mine = [one for one in _KET_CACHE if one.startswith(str(self.key))]
                 for one in mine:
                     os.close(_KET_CACHE.pop(one))
-            self._ket_out = None
+
     def _off_map_close(self) -> None:
         """撤掉偏移表映射。"""
         if self._off_map is not None:
@@ -508,7 +506,6 @@ class Shard:
             if one is not None:
                 one.close()
         self._rec_map = self._off_map = None
-        self._ket_out = None
         self._out.close()
         self._off_out.close()
         if self._chk is not None:
@@ -860,7 +857,6 @@ class Index:
                 left = sorted(self.store.glob(f"warm-{one['serial']:04d}.ket*"))  # 键条目片，按片号就是条号顺序
                 shard._key_entries = sum(one.stat().st_size for one in left) // shard.entry
                 if shard._key_entries:  # 有一片写到半截，就从那一片接着写
-                    shard._ket_out = shard._ket_use(shard._key_entries >> KEY_SHIFT)
                     shard._ket_seg = (bytearray(), shard._key_entries, shard._key_entries)
                 shard.table.load()  # 桶头整块读回来
 
