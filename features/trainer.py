@@ -104,6 +104,8 @@ class Trainer:
         model.grad_checkpoint = choice.grad_checkpoint  # 前向按配方决定要不要重算
         if choice.lora:  # 挂低秩
             lora.attach(model, choice.lora.get("target") or list(lora.TARGETS)[:4], choice.lora["r"], choice.lora["alpha"], choice.lora["dropout"])  # 挂件以外全冻上
+        if choice.lora:  # 挂件是新建的层，建在 CPU，得跟基座放一起
+            model.to(_device_of(model))
         if choice.task in {"dpo", "grpo", "ppo"}:  # 这三类要一份不动的参考模型
             self.ref_model = copy.deepcopy(_unwrap(model)).eval()  # 深拷贝一份基线，挂件和量化都在上面
             for one in self.ref_model.parameters():
@@ -206,7 +208,8 @@ class Trainer:
         for at, one in enumerate(rows):  # 一条条填
             ids[at, : len(one) - 1] = torch.tensor(one[:-1])  # 前 n-1 个当输入
             labels[at, : len(one) - 1] = torch.tensor(one[1:])  # 后 n-1 个当答案
-        return ids, labels
+        here = _device_of(self.model)  # 模型在哪张卡，数据就得在哪
+        return ids.to(here), labels.to(here)
 
     # --- 训练 ---
 
@@ -229,7 +232,7 @@ class Trainer:
         batch = torch.full((len(rows), widest), self.pad_id, dtype=torch.long)  # 先全补 pad
         for at, one in enumerate(rows):  # 一条条填进去
             batch[at, : len(one)] = torch.tensor(one)
-        return batch
+        return batch.to(_device_of(self.model))  # 跟模型放一起
 
     def _logp(self, ids: torch.Tensor) -> torch.Tensor:
         """当前模型给一批序列的答案位对数概率。"""
@@ -500,6 +503,13 @@ class Trainer:
         path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")  # 原样写回
 
 
+def _device_of(model):
+    """模型实际待着的设备。量化层的参数属性可能还写着 cpu，所以先看有没有真上卡。"""
+    if torch.cuda.is_available() and getattr(_unwrap(model), "quantized", False):  # 量化整套已经在卡上了
+        return torch.device("cuda", torch.cuda.current_device())
+    return next(model.parameters()).device
+
+
 def _unwrap(model):
     """拿回没被分布式包过的模型本体。"""
     return model.module if hasattr(model, "module") else model
@@ -568,7 +578,7 @@ def cross_entropy(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """按 token 分块算交叉熵，跳掉 -100 的补位。"""
     flat_logits = logits.reshape(-1, logits.shape[-1])  # 拍平成 (token, 词表)
     flat_labels = labels.reshape(-1)  # 答案也拍平
-    total, count = torch.zeros((), dtype=torch.float32), 0  # 总和与有效 token 数
+    total, count = logits.new_zeros((), dtype=torch.float32), 0  # 总和要求跟 logits 同设备，卡上才不会加不上
     for start in range(0, flat_labels.numel(), CHUNK):  # 一块一块来
         part = flat_labels[start : start + CHUNK]  # 这块的答案
         keep = part != -100  # 这块里哪些是真 token

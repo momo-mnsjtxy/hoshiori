@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 
 import main
+import torch
 from features import model, plan, recipe, tokenizer
 from utils import logs
 from utils.fail import fail
@@ -98,6 +99,8 @@ def command(args) -> int:
             logs.done("spin", "载入基座", path=str(base_path))
         else:  # 指不到就从随机权重起
             logs.warn("spin", "基座不在，从随机权重起", path=str(base_path))
+    here = torch.device("cuda") if _has_cuda() and torch.cuda.is_available() else torch.device("cpu")  # 真能上卡才上
+    net.to(here)  # 先搬设备再量化，量化层建在目标设备上
     quant = net.quantize(precision)  # 量化只能发生在灌完权重之后、建优化器之前
     if quant:
         logs.done("spin", "量化完成", precision=precision)
