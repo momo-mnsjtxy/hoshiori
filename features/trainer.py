@@ -535,7 +535,8 @@ def _setup() -> tuple:
         return 0, 1
     local = int(os.environ["LOCAL_RANK"])  # 本机第几张卡，torchrun 排好的
     if torch.cuda.is_available():  # 卡上每进程认领一张，默认 0 号会让所有进程挤在一张上
-        torch.cuda.set_device(local)
+        cards = torch.cuda.device_count()  # 几张卡
+        torch.cuda.set_device(local % cards if cards else 0)  # 进程比卡多时绕回来（单机用 devices:[0,0] 验分布式就是这种）
     torch.distributed.init_process_group("nccl" if torch.cuda.is_available() else "gloo")  # 卡上用 nccl，CPU 上用 gloo；rank 和总数从环境变量读
     return int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])  # 全局序号和总进程数
 

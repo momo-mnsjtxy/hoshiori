@@ -2,6 +2,7 @@
 
 约定：权重全是几行几列的小矩阵，量化只考字节布局和还原误差，不考压缩率。
 缺包的用例用 monkeypatch 假掉 find_spec，机器上装没装 onnx / mlx_lm 都跑得出同一个结果。
+onnx 的参考值一律拿 torch 那一侧的模块算，不拿 onnx 自己的输出当答案；past 一律用空的或零的。
 """
 
 import importlib.util
@@ -596,6 +597,31 @@ def test_onnx_needs_package(tmp_path, monkeypatch):
     assert run_forge(tmp_path, "--out", str(tmp_path / "o"), "--format", "onnx") == 4
 
 
+def export_with_past(tmp_path):
+    """导一张带 past 的完整图，返回（torch, session, 模块, 假输入, 输入名, 输出名）。
+
+    假输入里已经是空的 past（长度 0）；要对数的参考值一律拿模块那边算。
+    """
+    torch = pytest.importorskip("torch")
+    runtime = pytest.importorskip("onnxruntime")
+    folder = full_ckpt(tmp_path)
+    out = tmp_path / "m.onnx"
+    Export(Choice(source=folder, out=out, format="onnx", config=folder / "config.json")).run()
+    tensors = forge.rename(forge.load(folder), [])
+    config = json.loads((folder / "config.json").read_text(encoding="utf-8"))
+    module, feeds = forge.onnx_graph(tensors, config, torch)  # 同一份权重再搭一遍，只用来出参考值
+    names, out_names = forge.onnx_names(len(feeds[1]))
+    session = runtime.InferenceSession(str(out), providers=["CPUExecutionProvider"])
+    return torch, session, module, feeds, names, out_names
+
+
+def feed(names, feeds, ids, past_k=None, past_v=None):
+    """按输入名拼一份 onnxruntime 的输入；不给 past 就用假输入里那份空的。都换成 numpy。"""
+    _, empty_k, empty_v = feeds
+    parts = [ids, *(empty_k if past_k is None else past_k), *(empty_v if past_v is None else past_v)]
+    return dict(zip(names, [np.asarray(one) for one in parts]))
+
+
 def test_onnx_writes_full_graph(tmp_path):
     """整张因果图要能导出来：checker 过、输入输出对、权重落旁边同名文件。"""
     pytest.importorskip("torch")
@@ -605,36 +631,71 @@ def test_onnx_writes_full_graph(tmp_path):
     report = Export(Choice(source=folder, out=out, format="onnx", config=folder / "config.json")).run()
     model = onnx.load(str(out))
     onnx.checker.check_model(model)  # 图本身要合法
-    assert [one.name for one in model.graph.input] == ["input_ids"]  # 输入只有一个 token id
-    assert [one.name for one in model.graph.output] == ["logits"]  # 输出是每个位置的词表打分
-    nodes = {one.op_type for one in model.graph.node}  # 图里真的有点积、softmax、查表这些算子
-    assert {"MatMul", "Softmax", "Gather"} <= nodes
-    assert len(model.graph.input) == 1  # past 是可省的，不塞输入
+    assert [one.name for one in model.graph.input] == ["input_ids", "past_k.0", "past_k.1", "past_v.0", "past_v.1"]  # 每层一对 past，加 token id
+    assert [one.name for one in model.graph.output] == ["logits", "present_k.0", "present_k.1", "present_v.0", "present_v.1"]  # 打分，加各层回出去的 present
+    nodes = {one.op_type for one in model.graph.node}  # 图里真的有点积、softmax、查表、拼 past 这些算子
+    assert {"MatMul", "Softmax", "Gather", "Concat"} <= nodes
+    assert len(model.graph.input) == 5  # 两层就是四份 past，一份不少
     assert sorted(load_file(str(tmp_path / "m.safetensors")))  # 权重整份落在旁边
     assert any("onnx 对拍" in one for one in report["dropped"])  # 自检结论进了出账
 
 
 def test_onnx_graph_matches_torch_logits(tmp_path):
     """整图导出的 logits 要和 torch 那边的 logits 对得上，相对误差 < 1e-4。"""
-    torch = pytest.importorskip("torch")
-    runtime = pytest.importorskip("onnxruntime")
+    torch, session, module, feeds, names, _ = export_with_past(tmp_path)
     import onnx
 
-    folder = full_ckpt(tmp_path)
-    out = tmp_path / "m.onnx"
-    Export(Choice(source=folder, out=out, format="onnx", config=folder / "config.json")).run()
-    onnx.checker.check_model(onnx.load(str(out)))
-    # 重新按同一份权重把图搭一遍，拿来跟 onnx 的产物对数
-    tensors = forge.rename(forge.load(folder), [])
-    config = json.loads((folder / "config.json").read_text(encoding="utf-8"))
-    module, ids = forge.onnx_graph(tensors, config, torch)
+    onnx.checker.check_model(onnx.load(str(tmp_path / "m.onnx")))
+    ids, past_k, past_v = feeds
     with torch.no_grad():
-        want = module(ids).numpy()
-    session = runtime.InferenceSession(str(out), providers=["CPUExecutionProvider"])
-    got = session.run(None, {"input_ids": ids.numpy()})[0]
+        want = module(ids, past_k, past_v)[0].numpy()
+    got = session.run(None, feed(names, feeds, ids.numpy()))[0]
     assert want.shape == got.shape == (1, 8, 32)  # 一批、8 步、词表 32
     error = float(np.max(np.abs(got - want)) / float(np.max(np.abs(want))))  # 相对最大值
     assert error < 1e-4  # 导出来的图算得对，不是只是长得像
+
+
+def test_onnx_past_len_zero_matches_whole_forward(tmp_path):
+    """past_len 为 0 时就是整段前向：相对误差 < 1e-4，而且前几位不受后面的 token 影响。"""
+    torch, session, module, feeds, names, _ = export_with_past(tmp_path)
+    ids = torch.randint(0, 32, (1, 8), dtype=torch.long)  # 随便挑一串 token
+    with torch.no_grad():
+        want = module(ids, *feeds[1:])[0].numpy()  # 空 past 喂进去就是整段前向
+    got = session.run(None, feed(names, feeds, ids.numpy()))[0]
+    error = float(np.max(np.abs(got - want)) / float(np.max(np.abs(want))))
+    assert error < 1e-4  # 走 past 这条岔路，结果不能变
+    short = session.run(None, feed(names, feeds, ids[:, :5].numpy()))[0]  # 只喂前 5 位，past 仍是 0
+    head = float(np.max(np.abs(short - want[:, :5])) / float(np.max(np.abs(want[:, :5]))))
+    assert head < 1e-4  # 前 5 位的 logits 和整段跑出来的前 5 位一样，因果没被 past 弄坏
+
+
+def test_onnx_split_decode_matches_whole(tmp_path):
+    """先喂 5 再喂 5、第二次带上第一次的 present：最后一位 logits 和一次喂 10 的差在 1e-3 以内。"""
+    torch, session, module, feeds, names, _ = export_with_past(tmp_path)
+    ids = torch.randint(0, 32, (1, 10), dtype=torch.long)
+    with torch.no_grad():
+        want = module(ids, *feeds[1:])[0].numpy()  # 一次喂 10 的参考值
+    layer = len(feeds[1])
+    first = session.run(None, feed(names, feeds, ids[:, :5].numpy()))  # 前半段自己跑
+    past_k, past_v = first[1 : 1 + layer], first[1 + layer :]  # 回出来的 present 当第二段的 past
+    got = session.run(None, feed(names, feeds, ids[:, 5:].numpy(), past_k, past_v))[0]
+    assert got.shape == (1, 5, 32)  # 第二段只管这 5 步
+    want_last, got_last = want[0, -1], got[0, -1]
+    error = float(np.max(np.abs(got_last - want_last)) / float(np.max(np.abs(want_last))))
+    assert error < 1e-3  # 分段解码累积误差够小，KV 复用是真能用
+
+
+def test_onnx_present_shape_grows_along_past(tmp_path):
+    """present 和 past 同构，只有长度那维加上本步：past 长 4、喂 3 步，回出来是 7，前 4 位就是喂进去的 past。"""
+    torch, session, module, feeds, names, out_names = export_with_past(tmp_path)
+    layer, heads, head_dim = len(feeds[1]), feeds[1][0].shape[1], feeds[1][0].shape[3]
+    past_k = [torch.zeros(1, heads, 4, head_dim) for _ in range(layer)]  # 零 past，拼出来的前 4 位也该是零
+    past_v = [torch.zeros(1, heads, 4, head_dim) for _ in range(layer)]
+    ids = torch.randint(0, 32, (1, 3), dtype=torch.long)
+    got = session.run(None, feed(names, feeds, ids.numpy(), past_k, past_v))
+    assert [one.name for one in session.get_outputs()] == out_names  # 输出顺序和声明的一致
+    assert [one.shape for one in got[1:]] == [(1, heads, 7, head_dim)] * (2 * layer)  # 每份 present 同构加长
+    assert all(float(np.abs(one[:, :, :4]).max()) == 0.0 for one in got[1:])  # 前 4 位原样是喂进去的 past
 
 
 def test_mlx_needs_package(tmp_path, monkeypatch):
@@ -702,21 +763,12 @@ def test_missing_weights(tmp_path):
 
 def test_onnx_accepts_any_sequence_length(tmp_path):
     """图要能吃不同长度：1、7、13 三种都跟 torch 对得上，长度维是动态的。"""
-    torch = pytest.importorskip("torch")
-    runtime = pytest.importorskip("onnxruntime")
-
-    folder = full_ckpt(tmp_path)
-    out = tmp_path / "d.onnx"
-    Export(Choice(source=folder, out=out, format="onnx", config=folder / "config.json")).run()
-    tensors = forge.rename(forge.load(folder), [])
-    config = json.loads((folder / "config.json").read_text(encoding="utf-8"))
-    module, _ = forge.onnx_graph(tensors, config, torch)
-    session = runtime.InferenceSession(str(out), providers=["CPUExecutionProvider"])  # 同一个 session 反复喂不同长度
+    torch, session, module, feeds, names, _ = export_with_past(tmp_path)  # 同一个 session 反复喂不同长度
     for length in (1, 7, 13):
         ids = torch.randint(0, 32, (1, length), dtype=torch.long)  # 随便挑一串 token
         with torch.no_grad():
-            want = module(ids).numpy()
-        got = session.run(None, {"input_ids": ids.numpy()})[0]
+            want = module(ids, *feeds[1:])[0].numpy()
+        got = session.run(None, feed(names, feeds, ids.numpy()))[0]
         assert got.shape == want.shape == (1, length, 32)  # 输出长度跟着输入走
         error = float(np.max(np.abs(got - want)) / max(float(np.max(np.abs(want))), 1e-9))
         assert error < 1e-4  # 每个长度都算得对

@@ -39,6 +39,7 @@ q6_k 的逐子块比例不是拍出来的数，是像上游 make_qx_quants 那�
 tokenizer 从基座目录的 tokenizer.json（或 tokenizer.model）导出词表与 merges，
 kv 缺哪一条、读不出来都记进 dropped：产物离开仓库能不能独立跑，看这一栏。
 onnx 走 torch.onnx.export 导整张因果图（词表 → N 层 → 归一 → 输出层），权重落旁边同名 safetensors，
+这张图能增量解码：每层都有 past_k.N / past_v.N，回出 present_k.N / present_v.N，一段喂完接着下一段；
 导完过 onnx.checker，再拿 onnxruntime 跟 torch 对拍 logits；mlx 走 mlx_lm.convert 子进程，
 Linux 上跑不了 mlx，就把命令、参数、临时目录布局打出来（--verbose），--mlx-print-only 只打印不执行。
 """
@@ -198,27 +199,30 @@ class Export:
         from safetensors.numpy import save_file  # 权重落旁边，onnx 文件里只存图
 
         config = json.loads(Path(self.choice.config).read_text(encoding="utf-8")) if self.choice.config else {}  # 结构配置，没有就全靠权重形状推
-        module, ids = onnx_graph(tensors, config, torch)  # 同构模块加一批假 token
+        module, feeds = onnx_graph(tensors, config, torch)  # 同构模块加一批假 token 和空的 past
+        names, out_names = onnx_names(len(feeds[1]))  # 输入输出名按层展开
         self.choice.out.parent.mkdir(parents=True, exist_ok=True)
         side = self.choice.out.with_suffix(".safetensors")  # 权重文件，和 onnx 同名不同后缀
         save_file({name: np.ascontiguousarray(one.astype(np.float32)) for name, one in tensors.items()}, str(side))  # 权重整份落盘
         if self.choice.verbose:  # 把这张图的输入输出摆出来
-            print(f"onnx 输入 input_ids int64 {tuple(ids.shape)}，输出 logits，opset 14")
+            for name, one in zip(names, flat(feeds)):  # 一个输入一行，形状照实打
+                print(f"onnx 输入 {name} {one.dtype} {tuple(one.shape)}")
+            print(f"onnx 输出 {', '.join(out_names)}，opset 14")
         # dynamo=False 走 TorchScript 那条老路：只要 torch 和 onnx，不额外要 onnxscript。
         torch.onnx.export(
             module,  # 拼好的模块
-            ids,  # 一批一个，长度 ONNX_SEQ 的假 token
+            feeds,  # 一批一个，长度 ONNX_SEQ 的假 token，past 长度 0
             str(self.choice.out),  # 图写到哪
-            input_names=["input_ids"],  # 输入名
-            output_names=["logits"],  # 输出名，前向只出每个位置的词表打分
+            input_names=names,  # 输入名
+            output_names=out_names,  # 输出名：每个位置的词表打分，加各层回出去的 present
             opset_version=14,  # 14 是各家运行时都吃得下的版本
             dynamo=False,  # 走老 exporter，见上面那行
-            dynamic_axes={"input_ids": {1: "seq"}, "logits": {1: "seq"}},  # 序列维放开，长度不再钉死
+            dynamic_axes=past_axes(names, out_names),  # 序列维和 past_len 维全放开，长度不再钉死
         )
         import onnx  # 只有这条路要 onnx
 
         onnx.checker.check_model(onnx.load(str(self.choice.out)))  # 图本身要合法，不合规当场报
-        error, note = verify_graph(self.choice.out, module, ids)  # 有 onnxruntime 就真跑一遍对数
+        error, note = verify_graph(self.choice.out, module, feeds, names)  # 有 onnxruntime 就真跑一遍对数
         if error is not None and error > ONNX_RELATIVE_MAX:  # 差过线就是图导坏了
             fail("error", f"onnx 图和 torch 对不上，相对误差 {error:.2e}", hint="换 opset 或看这个算子有没有实现")
         if self.choice.verbose:  # 自检结论也打出来
@@ -285,8 +289,37 @@ def onnx_local_name(name: str):
     return None
 
 
+def onnx_names(layers: int) -> tuple:
+    """图的输入输出名，按层展开。返回（输入名, 输出名）。
+
+    每层一对 past 进、一对 present 出；past_len 为 0、present 原样给回时，行为和整段前向一样。
+    """
+    past = [f"past_{s}.{one}" for s in ("k", "v") for one in range(layers)]  # past_k.0 / past_v.0 …
+    present = [f"present_{s}.{one}" for s in ("k", "v") for one in range(layers)]  # present_k.0 / present_v.0 …
+    return ["input_ids", *past], ["logits", *present]
+
+
+def past_axes(names: list, out_names: list) -> dict:
+    """序列维和 past_len 维都放开，图才能吃任意长度、任意已有长度。"""
+    axes = {"input_ids": {1: "seq"}, "logits": {1: "seq"}}  # 本步长度两头都动态
+    for name in names[1:]:  # past：批、头、past_len、头宽
+        axes[name] = {2: "past_len"}
+    for name in out_names[1:]:  # present：长度是 past_len + seq，另用一个维名
+        axes[name] = {2: "total_len"}
+    return axes
+
+
+def flat(feeds: tuple) -> list:
+    """把（假 token, past_k 列表, past_v 列表）摊成一列，顺序和输入名一致。"""
+    ids, past_k, past_v = feeds
+    return [ids, *past_k, *past_v]
+
+
 def onnx_graph(tensors: dict, config: dict, torch):
-    """按权重里的名字拼一个和 features.model 同构的最小模块，权重真灌进去，返回（模块, 假 token）。
+    """按权重里的名字拼一个和 features.model 同构的最小模块，权重真灌进去，返回（模块, 一批输入）。
+
+    输入是（假 token, 各层空 past_k, 各层空 past_v），past 形状 (批, 头, past_len=0, 头宽)，
+    前向回（logits, 各层 present_k …, 各层 present_v …）；把 present 当下一段的 past 喂回去就是增量解码。
 
     名字对不上 features.model 的张量（没映射过的）不进图，缺的张量保持随机初值（种子写死）。
     这样只有几个张量的小权重也能导出一张完整图，全张量的权重导出来就是原样的那一摞。
@@ -323,15 +356,15 @@ def onnx_graph(tensors: dict, config: dict, torch):
     pair = torch.arange(0, head_dim, 2, dtype=torch.float32)  # 每两维一组
     freq = (theta ** (-pair / head_dim))[None, :]  # 每组的角速度，序列长度无关，可以预算
 
-    def angles(steps: int):  # 角度按实际长度现算，导出的图才能吃任意长度
-        spot = torch.arange(steps, dtype=torch.float32)  # 每个位置一个标量
+    def angles(steps, past):  # 角度按实际长度现算，导出的图才能吃任意长度
+        spot = torch.arange(steps, dtype=torch.float32) + past  # 位置接着 past_len 往后数，不是从 0 起
         turn = spot[:, None] * freq  # 位置乘角速度
         return turn.cos()[None, None], turn.sin()[None, None]  # 补批和头两维，好跟张量对齐
 
-    def rotate(x, steps: int):  # 相邻两维当一对转，和 features/model.py 的 rotate 一个算法
+    def rotate(x, steps, past):  # 相邻两维当一对转，和 features/model.py 的 rotate 一个算法
         if head_dim % 2:  # 头宽是奇数就配不成对，原样返回
             return x
-        cos, sin = angles(steps)  # 按这一批的真实长度取角度
+        cos, sin = angles(steps, past)  # 按这一批的真实长度和起点取角度
         pairs = x.view(*x.shape[:-1], -1, 2)  # 头宽拆成 组 × 组内两值
         left, right = pairs[..., 0], pairs[..., 1]  # 一组的两个分量
         turned = torch.stack((-right, left), dim=-1)  # 旋转 90 度
@@ -348,7 +381,7 @@ def onnx_graph(tensors: dict, config: dict, torch):
             return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * self.weight  # 归一后乘回缩放
 
     class Attention(nn.Module):
-        """多头因果注意力，参数名缩写成 q / k / v / o。"""
+        """多头因果注意力，参数名缩写成 q / k / v / o。past 拼在本步前面一起算，回出拼好的 present。"""
 
         def __init__(self) -> None:
             super().__init__()
@@ -357,15 +390,20 @@ def onnx_graph(tensors: dict, config: dict, torch):
             self.v = nn.Linear(hidden, d_attn, bias=False)  # 值
             self.o = nn.Linear(d_attn, hidden, bias=False)  # 拼回隐藏维
 
-        def forward(self, x):
-            batch, steps, _ = x.shape  # 批、序列、隐藏维
+        def forward(self, x, past_k, past_v):
+            batch, steps, _ = x.shape  # 批、本步长度、隐藏维
+            past = past_k.shape[2]  # 前面已经有了多少位，query 的起点和遮罩都靠它
+            newest = past + steps  # 拼完之后的键长
             split = lambda part: part.view(batch, steps, heads, head_dim).transpose(1, 2)  # 拆成（批, 头, 序列, 头宽）
-            query, key, value = rotate(split(self.q(x)), steps), rotate(split(self.k(x)), steps), split(self.v(x))  # 查询键转位置，值不动
-            scores = (query @ key.transpose(-2, -1)) * (head_dim ** -0.5)  # 缩放点积
-            mask = torch.triu(torch.ones(steps, steps, dtype=torch.bool), diagonal=1)  # 遮罩按实际长度现做
-            scores = scores.masked_fill(mask, float("-inf"))  # 因果遮罩
+            query = rotate(split(self.q(x)), steps, past)  # 查询从这个起点开始转位置
+            key = torch.cat([past_k, rotate(split(self.k(x)), steps, past)], dim=2)  # 旧的键在前，本步的键接在后
+            value = torch.cat([past_v, split(self.v(x))], dim=2)  # 值同样接在后面，值不转位置
+            scores = (query @ key.transpose(-2, -1)) * (head_dim ** -0.5)  # 缩放点积，键长是 past + 本步
+            reach = torch.arange(steps) + past  # 每个 query 能看到的最后一个键位置（含自己）
+            ahead = torch.arange(newest)[None, :] > reach[:, None]  # 比它更靠右的键看不见
+            scores = scores.masked_fill(ahead, float("-inf"))  # 左对齐的因果遮罩
             out = torch.softmax(scores, dim=-1) @ value  # 加权求和
-            return self.o(out.transpose(1, 2).reshape(batch, steps, -1))  # 头拼回去再投影
+            return self.o(out.transpose(1, 2).reshape(batch, steps, -1)), key, value  # 投影回去，键值当 present 交出去
 
     class Feed(nn.Module):
         """前馈：门控乘值，再压回隐藏维。"""
@@ -389,12 +427,13 @@ def onnx_graph(tensors: dict, config: dict, torch):
             self.feed_norm = RMS()  # 进前馈前再归一
             self.feed = Feed()  # 前馈
 
-        def forward(self, x):
-            x = x + self.attn(self.attention_norm(x))  # 注意力这一跳
-            return x + self.feed(self.feed_norm(x))  # 前馈这一跳
+        def forward(self, x, past_k, past_v):
+            out, key, value = self.attn(self.attention_norm(x), past_k, past_v)  # 注意力这一跳，顺手带出 present
+            x = x + out  # 残差
+            return x + self.feed(self.feed_norm(x)), key, value  # 前馈这一跳，键值原样往上交
 
     class Graph(nn.Module):
-        """整摞：查表 → 逐层 → 收尾归一 → 输出层。"""
+        """整摞：查表 → 逐层 → 收尾归一 → 输出层。每层一份 past 进，一份 present 出。"""
 
         def __init__(self) -> None:
             super().__init__()
@@ -403,12 +442,16 @@ def onnx_graph(tensors: dict, config: dict, torch):
             self.norm = RMS()  # 收尾归一
             self.head = None if tie else nn.Linear(hidden, vocab, bias=False)  # 独立输出层，共用时就是 None
 
-        def forward(self, ids):
+        def forward(self, ids, past_k, past_v):
             x = self.embed(ids)  # 查表
-            for block in self.layers:  # 一层一层往下走
-                x = block(x)
+            keys, values = [], []  # 各层回出来的 present
+            for block, one_k, one_v in zip(self.layers, past_k, past_v):  # 一层一层往下走，past 按层对号
+                x, key, value = block(x, one_k, one_v)
+                keys.append(key)  # 这一层拼好 past 的键
+                values.append(value)  # 这一层的值
             x = self.norm(x)  # 收尾归一
-            return x @ self.embed.weight.T if self.head is None else self.head(x)  # 共用词表就直接拿转置投影
+            logits = x @ self.embed.weight.T if self.head is None else self.head(x)  # 共用词表就直接拿转置投影
+            return (logits, *keys, *values)  # 每个位置的打分，加各层的 present
 
     module = Graph().eval()  # 先搭好架子
     state = {}  # 要灌进去的权重
@@ -418,11 +461,15 @@ def onnx_graph(tensors: dict, config: dict, torch):
             state[local] = one
     module.load_state_dict(state, strict=False)  # 缺的保持随机初值
     ids = (torch.arange(seq, dtype=torch.long) % vocab)[None]  # 一批一个，长度 seq 的假 token
-    return module, ids
+    empty = lambda: torch.zeros(1, heads, 0, head_dim)  # past_len 为 0 的空 past：导出时就走整段前向那条路
+    return module, (ids, [empty() for _ in range(layers)], [empty() for _ in range(layers)])  # 每层一份，键和值各一批
 
 
-def verify_graph(path: Path, module, ids) -> tuple:
-    """有 onnxruntime 就真跑一遍对拍，返回（logits 相对误差, 说明）；没装返回（None, 说明）。"""
+def verify_graph(path: Path, module, feeds: tuple, names: list) -> tuple:
+    """有 onnxruntime 就真跑一遍对拍，返回（logits 相对误差, 说明）；没装返回（None, 说明）。
+
+    past 用空的那一份（past_len 为 0），对拍的还是整段前向这一条路：图松了能拦住。
+    """
     import torch
 
     try:
@@ -431,8 +478,9 @@ def verify_graph(path: Path, module, ids) -> tuple:
         return None, "没装 onnxruntime，数值没对拍（只过了 checker）"
     session = runtime.InferenceSession(str(path), providers=["CPUExecutionProvider"])  # 只在本机 CPU 上跑
     with torch.no_grad():  # 对拍不需要梯度
-        want = module(ids).numpy()  # torch 这一侧的结果
-    got = session.run(None, {"input_ids": ids.numpy()})[0]  # onnx 这一侧的结果
+        want = module(*feeds)[0].numpy()  # torch 这一侧的结果，第 0 个回的是 logits
+    feed = {name: one.numpy() for name, one in zip(names, flat(feeds))}  # 输入按名字喂
+    got = session.run(None, feed)[0]  # onnx 这一侧的结果
     error = float(np.max(np.abs(got - want)) / max(float(np.max(np.abs(want))), 1e-12))  # 除以最大值算相对误差
     return error, f"onnx 对拍 logits 相对误差 {error:.2e}（上限 {ONNX_RELATIVE_MAX:g}）"
 
