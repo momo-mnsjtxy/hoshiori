@@ -213,6 +213,7 @@ class Export:
             output_names=["logits"],  # 输出名，前向只出每个位置的词表打分
             opset_version=14,  # 14 是各家运行时都吃得下的版本
             dynamo=False,  # 走老 exporter，见上面那行
+            dynamic_axes={"input_ids": {1: "seq"}, "logits": {1: "seq"}},  # 序列维放开，长度不再钉死
         )
         import onnx  # 只有这条路要 onnx
 
@@ -319,14 +320,18 @@ def onnx_graph(tensors: dict, config: dict, torch):
     theta = float(config.get("rope_theta") or 10000.0)  # rope 底数
     tie = "output.weight" not in found  # 没有独立输出层就拿词表权重转置当输出层
 
-    step = torch.arange(seq, dtype=torch.float32)  # 每个位置一个标量
     pair = torch.arange(0, head_dim, 2, dtype=torch.float32)  # 每两维一组
-    angle = step[:, None] * (theta ** (-pair / head_dim))[None, :]  # 位置乘频率，得到每组的旋转角
-    cos, sin = angle.cos()[None, None], angle.sin()[None, None]  # 补批和头两维，好跟张量对齐
+    freq = (theta ** (-pair / head_dim))[None, :]  # 每组的角速度，序列长度无关，可以预算
 
-    def rotate(x):  # 相邻两维当一对转，和 features/model.py 的 rotate 一个算法
+    def angles(steps: int):  # 角度按实际长度现算，导出的图才能吃任意长度
+        spot = torch.arange(steps, dtype=torch.float32)  # 每个位置一个标量
+        turn = spot[:, None] * freq  # 位置乘角速度
+        return turn.cos()[None, None], turn.sin()[None, None]  # 补批和头两维，好跟张量对齐
+
+    def rotate(x, steps: int):  # 相邻两维当一对转，和 features/model.py 的 rotate 一个算法
         if head_dim % 2:  # 头宽是奇数就配不成对，原样返回
             return x
+        cos, sin = angles(steps)  # 按这一批的真实长度取角度
         pairs = x.view(*x.shape[:-1], -1, 2)  # 头宽拆成 组 × 组内两值
         left, right = pairs[..., 0], pairs[..., 1]  # 一组的两个分量
         turned = torch.stack((-right, left), dim=-1)  # 旋转 90 度
@@ -351,14 +356,14 @@ def onnx_graph(tensors: dict, config: dict, torch):
             self.k = nn.Linear(hidden, d_attn, bias=False)  # 键
             self.v = nn.Linear(hidden, d_attn, bias=False)  # 值
             self.o = nn.Linear(d_attn, hidden, bias=False)  # 拼回隐藏维
-            self.mask = torch.triu(torch.ones(seq, seq, dtype=torch.bool), diagonal=1)  # 上三角遮掉未来
 
         def forward(self, x):
             batch, steps, _ = x.shape  # 批、序列、隐藏维
             split = lambda part: part.view(batch, steps, heads, head_dim).transpose(1, 2)  # 拆成（批, 头, 序列, 头宽）
-            query, key, value = rotate(split(self.q(x))), rotate(split(self.k(x))), split(self.v(x))  # 查询键转位置，值不动
+            query, key, value = rotate(split(self.q(x)), steps), rotate(split(self.k(x)), steps), split(self.v(x))  # 查询键转位置，值不动
             scores = (query @ key.transpose(-2, -1)) * (head_dim ** -0.5)  # 缩放点积
-            scores = scores.masked_fill(self.mask, float("-inf"))  # 因果遮罩
+            mask = torch.triu(torch.ones(steps, steps, dtype=torch.bool), diagonal=1)  # 遮罩按实际长度现做
+            scores = scores.masked_fill(mask, float("-inf"))  # 因果遮罩
             out = torch.softmax(scores, dim=-1) @ value  # 加权求和
             return self.o(out.transpose(1, 2).reshape(batch, steps, -1))  # 头拼回去再投影
 

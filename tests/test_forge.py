@@ -698,3 +698,25 @@ def test_missing_weights(tmp_path):
     path = tmp_path / "sft.warp.yaml"
     path.write_text("version: 1\ntask: sft\nmodel:\n  path: nope\n", encoding="utf-8")
     assert main.run(["forge", str(path), "--out", str(tmp_path / "o"), "--format", "gguf"]) == 2
+
+
+def test_onnx_accepts_any_sequence_length(tmp_path):
+    """图要能吃不同长度：1、7、13 三种都跟 torch 对得上，长度维是动态的。"""
+    torch = pytest.importorskip("torch")
+    runtime = pytest.importorskip("onnxruntime")
+
+    folder = full_ckpt(tmp_path)
+    out = tmp_path / "d.onnx"
+    Export(Choice(source=folder, out=out, format="onnx", config=folder / "config.json")).run()
+    tensors = forge.rename(forge.load(folder), [])
+    config = json.loads((folder / "config.json").read_text(encoding="utf-8"))
+    module, _ = forge.onnx_graph(tensors, config, torch)
+    session = runtime.InferenceSession(str(out), providers=["CPUExecutionProvider"])  # 同一个 session 反复喂不同长度
+    for length in (1, 7, 13):
+        ids = torch.randint(0, 32, (1, length), dtype=torch.long)  # 随便挑一串 token
+        with torch.no_grad():
+            want = module(ids).numpy()
+        got = session.run(None, {"input_ids": ids.numpy()})[0]
+        assert got.shape == want.shape == (1, length, 32)  # 输出长度跟着输入走
+        error = float(np.max(np.abs(got - want)) / max(float(np.max(np.abs(want))), 1e-9))
+        assert error < 1e-4  # 每个长度都算得对
