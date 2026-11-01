@@ -1,23 +1,27 @@
 """落盘索引的测试：三层各自能查、热层满了会挤、片会滚、桶表按片落在盘上、转冷是流式且按批刷、
-转冷在后台不挡 put、关闭会排队排空、压与不压判定一样、落盘能读回来、两种模式判定一样。
+转冷在后台不挡 put、关闭会排队排空、压与不压判定一样、落盘能读回来、两种模式判定一样，
+外加键表按条分片、冷片单桶文件两桶不串、桶链按序走、查询只读目标桶。
 
 约定：用 8 字节的假键和 3 个假窗口，不跑真实的指纹，省时间；
 分带键的真实长度由 features/duplicate.py 按段内行数给。
 转冷改成后台以后，断言「已经转过冷」之前要 settle()：不刹车时后台可能还排着队。
 """
 
+import array
+import os
 import random
 import subprocess
 import sys
 import threading
 import time
 import warnings
+import zlib
 from pathlib import Path
 
 import pytest
 
 from features import duplicate, index as index_mod
-from features.index import BUCKET_KEEP, COLD_BATCH, Index
+from features.index import COLD_BATCH, COLD_HEAD, KEY_SLICE, Index, Shard
 
 ROOT = Path(__file__).resolve().parent.parent  # 仓库根，压测的子进程要在这儿跑
 
@@ -91,7 +95,7 @@ def test_cold_keeps_every_key(tmp_path):
         for band in range(3):
             assert index.get(keyed(sample, band)) == [sample]
         assert index.record(sample)[1] == windows_for(sample)  # 窗口压过也读得回来
-    assert list(tmp_path.glob("cold-*.k*"))  # 全部键按桶压在盘上，不是只留第一条
+    assert list(tmp_path.glob("cold-*.chk"))  # 全部键按桶串在盘上，不是只留第一条
 
 
 def test_cold_conversion_is_streaming(tmp_path):
@@ -126,29 +130,30 @@ def test_cold_removes_original_shard(tmp_path):
     index.settle()
     assert index._cold
     alive = {shard.serial for shard in index._warm}  # 还在温层的片号
-    for pattern in ("warm-*.rec", "warm-*.off", "warm-*.key", "warm-*.bkt[0-9]*"):
+    for pattern in ("warm-*.rec", "warm-*.off", "warm-*.ket[0-9]*", "warm-*.bkt"):
         for one in tmp_path.glob(pattern):  # 转过冷的片文件要当场删干净
             assert int(one.stem.split("-")[1]) in alive, one.name
     assert len(list(tmp_path.glob("warm-*.rec"))) == len(alive)  # 只剩没转冷的那几片
 
 
-def test_cold_deletes_bucket_slices(tmp_path):
-    """转过冷的片，桶片跟着片号一起删掉，不留一堆死文件。"""
+def test_cold_deletes_bucket_table(tmp_path):
+    """转过冷的片，桶表跟着片号一起删掉，不留死文件。"""
     index = Index(tmp_path, hot=1, per_shard=2, warm=2, key_size=8)
     fill(index, 12)
     index.settle()
     assert index._cold
     alive = {shard.serial for shard in index._warm}
-    left = [one for one in tmp_path.glob("warm-*.bkt[0-9]*") if int(one.stem.split("-")[1]) not in alive]
+    left = [one for one in tmp_path.glob("warm-*.bkt") if int(one.stem.split("-")[1]) not in alive]
     assert not left  # 转冷的片一片桶片都不剩
-    assert list(tmp_path.glob("cold-*.k*"))  # 键没丢，换到冷层的桶文件里了
+    assert list(tmp_path.glob("cold-*.chk"))  # 键没丢，换到冷层的桶链文件里了
 
 
 def test_warm_files_carry_key_table(tmp_path):
     index = Index(tmp_path, hot=1, per_shard=2, warm=100, key_size=8)  # 温层管够，不转冷
     fill(index, 6)
+    index.save()  # 桶表跟着落盘
     assert list(tmp_path.glob("warm-*.rec"))
-    assert list(tmp_path.glob("warm-*.bkt[0-9]*"))  # 温层带键表桶，桶表按片落在盘上
+    assert list(tmp_path.glob("warm-*.bkt"))  # 温层带键表桶，桶表落盘（整块一个文件）
     assert not list(tmp_path.glob("cold-*.rec"))
 
 
@@ -158,11 +163,11 @@ def slow_conversion(index: Index, spend: float, seen: list = None) -> None:
     """把转冷换成一个慢的：睡 spend 秒再真搬。同步实现下这 sleep 就是主流程白等的时间。"""
     real = index._to_cold
 
-    def slow(shard, serial):
+    def slow(shard, cold):
         if seen is not None:  # 谁被搬了，记下来
             seen.append(shard.serial)
         time.sleep(spend)
-        real(shard, serial)
+        real(shard, cold)
 
     index._to_cold = slow
 
@@ -202,7 +207,7 @@ def test_worker_error_reaches_close(tmp_path):
     """后台转冷抛异常要能从 close 抛出来，不能静默。"""
     index = Index(tmp_path, hot=5, per_shard=20, warm=40, key_size=8)
 
-    def boom(shard, serial):
+    def boom(shard, cold):
         raise RuntimeError("转冷挂了")
 
     index._to_cold = boom
@@ -244,27 +249,164 @@ def test_read_while_background_converts(tmp_path):
 
 # ---------- 桶表落盘 ----------
 
-def test_bucket_table_on_disk_still_finds(tmp_path):
-    """桶表落在盘上，缓存清光了也能按桶查回来。"""
-    index = Index(tmp_path, hot=1, per_shard=200_000, warm=100_000, key_size=8)
-    fill(index, 400)  # 八百条键，桶落在几个片里
-    slices = list(tmp_path.glob("warm-*.bkt[0-9]*"))
-    assert len(slices) > 1  # 桶表真的分成几片落了盘
-    assert sum(one.stat().st_size for one in slices) > 0  # 盘上有内容，不是空壳
-    for shard in index._warm:  # 内存里一份都不留，照样查得出来
-        shard.table.kept.clear()
+def test_bucket_table_lands_on_disk_whole(tmp_path):
+    """桶表整块落在盘上，读回来照样按桶查得到。"""
+    store = tmp_path / "s"
+    index = Index(store, hot=1, per_shard=200_000, warm=100_000, key_size=8)
+    fill(index, 400)  # 八百条键
+    index.save()
+    index.close()
+
+    ones = list(store.glob("warm-*.bkt"))
+    assert len(ones) == 1  # 一片一个文件，不按桶摊
+    assert ones[0].stat().st_size > 0  # 盘上有内容，不是空壳
+    back = Index(store, key_size=8)  # 桶头整块读回来
     for sample in (0, 137, 399):
-        assert index.get(keyed(sample, 0)) == [sample]
+        assert back.get(keyed(sample, 0)) == [sample]
+    back.close()
 
 
-def test_bucket_cache_stays_small(tmp_path):
-    """命中过的桶只留几百个，够查就行，不跟着键数涨。"""
+def test_bucket_table_size_follows_the_shard(tmp_path):
+    """桶表就一格定长数组：条数只跟片大小有关，不跟着灌进去多少条涨。"""
     index = Index(tmp_path, hot=1, per_shard=200_000, warm=100_000, key_size=8)
-    fill(index, 400)  # 八百条键，八百个桶左右，超过缓存上限
+    fill(index, 400)
     for shard in index._warm:
-        assert len(shard.table.kept) <= BUCKET_KEEP  # 缓存被压在上限以内
-    assert index.get(keyed(0, 0)) == [0]  # 缓存丢了也查得到
+        assert len(shard.table.heads) == shard.buckets  # 一个桶一格，整片就这么多
+        assert index.get(keyed(0, 0)) == [0]  # 照样查得到
+    index.close()
 
+
+# ---------- 键表按条分片 ----------
+
+def test_key_entry_slice_reads_that_entry(tmp_path):
+    """按条号读回来的就是那一条：片号、片内位置全按条号算，不整份映射。"""
+    shard = Shard(tmp_path, 1, "warm", 8, 1024)
+    for i in range(5):
+        shard.bump_key(keyed(i, 3), i)  # 键表末尾接五条
+    for i in range(5):  # 还在缓冲里，直接从内存切
+        entry = shard._key_at(i)  # 读第 i 条
+        assert entry[:8] == keyed(i, 3)  # 键就是它自己那条，没串位
+        assert int.from_bytes(entry[8:16], "big") == i  # 下��也是
+    shard.flush()  # 落地，同一条从盘上 pread 回来也要一样
+    for i in range(5):
+        assert shard._key_at(i)[:8] == keyed(i, 3)
+    shard.close()
+
+
+def test_key_entry_slices_cross_boundary(tmp_path):
+    """跨片边界：一片满了就换下一片，两边的条目各自都读得回来。"""
+    shard = Shard(tmp_path, 1, "warm", 8, 1024)
+    for i in range(KEY_SLICE + 2):
+        shard.bump_key(keyed(i, 0), i)
+    shard.flush()  # 缓冲写出去才量得到文件长短
+    files = sorted(tmp_path.glob("warm-*.ket*"))
+    assert len(files) == 2  # 满了换片，不挤在一个文件里
+    assert files[0].stat().st_size == KEY_SLICE * shard.entry  # 上一片正好满
+    assert files[1].stat().st_size == 2 * shard.entry  # 多出来的两条落在下一片
+    assert shard._key_at(KEY_SLICE - 1)[:8] == keyed(KEY_SLICE - 1, 0)  # 片尾那条还在上一片
+    assert shard._key_at(KEY_SLICE)[:8] == keyed(KEY_SLICE, 0)  # 跨片的第一条在新片
+    shard.close()
+
+
+def test_key_chain_crosses_slice(tmp_path):
+    """同一个键的链跨过片边界，find 顺着链照样把两边的下标都取回来。"""
+    shard = Shard(tmp_path, 1, "warm", 8, 8)  # 桶只有八个，同一个键一直落同一个桶、链一路往下长
+    for i in range(KEY_SLICE + 1):
+        shard.bump_key(keyed(0, 0), i)
+    assert sorted(shard.find(keyed(0, 0))) == list(range(KEY_SLICE + 1))
+    shard.close()
+
+
+# ---------- 冷片单文件桶链 ----------
+
+def key_in(bucket: int, buckets: int) -> bytes:
+    """找一个正好落在 bucket 号桶上的键。"""
+    for n in range(100_000):
+        key = n.to_bytes(8, "big")
+        if zlib.crc32(key) % buckets == bucket:
+            return key
+    raise AssertionError(f"找不到落在第 {bucket} 桶上的键")
+
+
+def test_cold_two_buckets_stay_apart(tmp_path):
+    """一个冷片一个桶文件，两个桶各走各的链，谁也不串到谁身上。"""
+    shard = Shard(tmp_path, 1, "cold", 8, 4)
+    shard.start_heads()  # 桶头先挂内存，跟转冷时一样
+    one = key_in(1, 4)
+    other = key_in(2, 4)
+    shard.bump(one, 11)
+    shard.bump(other, 22)
+    shard.flush()
+    assert shard.candidates(one) == [11]  # 自己的桶里只有自己那条
+    assert shard.candidates(other) == [22]
+    assert shard._heads[1] and shard._heads[2]  # 两个桶各有一个链头
+    assert shard._heads[1] != shard._heads[2]  # 链头不在同一处
+    assert len(list(tmp_path.glob("cold-*.chk"))) == 1  # 全片就一个桶文件，不是按桶摊一堆
+    shard.close()
+
+
+def test_cold_chain_walks_newest_first(tmp_path):
+    """桶链按写进去的先后倒着走，最后收在 0。"""
+    shard = Shard(tmp_path, 1, "cold", 8, 2)
+    shard.start_heads()
+    key = key_in(0, 2)
+    for sub in (7, 8, 9):
+        shard.bump(key, sub)
+    shard.flush()
+    assert shard.candidates(key) == [9, 8, 7]  # 新写的在链头，老的往后
+    at = shard._heads[zlib.crc32(key) % 2]
+    walked = []
+    while at:  # 自己顺着链走一遍，确认收在 0
+        head = os.pread(shard._chk, COLD_HEAD, at)
+        walked.append(int.from_bytes(head[4:8], "big"))
+        at = int.from_bytes(head[:4], "big")
+    assert walked == [9, 8, 7]
+    assert at == 0  # 链到头
+    shard.close()
+
+
+def test_query_reads_one_bucket_only(tmp_path, monkeypatch):
+    """查一次只读目标那一条链：几百条条目铺在文件里，读到的只有一条头加一块键。"""
+    buckets = 256
+    shard = Shard(tmp_path, 1, "cold", 8, buckets)
+    shard.start_heads()
+    for n in range(buckets):  # 每个桶都塞一条，别的桶全都有东西
+        shard.bump(key_in(n, buckets), n)
+    shard.flush()
+    shard.drop_heads()  # 搬完把内存那份桶头放掉，查询只能读盘上的
+    read = []  # 桶链文件上每次读了多少字节
+
+    def spy(fd, size, offset):
+        if fd == shard._chk:  # 只数桶链文件上的读
+            read.append(size)
+        return real(fd, size, offset)
+
+    real = os.pread
+    monkeypatch.setattr(index_mod.os, "pread", spy)
+    assert shard.candidates(key_in(99, buckets)) == [99]
+    assert sum(read) == 4 + COLD_HEAD + shard.key_size  # 一个桶头、一条条目头、一块键，就这么多
+    assert sum(read) < shard._chk_bytes // 32  # 远小于整片的字节数（一个桶平均也有一条以上的量）
+    shard.close()
+
+
+def test_key_table_and_cold_survive_reload(tmp_path):
+    """键表分片和冷层桶链都要过 save/reload：读回来照样查得到，条目一条不错位。"""
+    store = tmp_path / "s"
+    index = Index(store, hot=2, per_shard=40, warm=80, key_size=8)
+    fill(index, 200)  # 前面几片会转冷，末尾还留一片温层
+    index.save()
+    index.close()
+
+    back = Index(store, key_size=8)
+    assert back._cold  # 冷片读回来了
+    for sample in range(200):  # 冷层、温层两边都撞得上
+        assert back.get(keyed(sample, 1)) == [sample]
+    warm = max(back._warm, key=lambda one: one._key_entries)  # 还有键表的那一片（末尾那片可能是空的）
+    assert warm._key_entries  # 没转冷那片的键表读回来还在
+    for at in range(warm._key_entries):  # 逐条读，位置不错位
+        entry = warm._key_at(at)
+        assert int.from_bytes(entry[8:16], "big") in warm.find(entry[:8])  # 顺着链走得到它自己的下标
+    back.close()
 
 # 子进程里一路塞到转冷若干次，量这个进程的峰值内存。单片峰值和连转峰值必须分开进程，
 # 同一进程里第二次的峰值会把前一次的算进去。
@@ -280,7 +422,10 @@ index = Index({store!r}, hot=2000, per_shard=2000, warm=2000, key_size=8)  # 片
 for sample in range({count}):  # 每条两个键，跟别的用例一个形状
     for band in range(2):
         index.put(keyed(sample, band), sample, [sample] * 4, {{sample}})
-index.settle()  # 后台搬完再量峰值
+index.settle()  # 后台搬完，量过峰值
+while len(index._cold) < {cold}:  # 再一片一片推，推够这么多次连转
+    index._park_oldest()  # 直接排队最老的那片
+    index.settle()  # 等它搬完再推下一片，峰值才量得出是连着的
 assert len(index._cold) >= {cold}, len(index._cold)  # 确实连转了这么多次
 print(int([line.split()[1] for line in open("/proc/self/status") if line.startswith("VmHWM")][0]))
 """
@@ -333,8 +478,8 @@ def test_reload_after_cold(tmp_path):
     index.save()
     index.close()
 
-    assert list(store.glob("cold-*.k*"))  # 冷层键桶跟着片落了盘
-    assert not list(store.glob("cold-*.key"))  # 键表随片一起不要了
+    assert list(store.glob("cold-*.chk"))  # 冷层键链跟着片落了盘
+    assert not list(store.glob("cold-*.ket*"))  # 冷层的键不再单留一份键表，全在桶链里
     back = Index(store, key_size=8)
     assert back.get(keyed(0, 0)) == [0]
     assert back.get(keyed(0, 1)) == [0]  # 第二条键读回来也撞得上

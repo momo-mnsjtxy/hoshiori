@@ -12,7 +12,7 @@
 
 | 能力 | 状态 |
 | --- | --- |
-| `ori weave`：收 JSONL/TXT/目录/stdin/链接，规范化、MinHash 去重（索引可落盘分片）、指纹、数据集卡 | 可用 |
+| `ori weave`：收 JSONL/TXT/目录/stdin/链接，规范化、MinHash 去重（索引可落盘分片）、指纹、数据集卡 | 可用（百万级语料过百万条后转冷慢，见下） |
 | `ori spin`：真训练，七种任务族（sft/pretrain/distill/dpo/grpo/ppo/rloo）、LoRA、nf4/int8、ddp/fsdp2、健康停止、断点续训 | 可用 |
 | `ori import lmlab`：把 lmlab 的 yaml 转成配方，逐条差异清单 | 可用 |
 | `ori validate`：配方校验，报错指到字段并给候选 | 可用 |
@@ -109,6 +109,10 @@ docs/                命名与 PRD
 三步，缺一步就废。先用视图剔掉空白和标点（`view`），再取 5 字窗口压成 128 位指纹（`sign`），最后按段比：任意一段全等是候选，候选回算真实重合度，过 `--threshold` 才算重复。
 
 `--threshold 0.8` 是常规档。段内行数会按阈值自动推，阈值越低行数越小，否则真重复撞不上同一段。判掉的都在 `rejects.jsonl` 里带 `duplicate` 原因，`--keep-duplicates` 可以让它们留在 `bolt.jsonl` 并标上 `dup_of`。
+
+## 已知慢点
+
+去重索引在百万条以上、而且开了 `--store` 的时候，温层转冷那一段会明显拖慢落盘速度（一百一十万条要四十分钟以上）。二十万以内没有影响，内存比在 11.9 上下。转冷是后台线程，主流程不被它挡住，慢的是总时长。
 
 ## 退出码
 
