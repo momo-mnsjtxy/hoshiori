@@ -2,7 +2,7 @@
 
 调用方式：load 读配方并展开 extends，check 在命令开头验字段和类型，stamp 给完整配方算哈希。
 字段白名单集中在 FIELDS，拼错会报最近似的候选。model.geometry.image_side 是原图边长，0 表示不接图；
-patch 是块边长，默认 16。两个字段只描述模型的图片通路，训练批次携带图片需要后续接入。
+patch 是块边长，默认 16；接图时必须为正数并整除 image_side，训练器据此准备固定大小的图片块。
 
 调用示例：
   from pathlib import Path                      # 配方文件的位置
@@ -134,6 +134,11 @@ def _merge(base: dict, over: dict) -> dict:
 def check(data: dict) -> None:
     """验一份配方。先验字段，再验跨字段的必备关系。"""
     _walk(data, FIELDS)  # 字段名和类型先过一遍
+    geometry = (data.get("model") or {}).get("geometry") or {}                    # 图片边长与块边长要一起判断
+    side = geometry.get("image_side", 0)                                          # 没写图片边长就是纯文本
+    patch = geometry.get("patch", 16)                                             # 与模型几何的默认块边长一致
+    if side > 0 and (patch <= 0 or side % patch):                                  # 接图必须正好切成完整方块
+        fail("schema", "image_side 必须能被正数 patch 整除", where="model.geometry.patch", hint=f"当前 {side} ÷ {patch} 不能整切")
     if data.get("task") in FINE_TUNE and not (data.get("model") or {}).get("path"):
         fail("schema", "微调类任务要 model.path 指基座", where="model.path", hint="例: ../merged_model")
     train = data.get("train") or {}  # 没写就当空，下面逐项看

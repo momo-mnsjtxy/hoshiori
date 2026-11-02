@@ -30,6 +30,7 @@ COMMANDS = {
     "serve": "commands.serve",
     "loom": "commands.loom",
     "doctor": "commands.doctor",
+    "plugin": "commands.plugin",  # 单文件插件的清单与运行入口
 }
 
 
@@ -114,6 +115,13 @@ def parser() -> argparse.ArgumentParser:
     loom.add_argument("out", nargs="?", default="bolt", help="产物目录，默认 bolt")
     loom.add_argument("--port", type=int, default=8765, help="监听端口，0 表示随便挑一个空口")
     loom.add_argument("--host", default="127.0.0.1", help="监听地址，默认只本机")
+    plugins = below.add_parser("plugin", help="扫描并运行单文件插件")                                  # 插件命令入口
+    plugin_actions = plugins.add_subparsers(dest="action", required=True)                             # list 与 run 两个动作
+    plugin_actions.add_parser("list", help="列出四类插件")                                             # 只展示目录现状
+    plugin_run = plugin_actions.add_parser("run", help="运行一个插件")                                 # 点名运行一份插件
+    plugin_run.add_argument("kind", metavar="类", help="sources / rewards / metrics / exporters")    # 四类目录中的一类
+    plugin_run.add_argument("name", metavar="名", help="插件的 NAME")                                 # 文件声明的插件名
+    plugin_run.add_argument("--args", default="{}", help="传给 run 的 JSON 对象，默认 {}")             # 关键字参数对象
     below.add_parser("doctor", help="看看这台机器缺什么")
     return top
 

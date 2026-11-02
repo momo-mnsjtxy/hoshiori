@@ -24,7 +24,7 @@ from utils.fail import Failure                   # 核对缺包与配方错误�
 @pytest.fixture                                                                                         # 多个模型测试共用尺寸
 def geo():                                                                                              # 每次得到独立几何
     """原图故意不能整除块边长，最长文本也要放得下全部图片前缀。"""
-    return model.Geometry(d_model=32, layers=2, heads=2, d_head=16, vocab=64, max_seq_len=24, image_side=5, patch=2)  # CPU 上直接跑
+    return model.Geometry(d_model=32, layers=2, heads=2, d_head=16, vocab=64, max_seq_len=24, image_side=6, patch=2)  # CPU 上直接跑
 
 
 # ---------- 读取图片 ----------
@@ -168,10 +168,10 @@ def test_image_projection_gradient_with_checkpoint(geo):                        
 # ---------- 配方与存档 ----------
 
 def test_recipe_accepts_image_geometry():                                             # 白名单与几何构造能完整接上
-    data = {"model": {"geometry": {"image_side": 5, "patch": 2}}}                       # 其余几何保留默认值
+    data = {"model": {"geometry": {"image_side": 6, "patch": 2}}}                       # 其余几何保留默认值
     recipe.check(data)                                                               # 只在配方边界校验
     geo = model.Geometry.from_recipe(data)                                           # 模型照收已检查的字段
-    assert geo.image_side == 5 and geo.patch == 2                                     # 两个值没有丢失
+    assert geo.image_side == 6 and geo.patch == 2                                     # 两个值没有丢失
     assert model.Geometry.from_recipe({}).image_side == 0                            # 旧配方默认不接图
 
 
@@ -193,7 +193,7 @@ def test_image_model_save_load_and_config(geo, tmp_path, tie):                  
     net.write_config(tmp_path, "fp32")                                               # 几何也照常落盘
     assert "image_proj.weight" in state                                              # 图片投影跟随模型保存
     config = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))        # 核对磁盘里的实际内容
-    assert config["image_side"] == 5 and config["patch"] == 2                         # 重建图片层所需的两个字段在
+    assert config["image_side"] == 6 and config["patch"] == 2                         # 重建图片层所需的两个字段在
     assert config["max_position_embeddings"] == 33                                   # 位置预算含九块图片和二十四个词
     again = model.Model(model.Geometry(**net.geo.as_dict())).eval()                   # 用落盘几何重建同一架子
     again.load(tmp_path)                                                             # 图片投影由既有同名张量加载路径灌回

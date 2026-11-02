@@ -1,30 +1,13 @@
-"""训练：真的把模型往前推，并管理本次任务的 CPU 参考模型和教师模型。
+"""训练：读取文本与可选图片，拼批、前向、反向，并管理存档和本次任务的冻结模型。
 
-调用方式：Trainer(model, geo, choice).run() 跑完并释放冻结模型；只构建而不运行时调用 close()。
-Choice.base 接收命令层已载入的 model.path；参考模型重新读这份权重，随机起步时才拷贝学生。
-Choice.teacher 接收 model.teacher；参考模型和教师都在 CPU 上 eval、冻结，只把前向结果送回学生设备。
+调用方式：Trainer(model, geo, choice).run() 跑完整趟；image_side 大于零时，bolt 样本的 images
+会缩放切块并作为文本前缀，图片位置不计损失。多卡、续训、健康检查和参考模型仍由同一实例管理。
 
 调用示例：
-  from features.trainer import Choice, Trainer
-  job = Trainer(model, geo, Choice(out=Path("out/t"), files=[Path("bolt/bolt.jsonl")], steps=20))
-  job.run()                       # 返回跑到第几步；健康检查叫停时 job.reason 非空，命令层据此退 1
-
-多卡走 torchrun：每个进程自己读 LOCAL_RANK 建进程组，ddp 用 DistributedDataParallel 包一层（梯度在反向时
-跨进程平均），fsdp2 用 fully_shard 逐层切（参数真摊开）。只有 0 号进程写盘和打日志，其余进程算完就等收尾，
-否则同一份产物目录几路抢写。LOCAL_RANK 不在环境里就是单进程，一条分布式代码都不进。
-
-健康检查盯三样：loss 是 NaN/Inf 连续 3 步、梯度范数超 1e3 连续 5 步、吞吐跌破前 20 步中位数的四成。
-处置照配方 train.health：stop 存一档再退，退出码 1，原因写进 run.json 和日志；warn 只喊一声接着跑。
-
-产物（一次一档，不覆盖已有的）：
-  step-000020/model.safetensors  全量权重；挂了 LoRA 时换成 adapter.safetensors
-  step-000020/optimizer.pt       AdamW 的一阶二阶 + 梯度累积进度
-  step-000020/state.json         步数、数据游标、随机数状态、最近几步的 loss
-  latest                         最新一档的目录名，--resume auto 照它找
-为什么三样分开：权重给导出，优化器和游标给续训，随机数状态给复现，少一样都接不上。
-
-分词用字节：一个 UTF-8 字节一个号，对 vocab 取模就落进词表。不引分词器，换模型也不会因词表对不上崩。
-交叉熵按 token 分块算，一次只把一块 token 的 V 维展开，词表上万也不炸内存。
+  from features.trainer import Choice, Trainer                                  # 训练参数和主入口
+  choice = Choice(out=Path("out/t"), files=[Path("bolt/bolt.jsonl")], steps=20)  # 二十步训练
+  job = Trainer(model, geo, choice)                                             # 读取并编码全部样本
+  job.run()                                                                     # 返回最终步数并释放冻结模型
 """
 
 import contextlib
@@ -43,7 +26,7 @@ from torch.distributed.fsdp import fully_shard
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from features import alignment, lora
+from features import alignment, image, lora
 from utils import logs
 from utils.fail import fail
 
@@ -89,6 +72,7 @@ class Choice:
     kl_coef: float = 0.01  # GRPO 的 KL 罚系数
     temperature: float = 2.0  # distill 的温度
     teacher: Path = None  # distill 的教师权重，必填
+    max_images: int = 4  # 一条样本最多取几张图片；放末尾保留旧位置参数顺序
 
 
 class Trainer:
@@ -160,17 +144,24 @@ class Trainer:
         return [byte % self.geo.vocab for byte in text.encode("utf-8")[: self.geo.max_seq_len]]  # 兜底：字节取模
 
     def _read_text(self) -> list:
-        """把正文读成编号列表，短于两个号的丢掉。"""
-        out = []  # 攒起来的样本
-        for one in self.choice.files:  # 一个文件一趟
-            for line in Path(one).read_text(encoding="utf-8").splitlines():  # 一行一条样本
-                if not line.strip():  # 空行跳过
+        """把正文编码成编号；图片几何开启时，同条保存最多 max_images 个路径。"""
+        out = []                                                                  # 攒起来的样本
+        for one in self.choice.files:                                             # 一个文件一趟
+            for line in Path(one).read_text(encoding="utf-8").splitlines():       # 一行一条样本
+                if not line.strip():                                              # 空行没有训练内容
                     continue
-                text = json.loads(line).get("text") or ""  # 正文，bolt.jsonl 固定有这个字段
-                ids = self._ids(text)  # 编码，超长已截断
-                if len(ids) > 1:  # 至少要有输入和答案
-                    out.append(ids)
-        return out
+                item = json.loads(line)                                           # bolt 里正文和图片同属一条记录
+                ids = self._ids(item.get("text") or "")                          # 正文沿用唯一的编码入口
+                if len(ids) <= 1:                                                 # 至少要有输入和答案
+                    continue
+                if self.geo.image_side:                                           # 图片模型还要留住对应路径
+                    here = Path(one).parent                                          # 相对图片路径按数据文件旁边算
+                    raw = (item.get("images") or [])[: self.choice.max_images]        # 上限之外的不拿
+                    paths = [str(here / one) if not Path(one).is_absolute() else one for one in raw]  # 补齐成能直接打开的路径
+                    out.append((ids, paths))                                      # 编号和图片仍保持同条关系
+                else:                                                            # 纯文本配方沿用原来的样本结构
+                    out.append(ids)                                               # 下游继续拿一串编号
+        return out                                                               # 一次读完，训练时不再碰数据文件
 
     def _read_pairs(self) -> list:
         """读偏好对，每对编成两边各一串号。"""
@@ -211,16 +202,51 @@ class Trainer:
         return self.samples[self._perm[pos]]  # 按顺序取一条
 
     def _batch(self) -> tuple:
-        """凑一批，右侧补 0，答案位补 -100。"""
-        rows = [self._next() for _ in range(self.choice.batch_size)]  # 取够一批
-        widest = max(len(one) for one in rows) - 1  # 最长的输入长度
-        ids = torch.full((len(rows), widest), self.pad_id, dtype=torch.long)  # 输入，补词表的 pad
-        labels = torch.full((len(rows), widest), -100, dtype=torch.long)  # 答案，补位不参与算损失
-        for at, one in enumerate(rows):  # 一条条填
-            ids[at, : len(one) - 1] = torch.tensor(one[:-1])  # 前 n-1 个当输入
-            labels[at, : len(one) - 1] = torch.tensor(one[1:])  # 后 n-1 个当答案
-        here = _device_of(self.model)  # 模型在哪张卡，数据就得在哪
-        return ids.to(here), labels.to(here)
+        """凑一批；纯文本返回 ids/labels，图片批次再返回右侧补零的 patches。"""
+        rows = [self._next() for _ in range(self.choice.batch_size)]              # 取够一个微批
+        if not self.geo.image_side:                                               # 没开图片几何就走原来的两张量路径
+            widest = max(len(one) for one in rows) - 1                            # 最长的输入长度
+            ids = torch.full((len(rows), widest), self.pad_id, dtype=torch.long)   # 输入右侧补词表 pad
+            labels = torch.full((len(rows), widest), -100, dtype=torch.long)       # 答案补位不参与损失
+            for at, one in enumerate(rows):                                       # 一条条填入文本
+                ids[at, : len(one) - 1] = torch.tensor(one[:-1])                   # 前 n-1 个当输入
+                labels[at, : len(one) - 1] = torch.tensor(one[1:])                 # 后 n-1 个当答案
+            here = _device_of(self.model)                                         # 模型在哪张卡，文本就去哪
+            return ids.to(here), labels.to(here)                                  # 保留旧接口的两个返回值
+
+        widest = max(len(one[0]) for one in rows) - 1                              # 图片样本里最长的文本输入
+        patches, image_steps = self._pictures(rows)                               # 图片按批内最多块数补齐
+        ids = torch.full((len(rows), widest), self.pad_id, dtype=torch.long)        # 文本输入仍只补文本位
+        labels = torch.full((len(rows), image_steps + widest), -100, dtype=torch.long)  # 图片前缀整段不算损失
+        for at, (tokens, _) in enumerate(rows):                                    # 图片路径已经交给上一步处理
+            ids[at, : len(tokens) - 1] = torch.tensor(tokens[:-1])                 # 前 n-1 个文本号当输入
+            labels[at, image_steps : image_steps + len(tokens) - 1] = torch.tensor(tokens[1:])  # 答案接在图片位后面
+        here = _device_of(self.model)                                              # 文本和标签跟随学生模型
+        return ids.to(here), labels.to(here), patches                             # 图片张量已经对齐设备和精度
+
+    def _pictures(self, rows: list) -> tuple:
+        """把一批样本的图片依路径顺序切块，再按批内最大块数从右侧补零。"""
+        prepared = []                                                              # 每条样本各自串好的图片块
+        counts = []                                                                # 每条实际有多少块
+        for _, paths in rows:                                                      # 文本已在同条里，此处只管图片
+            pieces = []                                                            # 一条样本可能带多张图片
+            count = 0                                                              # 多张图的块数累加
+            for path in paths:                                                     # 路径顺序就是图片前缀顺序
+                blocks, size = image.prepare(path, self.geo.image_side, self.geo.patch)  # 一张图缩放、归一、切块
+                pieces.append(torch.from_numpy(blocks))                            # float32 数组先转 CPU 张量
+                count += size                                                      # 记下该样本的真实图片位
+            joined = torch.cat(pieces) if pieces else torch.empty((0, self.geo.patch, self.geo.patch, 3))  # 多图首尾相接
+            prepared.append(joined)                                                # 留待按批内最大值补齐
+            counts.append(count)                                                   # 右侧补多少由这个数决定
+        widest = max(counts)                                                       # 同批模型前缀必须等长
+        if widest == 0:                                                            # 整批都没图片时不增加任何前缀
+            return None, 0                                                        # 模型仍走无图前向
+        batch = torch.zeros((len(rows), widest, self.geo.patch, self.geo.patch, 3), dtype=torch.float32)  # 零块铺底
+        for at, blocks in enumerate(prepared):                                     # 每条从左边放真实图片块
+            batch[at, : counts[at]] = blocks                                      # 剩下的右侧保持零块
+        here = _device_of(self.model)                                              # 图片跟学生模型放在同一设备
+        dtype = self.geo.dtype(self.choice.precision)                              # 图片投影使用模型精度
+        return batch.to(device=here, dtype=dtype), widest                          # 交出固定五维形状和前缀长度
 
     # --- 训练 ---
 
@@ -318,14 +344,29 @@ class Trainer:
         total = 0.0  # 这一步攒到的损失
         tokens = 0  # 这一步过了多少真 token，算吞吐用
         for _ in range(self.choice.grad_accum):  # 一个一个微批
-            ids, labels = self._batch()  # 取微批
+            if self.geo.image_side:                                               # 图片几何的批次还带五维图片块
+                ids, labels, patches = self._batch()                              # 图片前缀长度已经反映在 labels 里
+            else:                                                                # 纯文本保留原来的两张量接口
+                ids, labels = self._batch()                                       # 取文本微批
             with self._context():  # 半精度上下文
                 if self.choice.task == "distill":  # 蒸馏换成交叉熵之外的目标
                     with torch.no_grad():  # 教师不建图
-                        teach = self.teacher(ids.cpu()).to(ids.device)  # 教师只在 CPU 前向，打分回到学生设备
-                    loss = alignment.distill(self.model(ids), teach, self.choice.temperature).mean() / self.choice.grad_accum
+                        if self.geo.image_side:                                   # 教师也要看到同一段图片前缀
+                            teacher_patches = None if patches is None else patches.float().cpu()  # CPU 教师使用 fp32 图片
+                            teach = self.teacher(ids.cpu(), patches=teacher_patches).to(ids.device)  # 打分送回学生设备
+                        else:                                                    # 纯文本蒸馏保持原来的调用
+                            teach = self.teacher(ids.cpu()).to(ids.device)         # 教师只在 CPU 前向
+                    if self.geo.image_side:                                       # 学生的图片块已经对齐设备和精度
+                        scores = self.model(ids, patches=patches)                  # 图片与文本共同产生蒸馏打分
+                    else:                                                        # 没有图片几何不传新增参数
+                        scores = self.model(ids)                                  # 保留纯文本前向
+                    loss = alignment.distill(scores, teach, self.choice.temperature).mean() / self.choice.grad_accum  # 按累积数缩放
                 else:  # 普通语言模型目标
-                    loss = cross_entropy(self.model(ids), labels) / self.choice.grad_accum  # 除开累积数，梯度才不跟着放大
+                    if self.geo.image_side:                                       # 图片块作为文本之前的前缀
+                        scores = self.model(ids, patches=patches)                  # 返回图片位和文本位的全部打分
+                    else:                                                        # 纯文本仍调用原接口
+                        scores = self.model(ids)                                  # 输出长度与 ids 相同
+                    loss = cross_entropy(scores, labels) / self.choice.grad_accum  # -100 图片位和补位都会跳过
             loss.backward()  # 反向
             total += float(loss.detach())  # 累进账
             tokens += int((labels != -100).sum())  # 记下这块有多少真 token

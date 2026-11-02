@@ -1,22 +1,13 @@
-"""图片：用 Pillow 读 PNG/JPEG，按行切块并补齐边界，把像素归一到模型用的范围。
+"""图片：用 Pillow 读 PNG/JPEG，缩放、归一并按行切成模型使用的 RGB 图片块。
 
-调用方式：load(path) 返回 (高, 宽, 3) 的 RGB float32，像素仍在 [0, 255]；灰度图复制成三通道。
-patches(array, size) 保留通道，把右侧和底部补零，返回 (块数, size, size, 通道)；灰度数组没有通道维。
-normalize(array) 把 [0, 255] 映射到 [-1, 1]，应先切块再归一，让补的黑边也变成 -1。
-下游负责把原图尺寸与 geometry.image_side 对齐、统一同批块数，再把数组转成与模型同设备、同精度的张量。
-本轮只接单图前缀；messages 的图片解析、批次拼装、文本标签和损失对齐由后续训练接入负责。
+调用方式：prepare(path, side, patch) 一次返回 float32 图片块和块数；load、patches、normalize
+保留为可单独调用的基础操作。读图失败会带着原路径抛出明确异常。
 
-调用示例（photo.png 是 224×224 的图片）：
-  import torch                                                                   # 把数组交给模型
-  from features import image                                                     # 图片的三个操作
-  from features.model import Geometry, Model                                      # 模型与几何
-  geo = Geometry(image_side=224, patch=16)                                         # 一张图切成 196 块
-  net = Model(geo)                                                               # 随机起一个接图的模型
-  blocks = image.normalize(image.patches(image.load("photo.png"), geo.patch))      # 黑边补好再归一
-  batch = torch.from_numpy(blocks)[None].to(net.model.embed_tokens.weight)         # 补批维并对齐设备、精度
-  ids = torch.tensor([[1, 2]], device=batch.device)                                # 两个文本位置
-  logits = net(ids, patches=batch)                                               # 返回 (1, 198, 512)
-  text_logits = logits[:, batch.shape[1]:]                                        # 去掉图片位置，接文本标签
+调用示例：
+  import torch                                                              # 把图片块交给模型
+  from features import image                                                # 图片准备入口
+  blocks, count = image.prepare("photo.png", side=224, patch=16)             # 缩放后切成 196 块
+  batch = torch.from_numpy(blocks)[None]                                     # 补上批维
 """
 
 import importlib.util             # 在读图入口确认 Pillow 已安装
@@ -56,3 +47,18 @@ def patches(array: np.ndarray, size: int) -> np.ndarray:                        
 def normalize(array: np.ndarray) -> np.ndarray:                                    # 原始像素换成模型输入
     """把 [0, 255] 像素线性映射到 [-1, 1] 的 float32，保持数组形状。"""
     return array.astype(np.float32) / 127.5 - 1.0                                  # 黑为 -1，白为 1，不按单图亮度缩放
+
+
+# ---------- 一次准备完整图片 ----------
+
+def prepare(path: str | Path, side: int, patch: int) -> tuple[np.ndarray, int]:     # 训练器从这里拿一张图的全部块
+    """读图并缩放到 side×side，归一后返回 (块, patch, patch, 3) 与块数。"""
+    try:                                                                            # 外部图片文件只在读取处接住一次
+        pixels = load(path)                                                         # 统一读成 RGB float32
+    except OSError as error:                                                        # 文件损坏、格式不认或途中读失败
+        raise OSError(f"图片读取失败: {path}: {error}") from error                 # 路径和底层原因一起交给调用方
+    from PIL import Image                                                           # load 已确认 Pillow 可用
+    source = Image.fromarray(pixels.astype(np.uint8))                               # Pillow 缩放使用八位 RGB
+    resized = np.asarray(source.resize((side, side)), dtype=np.float32)              # 所有图片统一成配方边长
+    blocks = normalize(patches(resized, patch))                                     # 先切块再映射到模型范围
+    return blocks, int(blocks.shape[0])                                              # 块数组和数量一次交给训练器

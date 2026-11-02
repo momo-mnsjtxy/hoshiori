@@ -1,18 +1,19 @@
-"""样本：从一条原始记录里认出正文，按规矩收干净，不合格就拒收并说明原因。
+"""样本：从一条原始记录里认出正文和图片路径，按规矩收干净，不合格就拒收并说明原因。
+
+调用方式：read(record, policy) 返回规范样本；images 可写一个路径或路径数组，默认最多四张。
+拒收是正常业务分支，每条原因码会进入 rejects.jsonl；正文和图片只在这个入口检查一次。
 
 调用示例：
   from features import sample
-  policy = sample.Policy()                       # 默认规矩：NFC、折叠空白、最短 1 字
-  clean = sample.read({"text": "  一段  话  "}, policy)   # 返回 {"text": "一段 话", ...}
-  sample.read({"text": ""}, policy)              # 抛 Refused("too_short")
-
-拒收是正常业务分支，不是故障：一次 weave 会拒掉很多条，每条都带原因码进 rejects.jsonl，
-接手者看原因码就知道是数据脏还是规矩太严。规矩本身由调用方从命令行传进来。
+  policy = sample.Policy()                                                        # 默认收最多四张图
+  clean = sample.read({"text": " 一段话 ", "images": ["photo.png"]}, policy)    # 正文收净，图片路径保留
+  sample.read({"text": ""}, policy)                                               # 抛 Refused("too_short")
 """
 
-import re
-import unicodedata
-from dataclasses import dataclass, field
+import re                                  # 清理控制符和多余空白
+import unicodedata                         # 统一字符的 Unicode 表示
+from dataclasses import dataclass          # 把样本规矩集中成一份数据
+from pathlib import Path                   # 检查图片路径是否真有文件
 
 CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")  # 不可见控制符，粘着会污染分词
 WS = re.compile(r"[ \t\u00a0\u3000]+")  # 各种空白，含全角空格
@@ -37,6 +38,7 @@ class Policy:
     form: str = "NFC"  # 统一字符表示；NFKC 会连带改字宽，默认不用
     min_chars: int = 1  # 短于此数算空样本
     max_chars: int = 0  # 0 表示不限长
+    max_images: int = 4  # 一条样本最多带几张图片
 
 
 def text_of(record: dict, policy: Policy) -> str:
@@ -80,11 +82,21 @@ def clean(text: str, policy: Policy) -> str:
 
 def read(record: dict, policy: Policy) -> dict:
     """主入口：一条原始记录进，一条规范样本出。"""
-    text = clean(text_of(record, policy), policy)  # 认正文再收干净，任何一步不合规都拒
-    out = {"text": text, "chars": len(text)}  # 只带下游真用得上的两样
-    out["source"] = record.get("source") or "unknown"  # 记来源，混配时按来源称重
-    if isinstance(record.get("messages"), list):  # 对话样本原样留一份，训练要用结构化那版
-        out["messages"] = record["messages"]
-    for key, value in (record.get("meta") or {}).items():  # 上游给的附加信息搬过来
-        out.setdefault("meta", {})[key] = value
-    return out
+    text = clean(text_of(record, policy), policy)                              # 认正文再收干净，不合规就拒收
+    given = record.get("images")                                               # 图片在正文之外单独读取
+    images = [given] if isinstance(given, str) else list(given or [])           # 单路径和路径数组统一成列表
+    if len(images) > policy.max_images:                                         # 超出单条样本的图片预算
+        raise Refused("too_many_images", str(len(images)))                     # 原因码交给拒收档记账
+    for path in images:                                                        # 每个路径只在样本入口检查一次
+        if not Path(path).is_file():                                            # 找不到文件就不能留给训练阶段
+            raise Refused("no_image", str(path))                               # 明说是哪张图不存在
+
+    out = {"text": text, "chars": len(text)}                                  # 正文和长度交给下游
+    out["source"] = record.get("source") or "unknown"                         # 记来源，混配时按来源称重
+    if "images" in record:                                                     # 原记录带图时保留规范后的路径列表
+        out["images"] = images                                                 # 训练器按原顺序准备每张图片
+    if isinstance(record.get("messages"), list):                               # 对话样本原样留一份
+        out["messages"] = record["messages"]                                  # 训练仍可使用结构化轮次
+    for key, value in (record.get("meta") or {}).items():                       # 上游附加信息逐项搬过来
+        out.setdefault("meta", {})[key] = value                                # 第一个字段到来时再建 meta
+    return out                                                                  # 交出一条可写入 bolt 的样本

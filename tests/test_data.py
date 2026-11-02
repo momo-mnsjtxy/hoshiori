@@ -55,6 +55,23 @@ def test_read_keeps_messages_and_meta():
     assert out["meta"]["k"] == 1
 
 
+def test_read_keeps_images_and_refuses_bad_paths(tmp_path):                          # 单路径、路径数组和两种拒收一次覆盖
+    first = tmp_path / "first.png"                                                  # 样本层只确认路径存在
+    second = tmp_path / "second.png"                                                # 图片内容留给训练准备入口读取
+    first.write_bytes(b"first")                                                     # 造两个真实存在的文件
+    second.write_bytes(b"second")                                                   # 路径顺序应原样保留
+    one = read({"text": "正文", "images": str(first)}, Policy())                   # 字符串路径也统一成数组
+    many = read({"text": "正文", "images": [str(first), str(second)]}, Policy())   # 数组路径逐个保留
+    assert one["images"] == [str(first)]                                            # 单图下游也得到同一种结构
+    assert many["images"] == [str(first), str(second)]                              # 多图顺序没有变化
+    with pytest.raises(Refused) as missing:                                          # 不存在的图片在样本入口拒收
+        read({"text": "正文", "images": [str(tmp_path / "missing.png")]}, Policy())  # 不留到训练时才报错
+    assert missing.value.code == "no_image"                                        # 缺图有独立原因码
+    with pytest.raises(Refused) as crowded:                                          # 默认一条最多四张图
+        read({"text": "正文", "images": [str(first)] * 5}, Policy())               # 路径都存在，只考数量上限
+    assert crowded.value.code == "too_many_images"                                 # 超限也能在拒收档单独统计
+
+
 # ---------- 判重 ----------
 
 BASE = "星织把散落的星点织成整匹布，训练管线就是织机，梭子交到手上，经线与纬线各自就位。" * 3

@@ -1,4 +1,4 @@
-"""训练的测试：训练、存档和续训能跑通，参考模型与教师独立载入、冻结在 CPU 并按任务释放。
+"""训练的测试：文本与图片批次、存档和续训能跑通，参考模型与教师独立载入、冻结并按任务释放。
 
 调用方式：在项目根目录用 pytest 运行本文件；模型缩到 2 层 32 维 64 词表，CPU 上也能验。
 
@@ -13,19 +13,22 @@ import importlib.util
 import json
 import math
 import shutil
+from pathlib import Path
 import socket
 import sys
 import time
 import types
 import weakref  # 检查任务收尾后冻结模型确实已释放
+from dataclasses import replace
 
+import numpy as np
 import pytest
 import torch
 from torch.nn import functional as F
 
 import main
 from commands import spin
-from features import lora, model, trainer
+from features import image, lora, model, trainer
 
 
 @pytest.fixture
@@ -88,6 +91,54 @@ def test_resume_keeps_cursor(geo, files, tmp_path):
     job = trainer.Trainer(model.Model(geo), geo, short(geo, files, out, steps=5, save_every=5, resume=out / "step-000004"))  # 从断点接
     job.run()
     assert job.history and json.loads((out / "step-000005" / "state.json").read_text(encoding="utf-8"))["cursor"] == 10  # 接着往后取
+
+
+# ---------- 图片批次 ----------
+
+def test_image_batch_shape_and_label_prefix(geo, tmp_path, monkeypatch):                  # 多图串块、右补零和标签前缀一起核对
+    path = tmp_path / "pictures.jsonl"                                                   # 两条图片样本放在同一批
+    rows = [                                                                             # 第一条一张图，第二条两张图
+        {"text": "abcdef", "images": ["one.png"]},                                    # 五个答案位和四个真实图片块
+        {"text": "abcdefgh", "images": ["two.png", "three.png"]},                    # 七个答案位和八个真实图片块
+    ]
+    path.write_text("\n".join(json.dumps(one) for one in rows), encoding="utf-8")        # 写成训练器实际读取的 JSONL
+    pictured = replace(geo, image_side=4, patch=2)                                       # 每张图固定切成四块
+    values = {"one.png": 1.0, "two.png": 2.0, "three.png": 3.0}                       # 不同图片用不同块值辨认顺序
+
+    def prepare(path, side, patch):                                                      # 只隔离读图，批次拼法走真实实现
+        blocks = np.full((4, patch, patch, 3), values[Path(path).name], dtype=np.float32)            # 一张图交四块
+        return blocks, len(blocks)                                                       # 契约同时返回块数
+
+    monkeypatch.setattr(image, "prepare", prepare)                                       # 不让文件编码细节干扰批次断言
+    job = trainer.Trainer(model.Model(pictured), pictured, short(pictured, [path], tmp_path / "run", batch_size=2, steps=1))  # 真建训练任务
+    samples = iter(job.samples)                                                         # 文件顺序就是本次批次顺序
+    monkeypatch.setattr(job, "_next", lambda: next(samples))                            # 跳过随机洗牌，只考拼批
+    ids, labels, patches = job._batch()                                                 # 取出图片微批
+    assert ids.shape == (2, 7)                                                         # 最长八个号，输入留下前七个
+    assert patches.shape == (2, 8, 2, 2, 3)                                           # 两张图决定批内最多八块
+    assert labels.shape == (2, 15)                                                     # 八个图片位加七个文本位
+    assert torch.all(labels[:, :8] == -100)                                            # 全部图片块都不参与语言损失
+    assert torch.equal(labels[0, 8:13].cpu(), torch.tensor(job.samples[0][0][1:]))       # 文本答案紧接图片前缀
+    assert torch.all(labels[0, 13:] == -100)                                            # 短文本右侧仍是忽略位
+    assert torch.all(patches[0, :4] == 1) and torch.all(patches[0, 4:] == 0)             # 单图样本只在右侧补零块
+    assert torch.all(patches[1, :4] == 2) and torch.all(patches[1, 4:] == 3)             # 多图按路径次序首尾拼接
+    job.close()                                                                         # 只验批次，不运行的任务显式释放
+
+
+def test_text_batch_keeps_original_forward(geo, files, tmp_path, monkeypatch):           # 没有 image_side 时接口和前向都不带图片参数
+    net = model.Model(geo)                                                              # 原来的纯文本模型
+    forward = net.forward                                                               # 留住真实文本前向
+
+    def text_only(ids):                                                                 # 故意只接旧接口的一个参数
+        return forward(ids)                                                             # 数值仍由真实模型计算
+
+    monkeypatch.setattr(net, "forward", text_only)                                      # 若训练器多传 patches 会直接报 TypeError
+    job = trainer.Trainer(net, geo, short(geo, files, tmp_path / "run", steps=1))        # 普通文本任务
+    batch = job._batch()                                                                # 先核对旧批次接口
+    assert len(batch) == 2 and batch[0].shape == batch[1].shape                         # 仍只返回 ids 和同形 labels
+    assert all(isinstance(one, list) for one in job.samples)                            # 样本仍是一串编号，不改内部结构
+    assert math.isfinite(job._update())                                                 # 旧签名前向真跑一步仍有有限损失
+    job.close()                                                                         # 不走 run 时显式释放任务资源
 
 
 # ---------- LoRA ----------

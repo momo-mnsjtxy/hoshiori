@@ -21,6 +21,8 @@
 | `ori forge`：safetensors → GGUF（f16/q8_0/q6_k/q5_k_s/q5_k_m 含 _M 抬升）、词表导出、LoRA 合并、onnx | 可用（mlx 待 macOS 复验） |
 | `ori serve`：OpenAI 兼容网关，流式、限流、请求日志、令牌鉴权、真分词 usage | 可用（后端 echo / 外部命令） |
 | `ori loom`：只读面板，五页看卡、样本、拒收、进度、对比 | 可用 |
+| `ori plugin`：四类插件（数据源 / 奖励 / 指标 / 导出器），放文件即生效 | 可用 |
+| 图片进训练：样本带 `images`，模型按 patch 当前缀吃进去 | 可用（VLM 未接，只有图块前缀） |
 | `ori spin --dry-run`：训练计划表与显存估算 | 可用 |
 | `ori doctor`：环境自检 | 可用 |
 
