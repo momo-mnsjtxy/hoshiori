@@ -1,0 +1,52 @@
+# 启动用英语小题集：固定12题，不代表学术基准或通用能力排名。
+name: en-smoke
+desc: English smoke checks (12 fixed questions; not a general capability benchmark)
+tasks:
+  - id: france
+    prompt: 'What is the capital of France? Answer briefly.'
+    rule: regex
+    pattern: '(?i)\bParis\b'
+  - id: japan
+    prompt: 'What is the capital of Japan? Answer briefly.'
+    rule: regex
+    pattern: '(?i)\bTokyo\b'
+  - id: addition
+    prompt: 'What is 7 plus 5? Answer with a number.'
+    rule: regex
+    pattern: '\b12\b'
+  - id: multiply
+    prompt: 'What is 6 times 8? Answer with a number.'
+    rule: regex
+    pattern: '\b48\b'
+  - id: opposite
+    prompt: 'What is the opposite of hot? Answer with one word.'
+    rule: regex
+    pattern: '(?i)\bcold\b'
+  - id: color
+    prompt: 'What color is a ripe banana? Answer with one word.'
+    rule: regex
+    pattern: '(?i)\byellow\b'
+  - id: sequence
+    prompt: 'What number comes next: 2, 4, 6, 8, ? Answer with a number.'
+    rule: regex
+    pattern: '\b10\b'
+  - id: animal
+    prompt: 'What animal says meow? Answer with one word.'
+    rule: regex
+    pattern: '(?i)\bcat\b'
+  - id: water
+    prompt: 'What is the chemical formula for water?'
+    rule: regex
+    pattern: '(?i)H2O|H₂O'
+  - id: days
+    prompt: 'How many days are in a week? Answer with a number.'
+    rule: regex
+    pattern: '\b7\b'
+  - id: square
+    prompt: 'What is the square root of 81? Answer with a number.'
+    rule: regex
+    pattern: '\b9\b'
+  - id: planet
+    prompt: 'Which planet is known as the Red Planet?'
+    rule: regex
+    pattern: '(?i)\bMars\b'

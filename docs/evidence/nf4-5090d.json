@@ -1,0 +1,26 @@
+{
+  "precision": "nf4",
+  "gpu": "NVIDIA GeForce RTX 5090 D",
+  "capability": [
+    12,
+    0
+  ],
+  "torch": "2.8.0+cu128",
+  "cuda": "12.8",
+  "steps_before_resume": 3,
+  "steps_after_resume": 5,
+  "losses": [
+    5.613722,
+    5.568671,
+    5.552227,
+    5.552227,
+    5.546073
+  ],
+  "last_grad_norm": 1.7385011911392212,
+  "peak_allocated_bytes": 18368000,
+  "seconds": 1.4653266910463572,
+  "fp8_linear_layers": 0,
+  "scaled_mm_calls": 0,
+  "scaled_operators": {},
+  "checkpoint": "/root/hoshiori/.bench/nf4-5090d-run/latest"
+}

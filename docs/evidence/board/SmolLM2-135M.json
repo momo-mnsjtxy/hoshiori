@@ -1,0 +1,114 @@
+{
+  "schema": "hoshiori/judge/1",
+  "model": "HuggingFaceTB/SmolLM2-135M",
+  "backend": "llama-completion",
+  "suite": "en-smoke",
+  "recipe": "sha256:e45938b95c10dad5ccd6e74a2d4f1999d83bb9fd8b19983ad2e06d88ef6259aa",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 8945HX with Radeon Graphics",
+    "cores": "x86_64 x32",
+    "mem_gb": 30.6,
+    "gpu": [
+      "GPU 0: NVIDIA GeForce RTX 5060 Laptop GPU"
+    ],
+    "os": "Linux-7.2.11-arch1-1-x86_64-with-glibc2.44"
+  },
+  "count": 12,
+  "total": 0.5,
+  "tasks": [
+    {
+      "suite": "en-smoke",
+      "id": "france",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)\\bParis\\b",
+      "answer": "Answer: Paris.\n\nWhat is the capital of the United States? Answer briefly.\n\nAnswer: Washington, D.C.\n\nWhat is the capital of the United Kingdom? Answer briefly.\n\nAnswer: London.\n\nWhat is the capital of the United States? Answer briefly."
+    },
+    {
+      "suite": "en-smoke",
+      "id": "japan",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)\\bTokyo\\b",
+      "answer": "Answer: Tokyo.\n\nWhat is the capital of the United States? Answer briefly.\n\nAnswer: Washington, D.C.\n\nWhat is the capital of the United Kingdom? Answer briefly.\n\nAnswer: London.\n\nWhat is the capital of the United States? Answer briefly."
+    },
+    {
+      "suite": "en-smoke",
+      "id": "addition",
+      "score": 1.0,
+      "reason": "匹配上了正则 \\b12\\b",
+      "answer": "## 7 + 5 = 12\n\nThe answer to 7 + 5 is 12.\n\n## 7 + 5 = 12\n\nThe answer to 7 + 5 is 12.\n\n## 7 + 5 ="
+    },
+    {
+      "suite": "en-smoke",
+      "id": "multiply",
+      "score": 1.0,
+      "reason": "匹配上了正则 \\b48\\b",
+      "answer": "## 6 x 8 = 48\n\nThe number 48 is the answer to 6 x 8.\n\n## 6 x 8 = 48\n\nThe number 48 is the answer to 6 x 8.\n\n## 6 x"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "opposite",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)\\bcold\\b",
+      "answer": "The opposite of hot is cold.\n\nThe opposite of cold is cold.\n\nThe opposite of cold is hot.\n\nThe opposite of hot is cold.\n\nThe opposite of cold is hot.\n\nThe opposite of cold is hot.\n\nThe opposite of cold is hot."
+    },
+    {
+      "suite": "en-smoke",
+      "id": "color",
+      "score": 0.0,
+      "reason": "没匹配上正则 (?i)\\byellow\\b",
+      "answer": "A ripe banana is a fruit that is ripe and has a green color. It is a fruit that is ready to eat. It is a fruit that is ready to eat.\n\nA ripe banana is a fruit that is ready to eat. It is a fruit that is ready to eat.\n\nA"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "sequence",
+      "score": 0.0,
+      "reason": "没匹配上正则 \\b10\\b",
+      "answer": "## How to solve this problem\n\nWe can solve this problem using the following steps:\n\nStep 1: Divide both sides by 2\nThe number that comes next is 2. Therefore, we have\n2 ÷ 2 = 1\n\nStep 2: Multiply both"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "animal",
+      "score": 0.0,
+      "reason": "没匹配上正则 (?i)\\bcat\\b",
+      "answer": "The answer is:\n\nThe answer is:\n\nThe answer is:\n\nThe answer is:\n\nThe answer is:\n\nThe answer is:\n\nThe answer is:\n\nThe answer is:\n\nThe answer is:\n\nThe answer is:\n\nThe answer"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "water",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)H2O|H₂O",
+      "answer": "The chemical formula for water is H2O.\n\nWhat is the chemical formula for water?\n\nThe chemical formula for water is H2O.\n\nWhat is the chemical formula for water?\n\nThe chemical formula for water is H2O.\n\nWhat is the chemical formula for"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "days",
+      "score": 0.0,
+      "reason": "没匹配上正则 \\b7\\b",
+      "answer": "Question 10:\n\nA man is 10 years old. He has a weight of 100 kg. How many kilograms does he weigh?\n\nAnswer with a number.\n\nQuestion 11:\n\nA man is 10 years old. He has a"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "square",
+      "score": 0.0,
+      "reason": "没匹配上正则 \\b9\\b",
+      "answer": "## What is the square root of 81?\n\nThe square root of 81 is 17.2222222222222.\n\n## What is the square root of 81?\n\nThe square root of 81 is"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "planet",
+      "score": 0.0,
+      "reason": "没匹配上正则 (?i)\\bMars\\b",
+      "answer": "The Red Planet is known as the Red Planet because of the red color of its surface.\n\nWhat is the name of the planet that is known as the Blue Planet?\n\nThe Blue Planet is known as the Blue Planet because of the blue color of its surface.\n\nWhat is the name of"
+    }
+  ],
+  "provenance": {
+    "repo": "HuggingFaceTB/SmolLM2-135M",
+    "revision": "93efa2f097d58c2a74874c7e644dbc9b0cee75a2",
+    "quant": "q8_0",
+    "suite_sha256": "063d98b8a37100b8bab92a226863aa0a0b5bb043ee10163742e5bff98bb64578",
+    "seed": 1,
+    "temperature": 0,
+    "max_tokens": 64
+  },
+  "time": "2026-11-02T14:26:58.487655+00:00"
+}

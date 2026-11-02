@@ -16,7 +16,8 @@
   /metrics.json         loom.jsonl 里的 loss 与时间，供首页增量拉取
 
 安全面就三条，都只在这个文件里：
-  1. 只读：一个 GET 路由，不写盘，不收表单。
+  1. 设置 token 后所有页面需认证；POST /api/card 可修改名称、许可和描述。
+     无 token 时仅允许本机只读，公网监听必须提供 token。
   2. 路径钉死在产物根目录内：请求里的相对路径展开后不在根下面，回 404。
   3. 正文和出处一律 HTML 转义：样本里有尖括号也不会把版式咬穿。
 默认只监听 127.0.0.1。
@@ -26,6 +27,11 @@
 """
 
 import functools
+import base64  # 浏览器内置 Basic 登录框使用标准编码
+import hmac  # 固定时间比较访问令牌
+import os  # 同目录原子替换卡片
+import tempfile  # 写成功后再替换，避免半份 JSON
+import threading  # 同一个面板并发写卡片时串行修改
 import html
 import http.server
 import json
@@ -301,12 +307,15 @@ def _metrics(root: Path, since):
 class Panel(http.server.BaseHTTPRequestHandler):
     """一次请求。产物根目录在 make() 里塞进来，这个类只读它。"""
 
-    def __init__(self, request, address, server, root):
+    def __init__(self, request, address, server, root, token=""):
+        self.token = token                               # 每个请求使用同一份启动时令牌
         self.root = Path(root).resolve()                  # 入口就定死绝对路径，越界判断靠它比
         super().__init__(request, address, server)
 
     def do_GET(self):
         """一个 GET 进来，按路径找页面；没登记的路径就是 404。"""
+        if not self.authorize():                         # 指标、页面和错误出口都先认证
+            return
         url = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(url.query)
         if url.path == "/metrics.json":                 # 指标流是 JSON，不套五个页面的 HTML 壳
@@ -319,6 +328,74 @@ class Panel(http.server.BaseHTTPRequestHandler):
             return
         code, body = route(self, params)                  # 页面自己说清用哪个状态码
         self.reply(code, body)
+
+    def authorize(self, write: bool = False) -> bool:
+        """Bearer 给 API、Basic 给浏览器；写操作始终需要显式配置的令牌。"""
+        if not self.token and not write:                   # 兼容本机只读浏览，不意外开放修改
+            return True
+        authorization = self.headers.get("Authorization", "")
+        supplied = authorization[7:] if authorization.startswith("Bearer ") else ""
+        if authorization.startswith("Basic "):
+            try:
+                supplied = base64.b64decode(authorization[6:], validate=True).decode("utf-8").partition(":")[2]
+            except (ValueError, UnicodeError):             # 坏认证头属于未认证请求
+                supplied = ""
+        if self.token and hmac.compare_digest(supplied.encode(), self.token.encode()):
+            return True                                    # 不把令牌写到 URL、日志或页面
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Starfur Loom", charset="UTF-8"')
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        return False
+
+    def do_POST(self):
+        """认证后修改卡片元数据；只接受 JSON，浏览器跨源写请求明确拒绝。"""
+        if not self.authorize(write=True):
+            return
+        if urllib.parse.urlparse(self.path).path != "/api/card":
+            self.reply_json(404, {"error": "没有这个写操作"})
+            return
+        origin = self.headers.get("Origin")                 # Basic 会被浏览器自动带上，必须挡跨源写
+        if origin and urllib.parse.urlparse(origin).netloc != self.headers.get("Host"):
+            self.reply_json(403, {"error": "不接受跨源修改"})
+            return
+        if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
+            self.reply_json(415, {"error": "修改需要 application/json"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 65536:                     # 元数据不应包含整份语料，控制单请求占用
+                raise ValueError("请求大小必须在 1 到 65536 字节之间")
+            changes = json.loads(self.rfile.read(length))
+            if not isinstance(changes, dict) or not changes or set(changes) - {"name", "license", "description"}:
+                raise ValueError("只可修改 name、license、description，且至少给一项")
+            if any(not isinstance(value, str) or len(value) > 10000 for value in changes.values()):
+                raise ValueError("卡片字段必须是最多 10000 字的文本")
+            changes = {key: value.strip() for key, value in changes.items()}
+            if "name" in changes and not changes["name"]:
+                raise ValueError("名称不能为空")
+            card = _at(self.root, "card.json")              # 固定目标同样检查符号链接，不能写出根目录
+            if card is None or not card.is_file():
+                self.reply_json(404, {"error": "根目录里没有可修改的 card.json"})
+                return
+            with self.server.card_lock:                    # 读取、合并、替换算一个写事务
+                data = _read_json(card)
+                data.update(changes)                       # 样本数量、指纹等计算字段不允许从面板伪造
+                with tempfile.NamedTemporaryFile(mode="w", dir=self.root, prefix=".card-", suffix=".tmp", delete=False, encoding="utf-8") as output:
+                    temporary = Path(output.name)
+                    json.dump(data, output, ensure_ascii=False, indent=2)
+                    output.flush()
+                    os.fsync(output.fileno())              # 内容写稳之后再替换原卡片
+                try:
+                    os.replace(temporary, card)            # 读页面只能看到完整旧卡或完整新卡
+                finally:
+                    temporary.unlink(missing_ok=True)
+            self.reply_json(200, data)
+        except (ValueError, UnicodeError) as wrong:          # 请求内容问题让用户直接修改
+            self.reply_json(400, {"error": str(wrong)})
+        except OSError as wrong:                            # 文件权限/磁盘故障不能假装保存成功
+            self.reply_json(500, {"error": str(wrong)})
 
     def reply(self, code: int, body: str) -> None:
         """发一整页。"""
@@ -364,6 +441,8 @@ class Panel(http.server.BaseHTTPRequestHandler):
             "<br>"
             + _card_html(data, f"{data.get('name', '无名数据集')} · 数据集卡")
         )
+        if self.token:                                    # 认证面板提供实际可用的元数据编辑入口
+            body += _card_editor(data)
         return 200, _page("首页", body, "/")
 
     def metrics(self, params):
@@ -469,19 +548,44 @@ ROUTES = {                                # 路径 → 页面函数，加一页�
 }
 
 
-def make(root, host: str = "127.0.0.1", port: int = 0) -> http.server.ThreadingHTTPServer:
+def make(root, host: str = "127.0.0.1", port: int = 0, token: str = "") -> http.server.ThreadingHTTPServer:
     """建一个服务但先不转，测试拿它自己起线程。端口给 0 让系统挑空口。"""
-    return http.server.ThreadingHTTPServer((host, port), functools.partial(Panel, root=root))
+    if host not in {"127.0.0.1", "localhost", "::1"} and not token:
+        from utils.fail import fail                        # 只有启动边界检查对外监听的认证条件
+        fail("input", "对外监听面板必须配置访问令牌", hint="设置 ORI_LOOM_TOKEN 环境变量")
+    server = http.server.ThreadingHTTPServer((host, port), functools.partial(Panel, root=root, token=token))
+    server.card_lock = threading.Lock()                     # 全请求共享，避免写入丢失彼此修改的字段
+    return server
 
 
-def serve(root, host: str = "127.0.0.1", port: int = 0) -> None:
+def serve(root, host: str = "127.0.0.1", port: int = 0, token: str = "") -> None:
     """前台起服务，Ctrl+C 停。默认只监听本机。"""
-    server = make(root, host, port)
+    server = make(root, host, port, token)
     print(f"面板起在 http://{host}:{server.server_address[1]}/  根目录 {Path(root).resolve()}")
-    print("只读服务，Ctrl+C 停")
+    print("认证服务，可编辑卡片；浏览器用户名任意、密码填令牌。Ctrl+C 停" if token else "本机只读服务，Ctrl+C 停")
     try:
         server.serve_forever()
     except KeyboardInterrupt:                             # 手动停不算故障
         print("\n收工")
     finally:
         server.server_close()
+
+
+
+def _card_editor(data: dict) -> str:
+    """首页的元数据表单；使用同源 JSON 写操作，令牌由浏览器认证头携带。"""
+    fields = "".join(f"<label>{label}<input name='{key}' value='{_esc(data.get(key, ''))}'></label>"
+                     for key, label in (("name", "名称"), ("license", "许可"), ("description", "描述")))
+    return "<h2>编辑数据集卡</h2><form id='card-editor'>" + fields + "<button>保存</button></form><p id='card-result'></p>" + """
+<script>
+document.getElementById('card-editor').addEventListener('submit', async event => {
+  event.preventDefault();                                    // 提交走 JSON，原始表单不会触发写操作
+  const fields = Object.fromEntries(new FormData(event.target));
+  const result = document.getElementById('card-result');
+  try {
+    const response = await fetch('/api/card', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(fields)});
+    const data = await response.json();                       // 服务器失败原因原样显示
+    result.textContent = response.ok ? '已保存，刷新可查看新卡片。' : data.error;
+  } catch (error) { result.textContent = '保存失败：' + error.message; }
+});
+</script>"""

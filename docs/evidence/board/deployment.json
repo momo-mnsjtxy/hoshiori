@@ -1,0 +1,10 @@
+{
+  "project_id": "appgprj_6ae89bdddb7c8191bcccbb9527e33289",
+  "version_id": "appgprj_6ae89bdddb7c8191bcccbb9527e33289~appgver_83e876550f6881919165de0c21a4bf6c",
+  "deployment_id": "appgdep_6ae89ea4465481919e910d2a09d8ae16",
+  "commit_sha": "b8982461263373cd92372da9cf449658efc9ae6d",
+  "access": "public",
+  "status": "succeeded",
+  "url": "https://hoshiori-model-board.mnsjtxy.chatgpt.site",
+  "checkout": ".work/board-site"
+}

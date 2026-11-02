@@ -1,0 +1,47 @@
+{
+  "steps": 100,
+  "tokens_per_step": 256,
+  "seconds_per_step": 0.027290574554353953,
+  "hours": 0.0007580715153987209,
+  "cards": 1,
+  "price_per_hour": 1.19,
+  "total_price": null,
+  "currency": "USD",
+  "reason": "使用完全匹配配置的实测更新步耗时；云价 GPU 与实测 GPU 不同，费用未知",
+  "price_source": {
+    "version": 1,
+    "provider": "runpod",
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "cloud": "secure",
+    "currency": "USD",
+    "unit": "GPU-hour",
+    "price_per_hour": 1.19,
+    "fetched_at": "2026-11-02T14:29:32.158277+00:00",
+    "source": "https://api.runpod.io/graphql",
+    "query": "{ gpuTypes { id displayName memoryInGb securePrice communityPrice } }",
+    "raw_entry": {
+      "id": "NVIDIA GeForce RTX 5090",
+      "displayName": "RTX 5090",
+      "memoryInGb": 32,
+      "securePrice": 1.19,
+      "communityPrice": 0.69
+    },
+    "scope": "按需计算目录价；不含存储、税费、启动和空闲时间，库存未验证"
+  },
+  "hardware_match": false,
+  "measurement": {
+    "hardware": {
+      "name": "NVIDIA GeForce RTX 5090 D",
+      "capability": [
+        12,
+        0
+      ],
+      "total_gib": 31.35833740234375,
+      "free_gib_before": 30.86297607421875,
+      "torch": "2.8.0+cu128",
+      "cuda": "12.8"
+    },
+    "measured_at": "2026-11-02T14:29:33.817695+00:00",
+    "scope": "synthetic_full_length_training"
+  }
+}

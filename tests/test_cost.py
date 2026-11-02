@@ -23,9 +23,9 @@ def _plan(steps: int = 100):
 
 def test_price_and_hours_scale_linearly():
     table = _plan(steps=100)                                                     # 固定一张单卡训练账
-    base = cost.estimate(table, price_per_hour=2.5, tokens_per_step=2_000)        # 基准单价和工作量
-    longer = cost.estimate(replace(table, steps=200), price_per_hour=2.5, tokens_per_step=2_000)  # 步数翻倍
-    dearer = cost.estimate(table, price_per_hour=5.0, tokens_per_step=2_000)       # 单价翻倍
+    base = cost.estimate(table, price_per_hour=2.5, tokens_per_step=2_000, tokens_per_second=1_000)        # 基准单价和工作量
+    longer = cost.estimate(replace(table, steps=200), price_per_hour=2.5, tokens_per_step=2_000, tokens_per_second=1_000)  # 步数翻倍
+    dearer = cost.estimate(table, price_per_hour=5.0, tokens_per_step=2_000, tokens_per_second=1_000)       # 单价翻倍
     assert longer["hours"] == pytest.approx(base["hours"] * 2)                   # 总时长随总步数线性增长
     assert longer["total_price"] == pytest.approx(base["total_price"] * 2)       # 同一单价下总价也跟着翻倍
     assert dearer["hours"] == pytest.approx(base["hours"])                       # 换单价不应改变训练时间
@@ -54,7 +54,7 @@ def test_show_contains_cost_and_recommendation_sections():
     text = table.show()                                                          # 走用户实际看到的整张训练账
     assert table.steps == 120 and table.tokens == 512                            # 新字段确实由 recipe 填入
     assert "成本估算" in text and "复用卡推荐" in text                            # 成本与三条建议接在原账末尾
-    assert "120 步" in text and "batch" in text                                  # 估算工作量和推荐字段都能读到
+    assert "120 步" in text and "未知" in text                                  # 估算工作量和推荐字段都能读到
 
 
 def test_show_without_steps_only_adds_recommendations():

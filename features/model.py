@@ -7,6 +7,8 @@ max_seq_len 仍是文本长度预算，图片块额外占位置；实际图片�
 forward(ids, patches=None, block_mask=None, patch_at=None) 接收 (批, 文本长)；可选 patches 是归一后的 RGB，
 形状 (批, 块数, patch, patch, 3)，也可预先展平成 (批, 块数, patch*patch*3)。block_mask 以 1/0 标出
 真实块和批内补位块；patch_at 给每块所跟随的文本下标，不给时仍把整段图片放在文本前。图片与文字共用 RoPE，
+按拼好后的序列从 0 连续编号。默认 vision="conv" 使用两层块内卷积，旧图片权重需 vision="linear"。
+embeddings 与 retrieval 使用独立文本编码器前向，避免文本偷看图片；对比损失采用对称 InfoNCE 和有界跨批负样本队列。
 按拼好后的序列从 0 连续编号。align_weight 默认 0，此时只返回 (批, 块数+文本长, 词表)；权重大于 0 时
 返回 (logits, 对齐损失)，供调用方与语言损失相加。
 量化顺序仍是 load → quantize → 建优化器；无卡时保持 fp32，压过后可训的只剩 LoRA 的 A/B。
@@ -16,7 +18,7 @@ forward(ids, patches=None, block_mask=None, patch_at=None) 接收 (批, 文本�
   from pathlib import Path                                                    # 存档位置
   import torch                                                                # 造一批模型输入
   from features.model import Geometry, Model                                   # 几何与模型
-  geo = Geometry(image_side=32, patch=16)                                      # 四块图片前缀
+  geo = Geometry(image_side=32, patch=16, vision="conv")                                      # 四块图片前缀
   model = Model(geo)                                                          # 按几何搭架子，权重随机起
   ids = torch.tensor([[1, 2]])                                                # 两个文本位置
   patches = torch.zeros(1, 4, 16, 16, 3)                                      # 已归一的 RGB 图片块
@@ -28,6 +30,7 @@ forward(ids, patches=None, block_mask=None, patch_at=None) 接收 (批, 文本�
 """
 
 import json
+import hashlib  # 稳定文本指纹用来排除队列中的重复负例
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,7 +45,7 @@ from utils import logs
 from utils.fail import fail
 
 EPS = 1e-6  # RMSNorm 的分母下限，免得分母是 0 时除出无穷
-DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16, "nf4": torch.float32, "int8": torch.float32}
+DTYPES = {"fp8": torch.bfloat16, "fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16, "nf4": torch.float32, "int8": torch.float32}
 QUANT = {"nf4", "int8"}  # 真要压下去的精度；其余是普通 dtype，压不压都不经过 bitsandbytes
 
 
@@ -61,6 +64,7 @@ class Geometry:                   # 文本和图片共用一份几何
     rope_base: float = 10000.0     # RoPE 的底数
     tie: bool = True              # 输出层是否复用词表权重
     image_side: int = 0           # 原图边长，0 表示不接图
+    vision: str = "conv"          # 新视觉模型默认两层卷积；旧图片存档显式用 linear
     patch: int = 16               # 图片块边长，接图时用正整数，右侧和底部可补齐
 
     @classmethod
@@ -71,6 +75,17 @@ class Geometry:                   # 文本和图片共用一份几何
         if geo.heads * geo.d_head != geo.d_model:  # 头宽乘头数必须正好铺满隐藏维
             fail("schema", "heads × d_head 对不上 d_model", where="model.geometry.d_head", hint=f"{geo.heads} × {geo.d_head} 要等于 {geo.d_model}")
         return geo
+
+    @classmethod
+    def from_config(cls, data: dict) -> "Geometry":
+        """从模型自己的 config.json 重建几何；旧视觉配置没有 vision 时按线性塔读取。"""
+        fields = {"d_model": "hidden_size", "layers": "num_hidden_layers", "heads": "num_attention_heads", "d_head": "head_dim", "vocab": "vocab_size", "rope_base": "rope_theta", "tie": "tie_word_embeddings"}
+        values = {name: data[key] for name, key in fields.items() if key in data}  # 不复用学生的隐藏维或层数
+        values.update({name: data[name] for name in ("image_side", "patch") if name in data})
+        values["vision"] = data.get("vision", "linear")                          # 旧图片权重没有卷积参数，明确保留旧结构
+        blocks = math.ceil(values.get("image_side", 0) / values.get("patch", 16)) ** 2
+        values["max_seq_len"] = data.get("text_max_seq_len", data.get("max_position_embeddings", 128) - blocks)
+        return cls(**values)                                                      # 其余可选字段保持几何的标准默认值
 
     def dtype(self, precision: str) -> torch.dtype:
         """按精度挑权重类型。CPU 一律 fp32，nv 卡上才有半精度。"""
@@ -260,6 +275,57 @@ class Core(nn.Module):
         return self.norm(x)                                                             # 收尾归一
 
 
+class VisionTower(nn.Module):
+    """两层真实卷积提取块内空间特征；块与块的上下文随后交给语言 Transformer。"""
+
+    def __init__(self, patch: int, size: int) -> None:
+        super().__init__()                                                       # 注册卷积权重，完整存档会自动收集
+        self.patch = patch                                                       # 展平输入也按这份几何还原 RGB
+        self.conv_1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)                  # 第一层学习局部颜色和边缘
+        self.conv_2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)                 # 第二层组合局部视觉特征
+        self.output = nn.Linear(64, size, bias=False)                            # 池化后投到语言隐藏维
+
+    def forward(self, pixels: torch.Tensor) -> torch.Tensor:
+        """输入 (批, 块, RGB 展平)，输出 (批, 块, 隐藏维)。"""
+        batch, blocks = pixels.shape[:2]                                         # 块独立编码，不把相邻两张图混成一张
+        grid = pixels.reshape(batch * blocks, self.patch, self.patch, 3).permute(0, 3, 1, 2)
+        hidden = F.gelu(self.conv_1(grid))                                       # 保留二维邻域的卷积特征
+        hidden = F.gelu(self.conv_2(hidden)).mean(dim=(-2, -1))                   # 池化得到每块的视觉描述
+        return self.output(hidden).reshape(batch, blocks, -1)                   # 恢复批与块两个维度
+
+
+class ImageContrast(nn.Module):
+    """对称 InfoNCE 与有界历史负样本；历史表示 detach，评估时绝不入队。"""
+
+    def __init__(self, size: int, capacity: int = 1024, temperature: float = 0.07) -> None:
+        super().__init__()                                                       # 队列属于本模型的训练状态
+        self.capacity, self.temperature = capacity, temperature                  # 容量上限与温度都来自配方
+        self.register_buffer("images", torch.empty(0, size), persistent=False)  # 只在训练断点单独保存，不污染推理权重
+        self.register_buffer("texts", torch.empty(0, size), persistent=False)   # 图与文总是成对入队
+        self.register_buffer("keys", torch.empty(0, dtype=torch.long), persistent=False)  # 排除重复文本的假负样本
+
+    def forward(self, pictures: torch.Tensor, texts: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
+        """输入已归一化的图文向量，当前第 i 图与第 i 文是唯一标注正对。"""
+        if not len(pictures):
+            return (pictures.sum() + texts.sum()) * 0                            # 无图批仍保留可反传的零损失
+        old_images = self.images.detach().clone().float()                        # 克隆避免本次入队改动反向所需的值
+        old_texts = self.texts.detach().clone().float()                           # 历史负样本不建立反向链
+        image_keys = torch.cat((pictures, old_images), dim=0)                    # 本批和历史都可成为候选
+        text_keys = torch.cat((texts, old_texts), dim=0)
+        all_keys = torch.cat((keys, self.keys), dim=0)                            # 同文本历史项不能充当负样本
+        duplicate = keys[:, None] == all_keys[None, :]
+        duplicate[:, :len(keys)].fill_diagonal_(False)                           # 自己对应的正例必须保留
+        image_scores = (pictures @ text_keys.T / self.temperature).masked_fill(duplicate, -torch.inf)
+        text_scores = (texts @ image_keys.T / self.temperature).masked_fill(duplicate, -torch.inf)
+        labels = torch.arange(len(keys), device=keys.device)                     # 正例列位于当前批最前面
+        loss = (F.cross_entropy(image_scores, labels) + F.cross_entropy(text_scores, labels)) / 2
+        if self.training and self.capacity:
+            self.images = torch.cat((old_images, pictures.detach()), dim=0)[-self.capacity:]
+            self.texts = torch.cat((old_texts, texts.detach()), dim=0)[-self.capacity:]
+            self.keys = torch.cat((self.keys, keys), dim=0)[-self.capacity:].detach()                       # 最旧对自动淘汰，显存不会随步数增长
+        return loss                                                              # 温度只在相似度 softmax 前应用
+
+
 class ImageAlign(nn.Module):
     """把图片投影映到文本隐藏空间；子层名沿用 HF 多模态投影器的 linear_1 / linear_2。"""
 
@@ -295,10 +361,11 @@ class Model(nn.Module):
 
     # ---------- 建完整模型 ----------
 
-    def __init__(self, geo: Geometry, precision: str = "fp32", align_weight: float = 0.0) -> None:       # 默认仍只返回文本打分
+    def __init__(self, geo: Geometry, precision: str = "fp32", align_weight: float = 0.0, align_queue: int = 1024, align_temperature: float = 0.07) -> None:       # 默认仍只返回文本打分
         super().__init__()                                                                           # 注册模型模块
         self.geo = geo                                                                               # 几何留在身上，存盘和报数都要用
         self.dtype = geo.dtype(precision)                                                            # 权重类型
+        self.pad_id = 0  # Trainer 按实际词表覆盖；独立检索也可显式提供 text_mask
         self.align_weight = align_weight                                                             # 正数时把加权图文损失随 logits 一起交回
         self.grad_checkpoint = False                                                                # 训练器可开启前向重算，节省显存
         self.quantized = False                                                                      # 记下量化层是否已替换
@@ -308,6 +375,8 @@ class Model(nn.Module):
             if name.endswith("o_proj.weight") or name.endswith("down_proj.weight"):                    # 注意力与前馈各自的出口
                 nn.init.normal_(one, std=0.02 / math.sqrt(2 * geo.layers))                             # 保持已有文本权重的初始化顺序
         self.image_proj = nn.Linear(geo.patch ** 2 * 3, geo.d_model, bias=False) if geo.image_side else None  # RGB 块投影；最后才建，不扰动文本初始化
+        self.vision = VisionTower(geo.patch, geo.d_model) if geo.image_side and geo.vision == "conv" else None  # 真实卷积塔仅在接图时创建
+        self.contrast = ImageContrast(geo.d_model, align_queue, align_temperature) if geo.image_side else None  # 有界跨批字典
         self.image_align = ImageAlign(geo.d_model) if geo.image_side else None                         # 两层可训映射把图片送进文本隐藏空间
         self.to(self.dtype)                                                                          # 图片层也一起落到目标精度
 
@@ -322,14 +391,8 @@ class Model(nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:                              # 下游显式传入图片块及其布局
         """返回 logits；align_weight 为正时再返回一个加权标量对齐损失。"""
         image_hidden = None                                                                          # 无图前向不增加前缀，也没有图文损失
-        if patches is not None:                                                                      # 有图片才走两段图片映射
-            pixels = patches.flatten(2)                                                              # 每块先展平成一行 RGB
-            if block_mask is not None:                                                               # 补位像素不必进入线层，极端伪值也不会先溢出
-                pixels = pixels * block_mask.unsqueeze(-1).to(pixels.dtype)                           # 无效块在图片通路入口就是零
-            image_hidden = self.image_proj(pixels)                                                   # 真实块先投到 d_model
-            image_hidden = self.image_align(image_hidden)                                            # 再对齐到文本隐藏空间后进入 Block
-            if block_mask is not None:                                                               # 补位块自身也归零，连它自己的输出都不依赖补位像素
-                image_hidden = image_hidden * block_mask.unsqueeze(-1).to(image_hidden.dtype)         # 再消掉对齐层偏置产生的补位表示
+        if patches is not None:                                                      # 图片编码只有这一条入口，检索与生成共用
+            image_hidden = self.encode_image(patches, block_mask)                    # 两层卷积、像素旁路、图文投影与补位遮罩
         if self.grad_checkpoint and self.training:                                                    # 重算时也把图片布局和遮罩带上
             x = checkpoint(self.model, ids, image_hidden, block_mask, patch_at, use_reentrant=False)  # 保留图片投影与对齐层的梯度链
         else:                                                                                        # 常规一次过
@@ -342,13 +405,51 @@ class Model(nn.Module):
             return logits                                                                            # 旧调用方不需要拆元组
         if image_hidden is None:                                                                     # 这一批没有图片就没有可对齐的表示
             return logits, x.float().sum() * 0.0                                                     # 仍交回可反传的标量零，返回结构不变
-        if patch_at is None:                                                                         # 前缀布局的文本仍是一段连续后缀
-            text_hidden = x[:, image_hidden.shape[1]:]                                               # 跳过开头图片位即可取回文本
-        else:                                                                                        # 交错布局要按同一张位置表取回文本
-            text_at, _ = sequence_positions(ids.shape[1], patch_at)                                  # 不重新猜图片插入位置
-            text_hidden = x.gather(1, text_at.unsqueeze(-1).expand(-1, -1, x.shape[-1]))             # 恢复成 (批, 文本长, 隐藏维)
-        alignment = align_loss(image_hidden, text_hidden, block_mask) * self.align_weight             # 权重在模型边界统一乘一次
-        return logits, alignment                                                                     # 调用方可把第二项加入语言损失
+        pictures, texts, valid = self.embeddings(ids, patches, block_mask, image_hidden=image_hidden)
+        keys = torch.tensor([int.from_bytes(hashlib.blake2b(row[row != self.pad_id].numpy().tobytes(), digest_size=8).digest(), "little") & ((1 << 63) - 1) for row in ids.detach().cpu()], device=ids.device)  # 文本指纹仅用于排除重复负样本
+        alignment = self.contrast(pictures[valid], texts[valid], keys[valid]) * self.align_weight
+        return logits, alignment                                                     # 语言损失由训练器统一相加
+
+    def encode_image(self, patches: torch.Tensor, block_mask: torch.Tensor = None) -> torch.Tensor:
+        """图像生成与检索共用视觉编码；无效块在卷积前和投影后各清一次。"""
+        pixels = patches.flatten(2)                                                  # 支持原来的五维和预展平输入
+        if block_mask is not None:
+            pixels = pixels * block_mask.unsqueeze(-1).to(pixels.dtype)               # 伪像素不能影响卷积或溢出
+        hidden = self.image_proj(pixels)                                             # 保留像素旁路与旧权重名称
+        if self.vision is not None:
+            hidden = hidden + self.vision(pixels)                                    # 真卷积特征参与实际前向与反向
+        hidden = self.image_align(hidden)                                            # 映射到语言隐藏空间
+        if block_mask is not None:
+            hidden = hidden * block_mask.unsqueeze(-1).to(hidden.dtype)               # 消掉投影偏置产生的伪块
+        return hidden                                                                # 块顺序、数量与输入一致
+
+    def embeddings(self, ids: torch.Tensor, patches: torch.Tensor, block_mask: torch.Tensor = None, text_mask: torch.Tensor = None, image_hidden: torch.Tensor = None) -> tuple:
+        """返回归一化图、文向量与有图标记；文本单独编码，不能偷看待检索图片。"""
+        hidden = self.encode_image(patches, block_mask) if image_hidden is None else image_hidden
+        mask = torch.ones(hidden.shape[:2], device=hidden.device) if block_mask is None else block_mask.float()
+        counts = mask.sum(dim=1, keepdim=True)                                        # 无图样本不会进入对比学习
+        pictures = (hidden.float() * mask.unsqueeze(-1)).sum(dim=1) / counts.clamp_min(1)
+        words = self.model(ids)                                                      # 独立文本前向，不使用图片前缀
+        text_mask = (ids != self.pad_id) if text_mask is None else text_mask                    # 调用方可显式覆盖 pad=0 的默认约定
+        texts = (words.float() * text_mask.unsqueeze(-1)).sum(dim=1) / text_mask.sum(dim=1, keepdim=True).clamp_min(1)
+        return F.normalize(pictures, dim=-1), F.normalize(texts, dim=-1), counts[:, 0] > 0
+
+    @torch.no_grad()
+    def retrieval(self, ids: torch.Tensor, patches: torch.Tensor, block_mask: torch.Tensor = None, text_mask: torch.Tensor = None) -> dict:
+        """评估成对图文检索 Recall@1/5；输入第 i 图和第 i 文必须是真实配对。"""
+        training = self.training                                                     # 调用后恢复用户原来的模型状态
+        self.eval()                                                                  # 不改变历史负样本队列
+        pictures, texts, valid = self.embeddings(ids, patches, block_mask, text_mask)
+        pictures, texts = pictures[valid], texts[valid]                               # 排除整条无图样本
+        scores = pictures @ texts.T                                                  # 一次生成完整候选打分矩阵
+        expected = torch.arange(len(scores), device=scores.device)                    # 对角线是标注正例
+        result = {"pairs": len(scores)}                                              # 报清分母，避免空集伪装成满分
+        for name, matrix in (("image_to_text", scores), ("text_to_image", scores.T)):
+            for count in (1, 5):
+                hit = (matrix.topk(min(count, len(scores)), dim=1).indices == expected[:, None]).any(dim=1)
+                result[f"{name}_r{count}"] = float(hit.float().mean()) if len(scores) else 0.0
+        self.train(training)                                                         # 检索不改变后续训练行为
+        return result                                                                # 可直接写入 JSON 报告
 
     def count(self) -> int:
         """参数量，只含真正占参数的张量。"""
@@ -370,10 +471,20 @@ class Model(nn.Module):
 
     def load(self, source: Path) -> None:
         """从文件或目录里读同名张量灌回来。名字缺一个就报错，不静默跳过。"""
+        configuration = (source if source.is_dir() else source.parent) / "config.json"  # 推理读取实际词表补位定义
+        if configuration.is_file():
+            self.pad_id = json.loads(configuration.read_text(encoding="utf-8")).get("pad_token_id", self.pad_id)
         files = sorted(source.glob("*.safetensors")) if source.is_dir() else [source]  # 目录就全收
         state = {}  # 攒起来的张量
         for one in files:  # 一个文件一个文件读
             state.update(load_file(str(one), device="cpu"))  # 并进同一份
+        has_tower = any(name.startswith("vision.") for name in state)                # 存档本身决定有没有真实卷积参数
+        if self.geo.image_side and self.vision is not None and not has_tower:
+            self.vision = None                                                      # 旧视觉存档保留线性路径，不捏造未训练卷积
+            self.geo.vision = "linear"                                              # 后续配置明确标出实际加载的结构
+            logs.warn("model", "载入旧视觉存档，使用 linear 视觉路径")
+        if self.geo.image_side and self.vision is None and has_tower:
+            fail("input", "这是 conv 视觉存档，请使用 geometry.vision: conv", where=str(source))
         own = self.state_dict()  # 自己的整套名字
         with torch.no_grad():  # 参数是叶子又要梯度，原地灌得关掉记录
             for name, tensor in own.items():  # 按自己的名字逐个找
@@ -388,6 +499,11 @@ class Model(nn.Module):
         device 不给就按当前那张卡；测试里在无卡机器上灌 cpu 也能走完这条路径。
         压完把自己身上所有参数冻住：量化层没有梯度，其余参数在 QLoRA 里也不该动。
         """
+        if precision == "fp8":                                                      # FP8 是计算精度，主权重保持 BF16 可训练
+            from features.precision import enable                                  # 不依赖 bitsandbytes
+            count = enable(self)                                                   # CPU/不支持的 GPU 明确拒绝，不静默降级
+            logs.done("spin", "FP8 线性前向已启用", layers=count, master="bf16", backward="bf16")
+            return False                                                           # 不走 QLoRA 冻结语义，全参数仍可训练
         if precision not in QUANT:  # fp32 / bf16 / fp16 / fp8 不走这条路，本来就已经是真类型
             return False
         if device is None and not torch.cuda.is_available():  # 没卡就没地方放量化层
@@ -420,6 +536,9 @@ class Model(nn.Module):
             "max_position_embeddings": self.model.rope_cos.shape[2],  # 文本预算加图片块的总位置数
             "rope_theta": self.geo.rope_base,                     # RoPE 底数
             "tie_word_embeddings": self.geo.tie,                  # 输出层是否共用词表
+            "pad_token_id": self.pad_id,                       # 检索池化不能把词表补位算进文本表示
+            "vision": self.geo.vision,                         # 旧线性与新卷积权重可以明确重建
+            "text_max_seq_len": self.geo.max_seq_len,            # 区别文字预算与含图总位置预算
             "image_side": self.geo.image_side,                   # 原图边长，0 表示不接图
             "patch": self.geo.patch,                             # 图片块边长，决定投影输入宽度
             "torch_dtype": precision,                            # 权重精度

@@ -11,10 +11,12 @@
 """
 
 from dataclasses import dataclass, field
+import json                            # 校准和价钱快照从用户指定的 JSON 文件加载
+from pathlib import Path              # 相对路径跟配方目录走，不跟启动目录漂移
 
 from features import cost
 
-BYTES = {"bf16": 2, "fp16": 2, "fp32": 4, "fp8": 1, "nf4": 0.5, "int8": 1}  # 每参数占几个字节
+BYTES = {"bf16": 2, "fp16": 2, "fp32": 4, "fp8": 2, "nf4": 0.5, "int8": 1}  # FP8 前向仍保留 BF16 主权重
 ACTIVATION = 6.0  # 激活留量相对权重的倍数，经验值
 FRAGMENT = 1.15  # 显存碎片余量
 LORA_SHARE = 0.05  # 挂 LoRA 时优化器态只按 5% 参数算
@@ -37,6 +39,9 @@ class Plan:
     steps: int = 0  # 配方明确给出的总更新步数；0 表示要由数据量和 epochs 决定
     tokens: int = 128  # 每条样本的最长文本 token 数，来自模型几何
     params_b: float = 0.5  # 模型十亿参数量，复用卡要拿它和显存一起分档
+    profile: dict = None               # 真机短跑证据；没有时不生成看似已验证的配方
+    price: dict = None                 # 带来源与时间的云价快照
+    configuration: dict = None         # 与 profile 逐项匹配的实际训练配置
 
     @property
     def needs_gpu(self) -> bool:
@@ -55,16 +60,23 @@ class Plan:
         ]
         if self.lora:  # 挂 LoRA 才提，不挂不提
             lines.append(f"  LoRA      r={self.lora.get('r')} alpha={self.lora.get('alpha')}")
-        lines.append(f"  显存      ≈{self.vram_gb:.1f} GiB / 卡")
+        lines.append(f"  显存估算  ≈{self.vram_gb:.1f} GiB / 卡")  # 理论估算与实测分开，不当硬件容量
+        measured = cost.matching_run(self.profile, self.configuration) if self.profile else None
+        if measured:
+            lines.append(f"  实测峰值  {measured['peak_reserved_gib']:.3f} GiB · {self.profile['hardware']['name']}")
         for note in self.notes:  # 提醒跟在账后面
             lines.append(f"  ! {note}")
         if self.steps:  # 只有配方明确给了总步数，才有足够信息报成本
             tokens_per_step = self.tokens * self.batch * self.grad_accum  # 单卡一个更新步的 token 上限
-            quote = cost.estimate(self, tokens_per_step=tokens_per_step)  # 默认单价只作开跑前占位
+            quote = cost.estimate(self, tokens_per_step=tokens_per_step, profile=self.profile,
+                                  configuration=self.configuration, price=self.price)  # 缺少实测或单价则明确未知
             lines.extend(["", *cost.render(quote).splitlines()])  # 成本表与训练账隔一行
         lines.append("")  # 推荐另起一段，没步数时它就是唯一新增段
-        lines.append("复用卡推荐")  # 三条都能直接抄回 recipe 的 train 节
-        for card in cost.recommend(self.vram_gb, self.params_b):  # 按当前显存量级和模型大小分档
+        lines.append("复用卡推荐")  # 只列同一硬件、同几何下实际量过的批量
+        cards = cost.calibrated_recommend(self.profile, self.configuration) if self.profile else []
+        if not cards:
+            lines.append("  未知：缺少同模型、精度、训练配置的 GPU 校准；运行 ori cost calibrate")
+        for card in cards:
             lines.append(
                 f"  {card['strategy']} · {card['precision']} · batch {card['batch_size']} — {card['why']}"
             )
@@ -87,14 +99,21 @@ def table_overflow(params_b: float, precision: str, how: str, cards: int, limit:
     return estimate(params_b, precision, how, cards) > limit
 
 
-def build(recipe: dict) -> Plan:
+def build(recipe: dict, base_dir=None) -> Plan:
     """从配方算出一张账。"""
     train = recipe.get("train") or {}  # 没写 train 节就当空
     geometry = (recipe.get("model") or {}).get("geometry") or {}  # 序列上限在模型几何里
     how = train.get("strategy", "single")  # 没写就单卡
     devices = [int(one) for one in train.get("devices") or []]  # 卡号转整数，写照应列表
-    precision = train.get("precision", "bf16")  # 默认 bf16
-    params = float((recipe.get("model") or {}).get("params_b") or 0.5)  # 没写就按 0.5B 估
+    precision = train.get("precision", "fp32")  # 与 spin 真正开跑时的默认精度一致
+    evidence = recipe.get("cost") or {}  # 只有显式提供的证据才参与费用和复用推荐
+    base = Path(base_dir) if base_dir is not None else Path.cwd()
+    profile = json.loads((base / evidence["profile"]).read_text(encoding="utf-8")) if evidence.get("profile") else None
+    price = json.loads((base / evidence["price"]).read_text(encoding="utf-8")) if evidence.get("price") else None
+    config = cost.configuration(recipe) if profile else None
+    measured = cost.matching_run(profile, config) if profile else None
+    actual_params = measured.get("parameters") if measured else None  # 真正匹配时优先用构建出来的参数数目
+    params = float((recipe.get("model") or {}).get("params_b") or (actual_params / 1e9 if actual_params else 0.5))
     notes = []  # 收集要给用户看的提醒
     if how == "ddp":  # ddp 每张卡都存全量，省时间不省显存
         notes.append("ddp 每卡存全量权重，省的是时间不是显存")
@@ -118,4 +137,7 @@ def build(recipe: dict) -> Plan:
         steps=int(train.get("max_steps", 0)),
         tokens=int(geometry.get("max_seq_len", 128)),
         params_b=params,
+        profile=profile,
+        price=price,
+        configuration=config,
     )

@@ -1,0 +1,114 @@
+{
+  "schema": "hoshiori/judge/1",
+  "model": "HuggingFaceTB/SmolLM-135M-Instruct",
+  "backend": "llama-completion",
+  "suite": "en-smoke",
+  "recipe": "sha256:1dfaad12744ef4d812e982dd6a5856f1a382ac1e2ec0a5dcb1ab62efef0a51e8",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 8945HX with Radeon Graphics",
+    "cores": "x86_64 x32",
+    "mem_gb": 30.6,
+    "gpu": [
+      "GPU 0: NVIDIA GeForce RTX 5060 Laptop GPU"
+    ],
+    "os": "Linux-7.2.11-arch1-1-x86_64-with-glibc2.44"
+  },
+  "count": 12,
+  "total": 0.5,
+  "tasks": [
+    {
+      "suite": "en-smoke",
+      "id": "france",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)\\bParis\\b",
+      "answer": "The capital of France is Paris, which is the largest city in France and the second-largest city in the world. It is located in the north-central region of France, on the Seine River, and is the largest city in France by population.\n\nThe capital of France is the City of Light,"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "japan",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)\\bTokyo\\b",
+      "answer": "While the capital city of Japan is Tokyo, the official capital of Japan is Tokyo, which is the largest city in Japan and the second-largest city in the world. Tokyo is the capital of Japan, and it is the seat of government and the capital of the Japanese government."
+    },
+    {
+      "suite": "en-smoke",
+      "id": "addition",
+      "score": 0.0,
+      "reason": "没匹配上正则 \\b12\\b",
+      "answer": "The number 7 plus 5 is 11.\n\nHere's how you can solve it:\n\n**7 + 5 = 11**\n\nSo, 7 + 5 = 11\n\n**11** is the answer.\n\n**7 + 5"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "multiply",
+      "score": 0.0,
+      "reason": "没匹配上正则 \\b48\\b",
+      "answer": "The answer is: 60\n\nTo find the value of 6 times 8, we can use the multiplication property of integers. The product of two numbers is the sum of their products. In this case, the product of 6 and 8 is 60. Therefore, the value of"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "opposite",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)\\bcold\\b",
+      "answer": "The opposite of hot is cold.\n\nIn the context of temperature, the opposite of hot is cold.\n\nHere are some examples:\n\n* **Cold**: The opposite of hot is cold.\n* **Hot**: The opposite of cold is hot.\n* **Cold**: The opposite of hot is"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "color",
+      "score": 0.0,
+      "reason": "没匹配上正则 (?i)\\byellow\\b",
+      "answer": "The sweetest part of the banana!\n\nThe color of a ripe banana is a result of the ripeness of the fruit. The color of a ripe banana is determined by the ripeness of the fruit, which is measured by the color of the fruit's flesh. The color of a ripe banana is typically a"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "sequence",
+      "score": 1.0,
+      "reason": "匹配上了正则 \\b10\\b",
+      "answer": "The number 2 is the next number after 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "animal",
+      "score": 0.0,
+      "reason": "没匹配上正则 (?i)\\bcat\\b",
+      "answer": "What a fascinating question!\n\nThe answer to this question is a bit subjective, as it depends on the context and the animal's language. However, I'll provide a possible answer based on common animal vocalizations and vocalizations patterns.\n\n**The \"woof\" of a dog:**\n\nIn many dog breeds"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "water",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)H2O|H₂O",
+      "answer": "The chemical formula for water is H2O, which stands for hydrogen and oxygen. The chemical formula for water is H2O, which is a shorthand representation of the chemical composition of water.\n\nHere is the chemical formula for water:\n\nH2O (hydrogen and oxygen)\n\nThe chemical formula"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "days",
+      "score": 1.0,
+      "reason": "匹配上了正则 \\b7\\b",
+      "answer": "The number of days in a week is 7, which is the same as 7 days in a month.\n\nHere's the formula to calculate the number of days in a week:\n\nNumber of days in a week = (Number of days in a month) × 7\n\nFor example,"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "square",
+      "score": 0.0,
+      "reason": "没匹配上正则 \\b9\\b",
+      "answer": "The square root of 81 is approximately 3.14159. To find the square root of 81, we can use the following steps:\n\n1. Find the square root of 81 by dividing 81 by 2.\n2. Multiply the result by"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "planet",
+      "score": 0.0,
+      "reason": "没匹配上正则 (?i)\\bMars\\b",
+      "answer": "The Red Planet! While the Earth is the only known planet in the solar system that has a thick atmosphere, the Red Planet is a fascinating and unique world that has captivated human imagination for centuries. Here's a brief overview of the Red Planet:\n\n**Location:** The Red Planet is located in the asteroid belt between"
+    }
+  ],
+  "provenance": {
+    "repo": "HuggingFaceTB/SmolLM-135M-Instruct",
+    "revision": "b5f4b394abe60fe0e4d666139e57bfce520302a9",
+    "quant": "q8_0",
+    "suite_sha256": "063d98b8a37100b8bab92a226863aa0a0b5bb043ee10163742e5bff98bb64578",
+    "seed": 1,
+    "temperature": 0,
+    "max_tokens": 64
+  },
+  "time": "2026-11-02T14:28:17.787471+00:00"
+}

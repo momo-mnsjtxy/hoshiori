@@ -8,7 +8,7 @@
 
 每题是一场对局：两份答案各自按题目规则得 0~1 分，分高者胜，相同就是平局。
 后端调用顺序逐题打乱，避免总让某一方先答；结果始终换回 A 方视角，所以排名不受展示顺序影响。
-Elo 用 K=32、初始 1500；Bradley-Terry 返回两方归一化后、和为 1 的强度。
+Elo 默认 K=32、初始 1500，可按调用参数调整；Bradley-Terry 返回两方归一化后、和为 1 的强度。
 """
 
 import math
@@ -23,7 +23,8 @@ BT_EPSILON = 1e-9                                                            # �
 
 
 def run(first_backend: str, second_backend: str, suites: list, limit: int = 0,
-        seed: int = 0) -> dict:
+        seed: int = 0, k: float = ELO_K, initial: float = ELO_INITIAL,
+        min_matches: int = 30, window: int = 10, tolerance: float = 0.0) -> dict:
     """让两个后端对打若干套题，返回逐题对局和排好序的强弱表。
 
     limit 按套件生效，0 表示每套全跑；seed 只控制谁先答，不改变题目顺序。
@@ -33,9 +34,17 @@ def run(first_backend: str, second_backend: str, suites: list, limit: int = 0,
     if limit < 0:                                                            # 负数没有可解释的取题方式
         fail("input", "limit 不能是负数", hint="给 0 或正整数，0 表示不限")
 
+    if not math.isfinite(k) or k <= 0 or not math.isfinite(initial):          # Elo 配置来自公开调用边界
+        fail("input", "Elo K 必须是有限正数，初始分必须是有限数")
+    if window < 1 or min_matches < window or not math.isfinite(tolerance) or tolerance < 0:
+        fail("input", "收敛窗口要为正数，最少场数不能小于窗口，容差不能为负")
+
     backends = (first_backend, second_backend)                               # A/B 身份全程固定，调用先后另算
     chance = random.Random(seed)                                             # 固定种子让同一批评测可复现
     matches = []                                                             # 一道题留下一场完整对局
+    outcomes = []                                                            # 赛果是排名与收敛的同一份来源
+    ratings = []                                                             # 留每场 A 方分数，检查窗口内最大波动
+    converged = False                                                        # 默认跑完，只有显式容差才会早停
     for one in suites:                                                       # 套件按用户给的顺序跑
         tasks = one.tasks[:limit] if limit else one.tasks                    # 每套最多取 limit 题
         for task in tasks:                                                   # 两个后端都答这一道题
@@ -59,11 +68,20 @@ def run(first_backend: str, second_backend: str, suites: list, limit: int = 0,
                     player("B", backends[1], answers[1], verdicts[1]),       # B 方
                 ],
             })
-    outcomes = [match["result"] for match in matches]                       # 两种排名共用同一份赛果
+            outcomes.append(outcome)                                         # 本场的结果立即参与收敛判断
+            ratings.append(elo(outcomes, k, initial)[0])                      # 用与报告完全相同的 Elo 参数
+            recent = ratings[-window:]                                      # 窗口按场数，不按套件切开
+            if tolerance and len(matches) >= min_matches and max(recent) - min(recent) <= tolerance:
+                converged = True                                             # 这里只声称分数稳定，不声称统计显著
+                break                                                        # 剩余题目不再调用后端
+        if converged:                                                        # 已稳定时后续套件也不跑
+            break
     return {                                                                 # 命令层可直接塞进 JSON 报告
-        "elo": {"k": ELO_K, "initial": ELO_INITIAL},                     # 算法参数写明，报告可复算
+        "elo": {"k": k, "initial": initial},                     # 算法参数写明，报告可复算
+        "stopping": {"converged": converged, "min_matches": min_matches, "window": window,
+                     "tolerance": tolerance, "reason": "elo_stable" if converged else "exhausted"},
         "matches": matches,                                                 # 每题的对局明细
-        "ranking": rank(backends, outcomes),                                # 按 Elo 从强到弱排好
+        "ranking": rank(backends, outcomes, k, initial),                                # 按 Elo 从强到弱排好
     }
 
 
@@ -78,13 +96,13 @@ def player(side: str, backend: str, answer: str, verdict) -> dict:
     }
 
 
-def elo(outcomes: list) -> tuple:
+def elo(outcomes: list, k: float = ELO_K, initial: float = ELO_INITIAL) -> tuple:
     """按 A 方视角的赛果顺序更新两方 Elo，返回 ``(A, B)``。"""
-    first = ELO_INITIAL                                                      # A 方从 1500 开始
-    second = ELO_INITIAL                                                     # B 方从 1500 开始
+    first = initial                                                      # A 方从 1500 开始
+    second = initial                                                     # B 方从 1500 开始
     for outcome in outcomes:                                                 # 每题更新一次，平局 outcome=0.5
         expected = 1.0 / (1.0 + math.pow(10.0, (second - first) / 400.0))    # Elo 对 A 胜率的估计
-        change = ELO_K * (outcome - expected)                                # 实际结果减预期，再乘 K
+        change = k * (outcome - expected)                                # 实际结果减预期，再乘 K
         first += change                                                      # A 加多少
         second -= change                                                     # B 就减多少，总分守恒
     return round(first, 4), round(second, 4)                                 # 报告保留足够复核的精度
@@ -100,11 +118,11 @@ def bradley_terry(outcomes: list) -> tuple:
     return round(probability, 9), round(1.0 - probability, 9)                # 归一化强度也就是两人对局胜率
 
 
-def rank(backends: tuple, outcomes: list) -> list:
+def rank(backends: tuple, outcomes: list, k: float = ELO_K, initial: float = ELO_INITIAL) -> list:
     """把两方赛果算成 Elo、BT 与胜平负，按 Elo 再按 BT 从强到弱返回。"""
     if not outcomes:                                                         # 排名公开接口在边界直接说明空输入
         fail("input", "擂台没有可排名的对局")
-    elo_scores = elo(outcomes)                                               # 顺序模型：越近的赛果影响仍由当前分差决定
+    elo_scores = elo(outcomes, k, initial)                                               # 顺序模型：越近的赛果影响仍由当前分差决定
     bt_scores = bradley_terry(outcomes)                                      # 汇总模型：只看分数胜场占比
     wins = (sum(one > 0.5 for one in outcomes), sum(one < 0.5 for one in outcomes))  # 两方胜场
     ties = sum(one == 0.5 for one in outcomes)                               # 平局两边相同

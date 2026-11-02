@@ -274,3 +274,59 @@ def test_missing_tokenizers_falls_back_to_estimate(tmp_path, monkeypatch):
         server.shutdown()
         server.server_close()
         gate.close()
+
+
+def test_serve_reads_environment_token(monkeypatch, tmp_path):
+    """Compose 注入的 ORI_TOKEN 真正传给网关，命令行令牌仍可覆盖。"""
+    from argparse import Namespace
+    from commands import serve
+    created = []
+
+    class LocalGateway:
+        def __init__(self, model, **options):
+            created.append(options)
+
+        def run(self, port):
+            pass
+
+    monkeypatch.setattr(serve, "Gateway", LocalGateway)
+    monkeypatch.setenv("ORI_TOKEN", "environment-token")
+    arguments = Namespace(model="echo", token="", port=8080, backend="echo", answer_cmd="", log="", limit=60, host="127.0.0.1")
+    assert serve.command(arguments) == 0
+    assert created[-1]["token"] == "environment-token"
+    arguments.token = "explicit-token"
+    assert serve.command(arguments) == 0
+    assert created[-1]["token"] == "explicit-token"
+
+
+# ---------- 命令后端的外部输入边界 ----------
+
+def test_command_gateway_preserves_untrusted_prompt_and_model(tmp_path):
+    import shlex  # 只用于构建可信命令模板
+
+    marker = tmp_path / "command-executed"
+    prompt = f'题面 " 单引号 \'\n第二行 $(touch {marker}) `touch {marker}` ; touch {marker}; # {{model}}'
+    model_name = f'model name " $(touch {marker}) `touch {marker}` {{prompt}}'
+    program = "import json,sys; print(json.dumps(sys.argv[1:], ensure_ascii=False))"  # 固定程序回报收到的两个参数
+    template = f"{shlex.quote(sys.executable)} -c {shlex.quote(program)} {{prompt}} {{model}}"
+    gate = Gateway("fixed", answer_cmd=template, log=None)
+    server = gate.start(0, in_thread=True)  # 使用真正 HTTP 入口，而非替换后端函数
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}"
+        status, raw, _ = post(url, "/v1/chat/completions", {"model": model_name, "messages": [{"role": "user", "content": prompt}]})
+        assert status == 200
+        answer = json.loads(raw)["choices"][0]["message"]["content"]
+        assert json.loads(answer) == [prompt, model_name]  # 模型与题面各占一项；插入内容不再递归替换
+        assert not marker.exists()  # 题面和模型里的命令均不能制造文件
+    finally:
+        server.shutdown()
+        server.server_close()
+        gate.close()
+
+
+def test_command_gateway_reports_bad_backend_configuration():
+    from features.gateway import answer  # 直接验证 HTTP 错误出口接受的 RuntimeError
+
+    for template in ("echo 'unterminated", "/does-not-exist/ori-backend {prompt}", "sh -c '{prompt}'"):
+        with pytest.raises(RuntimeError, match="不能启动"):
+            answer("model", [{"content": "text"}], {"answer_cmd": template})

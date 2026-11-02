@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 from features import duplicate, index as index_mod
-from features.index import COLD_BATCH, COLD_HEAD, KEY_SLICE, Index, Shard
+from features.index import COLD_BATCH, COLD_HEAD, KEY_SLICE, LegacyIndex as Index, Shard
 
 ROOT = Path(__file__).resolve().parent.parent  # 仓库根，压测的子进程要在这儿跑
 
@@ -413,7 +413,7 @@ def test_key_table_and_cold_survive_reload(tmp_path):
 COLD_PEAK = """
 import sys
 sys.path.insert(0, {root!r})
-from features.index import Index
+from features.index import LegacyIndex as Index
 
 def keyed(sample, band):
     return sample.to_bytes(4, "big") + band.to_bytes(4, "big")
@@ -517,8 +517,9 @@ def test_same_verdict_memory_and_disk(tmp_path):
     disk.close()
 
 
-def test_same_verdict_through_cold(tmp_path):
+def test_same_verdict_through_cold(tmp_path, monkeypatch):
     """一路转冷也不改判定：同一批语料，内存版和落盘版逐条一模一样。"""
+    monkeypatch.setattr(index_mod, "Index", Index)  # 此用例专测旧 v4 转冷；v5 见 test_prefix_index.py
     texts = corpus()
     memory = duplicate.Duplicate(duplicate.Rule(threshold=0.8))
     disk = duplicate.Duplicate(duplicate.Rule(threshold=0.8), store=tmp_path, hot=3)
@@ -533,6 +534,7 @@ def test_same_verdict_through_cold(tmp_path):
 
 def test_pack_switch_keeps_verdict(tmp_path, monkeypatch):
     """压与不压，同一批语料的判定逐条一样；不压确实更占盘。"""
+    monkeypatch.setattr(index_mod, "Index", Index)  # 保留旧压缩格式的回归覆盖
     texts = corpus()
     memory = duplicate.Duplicate(duplicate.Rule(threshold=0.8))
     want = [memory.check(text) for text in texts]

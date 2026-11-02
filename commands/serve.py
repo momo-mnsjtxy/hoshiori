@@ -13,6 +13,7 @@
 起服务、鉴权、限流、落日志都在 features.gateway，这个文件只把参数搬过去。
 """
 
+import os  # 容器通过环境变量注入网关令牌，避免把秘密写进命令参数
 from pathlib import Path
 
 from features.gateway import Gateway
@@ -21,8 +22,9 @@ from utils.fail import fail
 
 def command(args) -> int:
     """核对参数后起网关，一直跑到 Ctrl-C。"""
-    token = (args.token or "").strip()                 # 首尾空格看不见，先去掉再比；中间的空格是令牌的一部分
-    if args.token and not token:                       # 给了 --token 却只有空格
+    given_token = args.token or os.environ.get("ORI_TOKEN", "")  # 显式命令行优先，Compose 环境变量兜底
+    token = given_token.strip()                 # 首尾空格看不见，先去掉再比；中间的空格是令牌的一部分
+    if given_token and not token:                       # 给了 --token 却只有空格
         fail("input", "--token 是空的", hint="给一个有内容的令牌，或者干脆不给")
     given = Path(args.model).expanduser()              # 参数可能是目录，也可能只是个模型名
     if "/" in args.model and not given.is_dir():       # 带斜杠的当路径，目录必须在

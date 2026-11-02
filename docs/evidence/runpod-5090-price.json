@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "provider": "runpod",
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "cloud": "secure",
+  "currency": "USD",
+  "unit": "GPU-hour",
+  "price_per_hour": 1.19,
+  "fetched_at": "2026-11-02T14:29:32.158277+00:00",
+  "source": "https://api.runpod.io/graphql",
+  "query": "{ gpuTypes { id displayName memoryInGb securePrice communityPrice } }",
+  "raw_entry": {
+    "id": "NVIDIA GeForce RTX 5090",
+    "displayName": "RTX 5090",
+    "memoryInGb": 32,
+    "securePrice": 1.19,
+    "communityPrice": 0.69
+  },
+  "scope": "按需计算目录价；不含存储、税费、启动和空闲时间，库存未验证"
+}

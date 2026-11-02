@@ -1,0 +1,15 @@
+{
+  "docker_version": "28.5.1",
+  "compose_version": "2.40.3",
+  "image": "sha256:e0337c4af1366efa1eeb0c65ef76994a97a5569940e04828833015125f0f7785",
+  "image_bytes": 128073333,
+  "http_verified_at": "2026-11-02T14:44:58.718686+00:00",
+  "includes_shell_argument_isolation": true,
+  "integration_tests": {
+    "passed": 451,
+    "deselected": 1,
+    "warnings": 14,
+    "log": "../integration.log"
+  },
+  "note": "HTTP check uses echo; this does not claim real model inference."
+}

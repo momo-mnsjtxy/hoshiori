@@ -12,15 +12,19 @@
 
 import argparse
 import sys
+from importlib.metadata import version as installed_version  # wheel 中版本来自构建时写入的包元数据
 from pathlib import Path
 
 from utils.fail import Failure, fail
 
-VERSION = (Path(__file__).parent / "VERSION").read_text().strip()  # 版本只有 VERSION 文件一处
+VERSION_FILE = Path(__file__).parent / "VERSION"  # 源码运行读唯一版本文件，wheel 不依赖安装目录外的文件
+VERSION = VERSION_FILE.read_text().strip() if VERSION_FILE.is_file() else installed_version("hoshiori")
 
 # 命令名 → 命令文件。加一个命令就在这里加一行，文件自己写在 commands/ 里。
 COMMANDS = {
     "weave": "commands.weave",
+    "cost": "commands.cost",  # 云价、真实吞吐校准和费用估算
+    "quality": "commands.quality",  # 人工标注校准与留出验证
     "import": "commands.import_lmlab",
     "validate": "commands.validate",
     "vocab": "commands.vocab",
@@ -52,6 +56,7 @@ def parser() -> argparse.ArgumentParser:
     weave.add_argument("--min-chars", type=int, default=1, help="短于这个长度算空样本")
     weave.add_argument("--max-chars", type=int, default=0, help="长于这个长度拒收，0 不限")
     weave.add_argument("--min-score", type=float, default=0.0, help="质量分低于此线拒收，默认 0 不筛")
+    weave.add_argument("--quality-profile", help="人工标注校准产生的质量权重 JSON")
     privacy = weave.add_mutually_exclusive_group()
     privacy.add_argument("--scrub", dest="scrub", action="store_true", default=True, help="替换敏感信息（默认）")
     privacy.add_argument("--no-scrub", dest="scrub", action="store_false", help="保留正文里的敏感信息")
@@ -65,12 +70,33 @@ def parser() -> argparse.ArgumentParser:
     weave.add_argument("--algo", default="sha256", choices=["sha256", "blake3"], help="指纹算法")
     weave.add_argument("--dry-run", action="store_true", help="照常跑，卡片里标一笔")
 
+    cost = below.add_parser("cost", help="查询云价、校准实机或估算训练费用")
+    cost.add_argument("action", choices=["prices", "calibrate", "estimate"])
+    cost.add_argument("recipe", nargs="?", help="训练配方")
+    cost.add_argument("--out", help="结果 JSON 文件")
+    cost.add_argument("--gpu", help="云价表中的 GPU 名称")
+    cost.add_argument("--cloud", choices=["secure", "community"], default="secure")
+    cost.add_argument("--profile", help="实机测量档案")
+    cost.add_argument("--price", help="来源可追溯的云价档案")
+    cost.add_argument("--steps", type=int, default=10, help="实测更新步数")
+    cost.add_argument("--warmup", type=int, default=3, help="不计入统计的预热步数")
+    cost.add_argument("--batches", default="1,2,4", help="显存校准微批列表")
+
+    quality = below.add_parser("quality", help="用人工标注校准质量权重")
+    quality_actions = quality.add_subparsers(dest="action", required=True)
+    quality_fit = quality_actions.add_parser("fit", help="拟合权重并报告独立留出误差")
+    quality_fit.add_argument("labels", help="带 text/score 的人工标注 JSONL")
+    quality_fit.add_argument("--annotator", required=True, help="标注团队或来源标识")
+    quality_fit.add_argument("--out", required=True, help="质量档案输出 JSON")
+    quality_fit.add_argument("--seed", type=int, default=0, help="划分训练/留出集的随机种子")
+
     into = below.add_parser("import", help="把别家的配置迁过来")
     kinds = into.add_subparsers(dest="kind", required=True)
-    old = kinds.add_parser("lmlab", help="lmlab preset yaml → 配方 + 差异清单")
-    old.add_argument("files", nargs="+", help="一个或多个 preset")
-    old.add_argument("--out", default="imported", help="输出目录")
-    old.add_argument("--force", action="store_true", help="覆盖已有文件")
+    for framework in ("lmlab", "axolotl", "llama-factory"):  # 三个来源共用输入与产物约定
+        old = kinds.add_parser(framework, help=f"{framework} yaml → 配方 + 差异清单")
+        old.add_argument("files", nargs="+", help="一个或多个配置文件")
+        old.add_argument("--out", default="imported", help="输出目录")
+        old.add_argument("--force", action="store_true", help="覆盖已有文件")
 
     vocab = below.add_parser("vocab", help="从语料学一个词表")
     vocab.add_argument("--in", dest="inputs", action="append", required=True, help="语料，可给多次")
@@ -95,6 +121,11 @@ def parser() -> argparse.ArgumentParser:
     judge.add_argument("--suite", action="append", help="评测套件，可给多次")
     judge.add_argument("--answer-cmd", help="拿答案的外部命令，{prompt} 换成题面；不给就回显")
     judge.add_argument("--arena", help="另一个答题命令；与 --answer-cmd 乱序对打并算 Elo / BT")
+    judge.add_argument("--elo-k", type=float, default=32, help="每场 Elo 最大更新幅度")
+    judge.add_argument("--elo-initial", type=float, default=1500, help="双方初始 Elo")
+    judge.add_argument("--arena-min-matches", type=int, default=30, help="检查收敛前至少打多少场")
+    judge.add_argument("--arena-window", type=int, default=10, help="收敛检查窗口场数")
+    judge.add_argument("--arena-tolerance", type=float, default=0, help="窗口内评分变化容限；0 关闭提前停止")
     judge.add_argument("--baseline", help="基线 report.json，给了就走回归门")
     judge.add_argument("--min-delta", type=float, help="允许掉多少总分，缺省读配方 eval.gate")
     judge.add_argument("--limit", type=int, default=0, help="每套最多跑几题，0 不限")
@@ -134,6 +165,7 @@ def parser() -> argparse.ArgumentParser:
     loom.add_argument("out", nargs="?", default="bolt", help="产物目录，默认 bolt")
     loom.add_argument("--port", type=int, default=8765, help="监听端口，0 表示随便挑一个空口")
     loom.add_argument("--host", default="127.0.0.1", help="监听地址，默认只本机")
+    loom.add_argument("--token-env", default="ORI_LOOM_TOKEN", help="读取面板访问令牌的环境变量名")
     plugins = below.add_parser("plugin", help="扫描并运行单文件插件")                                  # 插件命令入口
     plugin_actions = plugins.add_subparsers(dest="action", required=True)                             # list 与 run 两个动作
     plugin_actions.add_parser("list", help="列出四类插件")                                             # 只展示目录现状
@@ -144,6 +176,8 @@ def parser() -> argparse.ArgumentParser:
     mcp = below.add_parser("mcp", help="连接 stdio MCP 服务器")                                         # MCP 命令入口
     mcp_actions = mcp.add_subparsers(dest="action", required=True)                                      # list、tools、call 三个动作
     mcp_actions.add_parser("list", help="列出 mcp.yaml 里的服务器")                                    # 只读配置，不起进程
+    mcp_serve = mcp_actions.add_parser("serve", help="通过 stdio 暴露星织工具")                          # 让其他 MCP 客户端接入
+    mcp_serve.add_argument("--root", default=".", help="工具可以访问的工作目录")                       # 所有路径受此目录约束
     mcp_tools = mcp_actions.add_parser("tools", help="列出一台服务器的工具")                            # 完成握手后展示 tools/list
     mcp_tools.add_argument("name", metavar="名", help="mcp.yaml 里的服务器名")                         # 点名一台服务器
     mcp_call = mcp_actions.add_parser("call", help="调用一台服务器的一个工具")                          # 一次 tools/call 后退出

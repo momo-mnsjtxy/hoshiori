@@ -21,7 +21,7 @@ import copy
 import random
 import statistics
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
@@ -78,6 +78,10 @@ class Choice:
     teacher: Path = None  # distill 的教师权重，必填
     max_images: int = 4  # 一条样本最多取几张图片；位置不动以兼容旧的位置参数
     reward: Path = None  # 组相对任务的外部奖励文件；给了就覆盖数据里的 rewards
+    health_limits: dict = field(default_factory=dict)  # 只覆盖给出的阈值，默认维持旧行为
+    eval_files: list = field(default_factory=list)  # 独立验证集，不能混入训练取样
+    eval_every: int = 50  # 每几步验证一次；训练前先记录基线
+    curriculum_by: str = "length"  # length 保持旧顺序；difficulty 从易到难
     curriculum: bool = False  # 先学短样本，再随训练进度放开中、长样本
 
 
@@ -93,11 +97,19 @@ class Trainer:
         self.pad_id = getattr(choice.vocab, "pad_id", 0)  # 补位用词表的 pad；没词表还是老的 0
         self.ref_model = None  # dpo / grpo / ppo 的参考模型，只在 CPU 前向
         self.teacher = None    # distill 的教师，同样留在 CPU
+        self.difficulties = []  # 与样本下标一一对应，缺标注时稍后从词频估计
         self.samples = self._read()  # 编好的样本，一次读进来，别边跑边读盘
         self.total = choice.steps or max(1, math.ceil(choice.epochs * len(self.samples) / (choice.batch_size * choice.grad_accum)))  # 没给步数就按轮数换算
+        if choice.resume:  # 先恢复视觉结构，再建立挂件和优化器，旧档不能多出随机卷积参数
+            saved = _checkpoint(Path(choice.resume), self.out) / "config.json"
+            configuration = json.loads(saved.read_text(encoding="utf-8"))
+            if geo.image_side and configuration.get("vision", "linear") == "linear":
+                model.vision = None  # 旧图片断点的优化器也没有卷积参数
+                geo.vision = "linear"  # 后续保存继续声明真实结构
+        model.pad_id = self.pad_id  # 检索文本池化与训练分词使用同一补位定义
         model.grad_checkpoint = choice.grad_checkpoint  # 前向按配方决定要不要重算
         if choice.lora:  # 挂低秩
-            lora.attach(model, choice.lora.get("target") or list(lora.TARGETS)[:4], choice.lora["r"], choice.lora["alpha"], choice.lora["dropout"])  # 挂件以外全冻上
+            lora.attach(model, choice.lora.get("target") or list(lora.TARGETS)[:4], choice.lora["r"], choice.lora["alpha"], choice.lora["dropout"], variant=choice.lora.get("variant", "lora"))  # 挂件以外全冻上
         if choice.lora:  # 挂件是新建的层，建在 CPU，得跟基座放一起
             model.to(_device_of(model))
         if choice.task in {"dpo", "grpo", "ppo"}:                         # 这三类要一份不动的参考模型
@@ -108,7 +120,11 @@ class Trainer:
             else:                                                      # 基座已经由命令层确认可用
                 self.ref_model = _load_cpu(choice.base, geo)            # 按同一份几何重建，再从基座读权重
         if choice.task == "distill":                                    # 教师路径已由命令层检查
-            self.teacher = _load_cpu(choice.teacher, geo)               # 教师也独立构建和载入
+            self.teacher = _load_cpu(choice.teacher, geo, own_geometry=True)               # 教师也独立构建和载入
+            if self.teacher.geo.vocab != geo.vocab:
+                fail("input", "蒸馏教师与学生必须使用相同词表和 token 编号", where="model.teacher", hint="层数、隐藏维和头数可以不同；词表不能直接做 KL")
+            if self.teacher.geo.image_side != geo.image_side or self.teacher.geo.patch != geo.patch:
+                fail("input", "图像蒸馏要求教师与学生使用相同图片块布局", where="model.teacher")
         for net in (self.ref_model, self.teacher):                      # 两类冻结模型共用同一套设置
             if net is not None:                                        # 普通训练没有额外模型
                 net.eval()                                             # 关闭训练行为
@@ -128,6 +144,9 @@ class Trainer:
         self.big_norm = 0  # 连着几步梯度范数超线
         self.speeds = []  # 最近几步的吞吐（token/秒）
         self.last_norm = 0.0  # 这一步裁剪前的梯度范数
+        self.best_eval = None  # 验证集历史最佳 token 准确率
+        self.bad_eval = 0  # 连续验证退化次数，续训时一起恢复
+        self.eval_rows = self._read_eval()  # 验证集单独编码，不动训练游标
         self.last_tokens = 0  # 这一步过了多少真 token，算吞吐用
 
     # --- 数据 ---
@@ -178,6 +197,10 @@ class Trainer:
                 ids = self._ids(text)                                             # 正文沿用唯一的编码入口
                 if len(ids) <= 1:                                                 # 至少要有输入和答案
                     continue
+                difficulty = item.get("difficulty")                               # 人工难度应在 [0, 1]，越大越难
+                if difficulty is not None and (isinstance(difficulty, bool) or not isinstance(difficulty, (int, float)) or not math.isfinite(difficulty) or not 0 <= difficulty <= 1):
+                    fail("input", "difficulty 必须是 0 到 1 的有限数字", where=str(one))
+                self.difficulties.append(difficulty)                              # 与实际保留的训练样本同步追加
                 if self.geo.image_side:                                           # 图片模型还要留住对应路径
                     here = Path(one).parent                                          # 相对图片路径按数据文件旁边算
                     raw = (item.get("images") or [])[: self.choice.max_images]        # 上限之外的不拿
@@ -253,7 +276,7 @@ class Trainer:
         if not self.choice.curriculum:                                    # 默认关闭时保留原来的整轮洗牌
             self._perm = torch.randperm(len(self.samples), generator=gen).tolist()  # 整轮打乱
             return                                                       # 不建立课程桶，旧顺序一位不变
-        lengths = [self._length(one) for one in self.samples]            # 每条样本只算一次长度
+        lengths = self._difficulty() if self.choice.curriculum_by == "difficulty" else [self._length(one) for one in self.samples]            # 每条样本只算一次长度
         ordered = sorted(lengths)                                        # 经验分位按长度次序取最近秩
         short = ordered[math.ceil(len(ordered) / 3) - 1]                 # 至少三分之一落在短档边界内
         middle = ordered[math.ceil(len(ordered) * 2 / 3) - 1]            # 至少三分之二落在中档边界内
@@ -476,7 +499,11 @@ class Trainer:
                         scores = self.model(ids, patches=patches, block_mask=block_mask, patch_at=patch_at)  # 图片与文本按同一布局产生蒸馏打分
                     else:                                                        # 没有图片几何不传新增参数
                         scores = self.model(ids)                                  # 保留纯文本前向
-                    loss = alignment.distill(scores, teach, self.choice.temperature).mean() / self.choice.grad_accum  # 按累积数缩放
+                    aux = 0.0  # 蒸馏也可同时优化图文对比目标
+                    if isinstance(scores, tuple):
+                        scores, aux = scores  # 学生的对齐损失不能误送给 KL
+                    valid = labels != -100  # 图片位和 padding 不参与词表蒸馏
+                    loss = (alignment.distill(scores[valid], teach[valid], self.choice.temperature).mean() + aux) / self.choice.grad_accum  # 按累积数缩放
                 else:  # 普通语言模型目标
                     if self.geo.image_side:                                       # 图片块可作前缀，也可按样本位置交错
                         scores = self.model(ids, patches=patches, block_mask=block_mask, patch_at=patch_at)  # 返回图片位和文本位的全部打分
@@ -500,36 +527,101 @@ class Trainer:
 
     # --- 健康 ---
 
-    def _health(self, loss: float, spent: float) -> bool:
-        """看 loss、梯度范数、吞吐，返回这一趟该不该停。
-
-        三项各自计连续步数，踩线分别在第 3、5 步和第 21 步之后才成立。
-        处置照 train.health：warn 喊一声清计数接着跑，stop 把原因留在 self.reason 上。
-        """
-        bad = ""  # 这次踩线的原因
-        self.bad_loss = self.bad_loss + 1 if not math.isfinite(loss) else 0  # NaN/Inf 连着数
-        if self.bad_loss >= NAN_STEPS:
-            bad = f"loss 连续 {NAN_STEPS} 步是 NaN/Inf"
-        self.big_norm = self.big_norm + 1 if self.last_norm > NORM_LIMIT else 0  # 梯度炸了连着数
-        if not bad and self.big_norm >= NORM_STEPS:
-            bad = f"梯度范数连续 {NORM_STEPS} 步超 {NORM_LIMIT:g}（最近 {self.last_norm:.3g}）"
-        self.speeds = (self.speeds + [self.last_tokens / max(spent, 1e-9)])[-SPEED:]  # 只留最近这几步的吞吐
-        if not bad and len(self.speeds) == SPEED:  # 攒够 20 步基线才判得出掉速
-            base = statistics.median(self.speeds[:-1])  # 前 20 步的中位数
-            if self.speeds[-1] < base * SLOW_RATIO:  # 跌破四成
-                bad = f"吞吐掉到前 20 步中位数的四成以下（{self.speeds[-1]:.0f} < {base * SLOW_RATIO:.0f} token/s）"
-        if not bad:  # 都没踩线
-            return False
-        if self.choice.health == "warn":  # 只喊一声，计数清零免得每步重复喊
+    def _health(self, loss: float, spent: float, eval_score: float = None) -> bool:
+        """按配置监控损失、梯度、吞吐和验证退化；warn 清计数，stop 记录原因。"""
+        limits = self.choice.health_limits                                      # 覆盖项只来自配方/Choice
+        nan_steps = limits.get("nan_steps", NAN_STEPS)                           # 老配方仍容忍三次非有限损失
+        norm_steps = limits.get("norm_steps", NORM_STEPS)                         # 梯度超线次数
+        norm_limit = limits.get("norm_limit", NORM_LIMIT)                         # 裁剪前梯度的上限
+        window = limits.get("speed_window", SPEED - 1)                           # 本步不进入吞吐基线
+        slow_ratio = limits.get("slow_ratio", SLOW_RATIO)                         # 掉速比例下限
+        bad = ""                                                                # 只报本次最先满足的停止原因
+        self.bad_loss = self.bad_loss + 1 if not math.isfinite(loss) else 0       # 损失连续异常次数
+        self.big_norm = self.big_norm + 1 if not math.isfinite(self.last_norm) or self.last_norm > norm_limit else 0  # Inf 梯度同样算坏
+        if self.bad_loss >= nan_steps:
+            bad = f"loss 连续 {nan_steps} 步是 NaN/Inf"
+        if not bad and self.big_norm >= norm_steps:
+            bad = f"梯度范数连续 {norm_steps} 步超 {norm_limit:g}（最近 {self.last_norm:.3g}）"
+        self.speeds = (self.speeds + [self.last_tokens / max(spent, 1e-9)])[-window - 1:]  # 固定上限，不随训练增长
+        if not bad and len(self.speeds) == window + 1:
+            base = statistics.median(self.speeds[:-1])                            # 只看本步之前的数据
+            if self.speeds[-1] < base * slow_ratio:
+                bad = f"吞吐跌破前 {window} 步中位数的 {slow_ratio:g}（{self.speeds[-1]:.0f} < {base * slow_ratio:.0f} token/s）"
+        if eval_score is not None:                                               # 只有真正跑过验证才更新计数
+            if math.isfinite(eval_score) and (self.best_eval is None or eval_score > self.best_eval):
+                self.best_eval = eval_score                                      # 初始化或更新最好分数
+            drop = limits.get("eval_drop", 0.1)                                 # 准确率绝对下降量，不是百分比乘数
+            self.bad_eval = self.bad_eval + 1 if not math.isfinite(eval_score) or (self.best_eval is not None and self.best_eval - eval_score > drop) else 0
+            if not bad and self.bad_eval >= limits.get("eval_patience", 2):
+                best = "尚无有限基线" if self.best_eval is None else f"{self.best_eval:.4f}"
+                bad = f"eval 准确率连续 {self.bad_eval} 次退化超过 {drop:g}（最佳 {best}，当前 {eval_score:.4f}）"
+        if not bad:
+            return False                                                        # 所有监控项都没有达到停止条件
+        if self.choice.health == "warn":
             if self.lead:
                 logs.warn("spin", "健康检查", step=self.step, why=bad)
-            self.bad_loss = self.big_norm = 0  # 重新数
-            self.speeds = []  # 吞吐基线重新攒
+            self.bad_loss = self.big_norm = self.bad_eval = 0                    # 重新攒异常次数
+            self.speeds = []                                                     # 吞吐基线重新建立
             return False
-        self.reason = bad  # 停机原因，命令层和 run.json 都靠它
+        self.reason = bad                                                       # run.json 与命令退出码共用这份原因
         if self.lead:
             logs.warn("spin", "健康检查停机", step=self.step, why=bad)
         return True
+
+    def _read_eval(self) -> list:
+        """读取独立验证集；只保留真实 token，padding 不纳入准确率。"""
+        rows = []                                                               # 验证集不会经过 _next 或改变课程游标
+        for path in self.choice.eval_files:
+            for line in Path(path).read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue                                                    # 空行不产生验证样本
+                ids = self._ids(json.loads(line).get("text") or "")
+                if len(ids) > 1:
+                    rows.append(ids)                                            # 验证只关注文本预测质量
+        if self.choice.eval_files and not rows:
+            fail("input", "验证集没有可用文本", where="eval.files")
+        return rows
+
+    @torch.no_grad()
+    def evaluate(self) -> float:
+        """真实前向计算验证 token 准确率；验证不更新图文负样本队列或训练随机数。"""
+        was_training = self.model.training                                      # 结束时恢复进入验证前的模式
+        self.model.eval()                                                       # 关闭 dropout 与负样本入队
+        correct = count = 0                                                     # 按 token 汇总，避免短样本过重
+        for row in self.eval_rows:
+            ids = torch.tensor([row[:-1]], device=_device_of(self.model))
+            labels = torch.tensor([row[1:]], device=ids.device)
+            scores = self.model(ids)                                             # 文本验证不依赖图片输入
+            scores = scores[0] if isinstance(scores, tuple) else scores
+            valid = labels != self.pad_id                                        # 词表编码后的补位不能抬高分数
+            correct += int(((scores.argmax(-1) == labels) & valid).sum())
+            count += int(valid.sum())
+        self.model.train(was_training)                                           # 还原训练状态
+        score = correct / max(count, 1)                                          # 无有效 token 明确得到 0
+        if self.lead:
+            logs.step("spin", "验证", step=self.step, accuracy=score, tokens=count)
+        return score
+
+    def _difficulty(self) -> list:
+        """人工 difficulty 优先；未标注样本用平均 token 稀有度，独立于长度。"""
+        from collections import Counter                                         # 频数由当前训练集唯一决定
+        texts = []                                                              # 各任务都先取实际编码的正文
+        for sample in self.samples:
+            if self.choice.task == "dpo":
+                texts.append(sample[0] + sample[1])                              # 正反答案一起描述该题难度
+            elif self.choice.task in {"grpo", "rloo", "ppo"}:
+                texts.append([token for row in sample[0] for token in row])
+            else:
+                texts.append(sample[0] if self.geo.image_side else sample)
+        counts = Counter(token for row in texts for token in row if token != self.pad_id)
+        total = sum(counts.values())                                             # 全库词频作为稀有度基线
+        scores = []                                                              # 得分越高越晚学习
+        for at, row in enumerate(texts):
+            marked = self.difficulties[at] if self.difficulties else None
+            tokens = [token for token in row if token != self.pad_id]
+            rarity = sum(-math.log(counts[token] / max(total, 1)) for token in tokens) / max(len(tokens), 1)
+            scores.append(marked if marked is not None else rarity / max(math.log(max(total, 2)), 1))
+        return scores
 
     def _agree(self, stop: bool) -> bool:
         """多进程时统一停不停：各卡取到的批不一样，结论必须由 0 号说了算。
@@ -567,6 +659,9 @@ class Trainer:
             self.restore(Path(self.choice.resume))
         if self.lead:
             self._write_run()  # 回头知道跑的是什么
+        if self.eval_rows and self.best_eval is None:
+            baseline = self.evaluate()  # 开训前先测一次，不把第一个退化结果当最好值
+            self.best_eval = baseline if math.isfinite(baseline) else None  # 非有限结果不能污染后续比较
         try:
             while self.step < self.total:  # 一步一步推
                 self.step += 1  # 先记步号，断在存盘前也对得上
@@ -576,7 +671,8 @@ class Trainer:
                 self.history = (self.history + [round(loss, 6)])[-HISTORY:]  # 只留最近几步
                 if self.lead and (self.step % self.choice.log_every == 0 or self.step == 1):  # 到点报一次
                     logs.step("spin", "训练", step=self.step, total=self.total, loss=round(loss, 4), lr=f"{self._rate(self.step):.2e}", gpu_gb=round(self._vram(), 2))
-                if self._agree(self._health(loss, spent)):  # 三项指标有一项踩线到要停，多进程要口径一致
+                evaluation = self.evaluate() if self.eval_rows and self.step % self.choice.eval_every == 0 else None
+                if self._agree(self._health(loss, spent, evaluation)):  # 三项指标有一项踩线到要停，多进程要口径一致
                     break
                 if self.choice.save_every and self.step % self.choice.save_every == 0:  # 到点存一档
                     _barrier()  # 等齐再存，谁也不许先走
@@ -622,7 +718,9 @@ class Trainer:
         if not self.lead:  # 其余进程拼完就走
             return folder
         self.net.write_config(folder, self.choice.precision)  # 结构描述跟着这一档走，导出时就在手边
-        torch.save({"optim": self.optim.state_dict()}, folder / "optimizer.pt")  # 优化器态
+        contrast = self.net.contrast  # 历史负例是训练状态，不进入推理 safetensors
+        queue = None if contrast is None else {name: getattr(contrast, name).detach().cpu() for name in ("images", "texts", "keys")}
+        torch.save({"optim": self.optim.state_dict(), "contrast": queue}, folder / "optimizer.pt")  # 优化器态
         (folder / "state.json").write_text(json.dumps(self._state(), ensure_ascii=False, indent=2), encoding="utf-8")  # 步数、游标、随机数
         (self.out / "latest").write_text(folder.name, encoding="utf-8")  # 最新一档的指针
         return folder
@@ -637,24 +735,28 @@ class Trainer:
             "rng": self.rng.numpy().tobytes().hex(),  # torch 随机数状态，原字节存成十六进制
             "cuda_rng": [one.numpy().tobytes().hex() for one in torch.cuda.get_rng_state_all()] if torch.cuda.is_available() else [],  # 卡上的随机数状态
             "python_rng": random.getstate(),  # python 随机数状态
+            "health": {"best_eval": self.best_eval, "bad_eval": self.bad_eval, "bad_loss": self.bad_loss, "big_norm": self.big_norm, "speeds": self.speeds},  # 健康基线与连续次数跨续训保留
             "history": self.history,  # 最近几步的 loss
         }
 
     def restore(self, folder: Path) -> None:
         """从一档读回全部状态，接着往下跑。"""
-        if folder.name == "auto" or folder.is_file():  # --resume auto 走 latest，给了 latest 文件也照它指
-            name = (self.out / "latest").read_text(encoding="utf-8").strip() if folder.name == "auto" else folder.read_text(encoding="utf-8").strip()
-            folder = self.out / name
-        if not (folder / "state.json").exists():  # 给的是产物根目录时，顺手挑最新那一档
-            folder = folder / (folder / "latest").read_text(encoding="utf-8").strip()
+        folder = _checkpoint(folder, self.out)  # 命令行路径与初始化时的结构判断共用解析
         state = json.loads((folder / "state.json").read_text(encoding="utf-8"))  # 状态先读
         if self.choice.lora:  # 挂件只灌 A/B
             lora.load(self.net, folder)
         else:  # 全量训就灌全量
             self.net.load(folder)
-        self.optim.load_state_dict(torch.load(folder / "optimizer.pt", map_location="cpu", weights_only=False)["optim"])  # 优化器态
+        checkpoint = torch.load(folder / "optimizer.pt", map_location="cpu", weights_only=False)  # 优化器与队列同档保存
+        self.optim.load_state_dict(checkpoint["optim"])
+        if checkpoint.get("contrast") is not None and self.net.contrast is not None:
+            for name, tensor in checkpoint["contrast"].items():
+                setattr(self.net.contrast, name, tensor.to(_device_of(self.model)))  # 历史负例在续训后仍可使用  # 优化器态
         self.step = state["step"]  # 从断点接着数
         self.cursor = state["cursor"]  # 从断点接着取数据
+        health = state.get("health", {})  # 旧断点没有这一节，沿用初始化值
+        for name, value in health.items():
+            setattr(self, name, value)  # 恢复已落盘的健康基线
         self.history = state["history"]  # 曲线接上
         self.total = self.step + self.choice.steps if self.choice.steps else state["total"]  # 给了 5 步就是再跑 5 步，没给就照旧档的总数
         self.total = max(self.total, self.step)  # 别把总步数改到断点之前
@@ -680,6 +782,9 @@ class Trainer:
         meta = {
             "geometry": self.geo.as_dict(),  # 几何
             "train": {"steps": self.total, "batch_size": self.choice.batch_size, "grad_accum": self.choice.grad_accum, "lr": self.choice.lr, "seed": self.choice.seed, "precision": self.choice.precision, "strategy": self.choice.strategy, "devices": self.choice.devices, "grad_checkpoint": self.choice.grad_checkpoint, "health": self.choice.health, "curriculum": self.choice.curriculum},  # 训练超参
+            "health_limits": self.choice.health_limits,  # 复现实验时需要知道停止阈值
+            "eval": {"files": [str(path) for path in self.choice.eval_files], "every": self.choice.eval_every},
+            "curriculum_by": self.choice.curriculum_by,  # 分桶依据独立记录
             "lora": self.choice.lora,  # 挂件配置，没挂是 null
             "files": [str(one) for one in self.choice.files],  # 数据来源
         }
@@ -707,13 +812,26 @@ def _unwrap(model):
 
 # --- CPU 权重 ---
 
-def _load_cpu(source, geo):
+def _checkpoint(folder: Path, out: Path) -> Path:
+    """把 auto/latest/运行目录统一解析到真实断点；结构选择与状态恢复使用同一路径。"""
+    if folder.name == "auto":
+        return out / (out / "latest").read_text(encoding="utf-8").strip()  # 最新一档由产物根目录维护
+    if folder.is_file():
+        return folder.parent / folder.read_text(encoding="utf-8").strip()  # latest 相对自己所在目录，不相对新输出目录
+    if not (folder / "state.json").exists():
+        return folder / (folder / "latest").read_text(encoding="utf-8").strip()
+    return folder  # 已指向 step-* 就直接使用
+
+
+def _load_cpu(source, geo, own_geometry: bool = False):
     """按学生几何独立构建 CPU 模型，从基座或教师路径载入；产物根目录跟随 latest。"""
-    from features.model import Model                                        # 基座和教师用同一种模型结构
+    from features.model import Geometry, Model                                        # 基座和教师用同一种模型结构
 
     where = Path(source)                                                    # 路径由命令层整理好，内部直接使用
     if where.is_dir() and (where / "latest").is_file():                       # 产物根目录指向最近一档
         where = where / (where / "latest").read_text(encoding="utf-8").strip()  # 跟着已有存档指针找到权重
+    if own_geometry and (where / "config.json").is_file():                    # 异构教师从自己的存档描述构建
+        geo = Geometry.from_config(json.loads((where / "config.json").read_text(encoding="utf-8")))
     with torch.device("cpu"):                                               # 构造时就落 CPU，避免临时占卡
         net = Model(geo)                                                    # 默认 fp32，不复制学生的量化层或挂件
     net.load(where)                                                         # 从盘上逐份载入，不接触学生参数
@@ -727,7 +845,7 @@ def _setup() -> tuple:
     local = int(os.environ["LOCAL_RANK"])  # 本机第几张卡，torchrun 排好的
     if torch.cuda.is_available():  # 卡上每进程认领一张，默认 0 号会让所有进程挤在一张上
         cards = torch.cuda.device_count()  # 几张卡
-        torch.cuda.set_device(local % cards if cards else 0)  # 进程比卡多时绕回来（单机用 devices:[0,0] 验分布式就是这种）
+        torch.cuda.set_device(local)  # 进程比卡多时绕回来（单机用 devices:[0,0] 验分布式就是这种）
     torch.distributed.init_process_group("nccl" if torch.cuda.is_available() else "gloo")  # 卡上用 nccl，CPU 上用 gloo；rank 和总数从环境变量读
     return int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])  # 全局序号和总进程数
 
@@ -737,7 +855,7 @@ def _wrap(net, strategy: str, world: int, local: int):
     if strategy == "single" or world == 1:  # 一张卡不用包，包了反而多一层
         return net
     if strategy == "ddp":  # 每卡一份完整模型，反向时自动把所有进程的梯度平均
-        return DDP(net, device_ids=[local] if torch.cuda.is_available() else None)
+        return DDP(net, device_ids=[torch.cuda.current_device()] if torch.cuda.is_available() else None, broadcast_buffers=False)
     for block in net.model.layers:  # fsdp2 逐层切：一层算完只留分片，全量参数不会同时驻留
         fully_shard(block)
     fully_shard(net)  # 最外层也切一刀，残留的参数和梯度才一起摊开

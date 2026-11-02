@@ -17,6 +17,7 @@ data.files 里的图片样本可带 image_at；它是一图一个的递增正文
 import difflib
 import hashlib
 import json
+import math
 from pathlib import Path
 
 from utils import yaml_io
@@ -48,6 +49,7 @@ FIELDS = {
             "rope_base": (int, float),  # RoPE 底数，写 10000 或 10000.0 都行
             "tie": bool,                # 输出层是否复用词表权重
             "image_side": int,          # 原图边长，0 表示不接图
+            "vision": (str, {"linear", "conv"}),  # 新图像模型默认卷积塔；旧视觉存档可显式选 linear
             "patch": int,               # 图片块边长；image_side 为 0 时不接图，不使用此值
         },
         "tokenizer": str,  # 词表文件，给了就按它编，没给按字节取模兜底
@@ -73,8 +75,18 @@ FIELDS = {
         "weight_decay": float,  # 权重衰减
         "max_grad_norm": float,  # 梯度裁剪阈值
         "seed": int,  # 随机种子，复现要用
+        "curriculum_by": (str, {"length", "difficulty"}),  # 难度由样本 difficulty 给出；没有时用词元稀有度
         "curriculum": bool,  # 先取短样本，再随训练进度放开中、长样本
         "grad_checkpoint": bool,  # 用时间换显存
+        "health_limits": {
+            "nan_steps": int,  # 连续非有限损失次数
+            "norm_steps": int,  # 连续超梯度阈值次数
+            "norm_limit": (int, float),  # 裁剪前梯度上限
+            "speed_window": int,  # 吞吐基线步数，不含本步
+            "slow_ratio": (int, float),  # 当前吞吐与基线的比例下限
+            "eval_drop": (int, float),  # 验证 token 准确率相对最佳值允许下降的绝对量
+            "eval_patience": int,  # 连续退化几次验证后停机
+        },
         "health": (str, {"stop", "warn"}),  # 指标坏了怎么办：stop 存一档再退（退出码 1）/ warn 只喊一声
         "max_steps": int,  # 总步数，给了就不按 epochs 换算
         "save_every": int,  # 每多少步存一档，0 只在收尾存
@@ -84,9 +96,12 @@ FIELDS = {
         "clip_ratio": float,  # GRPO / PPO 的裁剪区间
         "kl_coef": float,  # GRPO 的 KL 罚系数
         "temperature": float,  # distill 的温度
+        "align_queue": int,  # 留作跨批负样本的图文对数；0 只使用本批
+        "align_temperature": (int, float),  # 对比学习 softmax 温度
         "align_weight": float,  # 图文对齐损失的权重，0 就是关
         "reward": str,  # 组相对任务的外部 reward(payload) Python 文件
         "lora": {
+            "variant": (str, {"lora", "dora", "loha"}),  # 低秩、权重分解、Hadamard 低秩
             "r": int,  # 低秩秩数，越大越占参数
             "alpha": int,  # 缩放分子，实际缩放是 alpha/r
             "dropout": float,  # adapter 上的丢弃率
@@ -94,10 +109,13 @@ FIELDS = {
         },
     },
     "eval": {
+        "files": list,  # 健康评估的独立验证 JSONL（text 字段）
+        "every": int,  # 每几步做一次验证；给 files 时默认 50
         "suites": list,  # 要跑的评测套件名
         "gate": {"min_delta": float},  # 回归门：掉过这个分就判失败
         "limit": int,  # 每个套件最多跑几题
     },
+    "cost": {"profile": str, "price": str},  # 实测性能档与实际价格来源
     "forge": {
         "formats": (list, FORMATS),  # 要出的产物格式
         "quant": list,  # 量化档，例 q5_k_m
@@ -147,6 +165,23 @@ def check(data: dict) -> None:
     if data.get("task") in FINE_TUNE and not (data.get("model") or {}).get("path"):
         fail("schema", "微调类任务要 model.path 指基座", where="model.path", hint="例: ../merged_model")
     train = data.get("train") or {}  # 没写就当空，下面逐项看
+    limits = train.get("health_limits") or {}                             # 可调阈值只在配方边界校验一次
+    for name in ("nan_steps", "norm_steps", "speed_window", "eval_patience"):
+        if name in limits and (isinstance(limits[name], bool) or limits[name] < 1):
+            fail("schema", f"{name} 必须是正整数", where=f"train.health_limits.{name}")
+    for name in ("norm_limit", "slow_ratio", "eval_drop"):
+        if name in limits and (not math.isfinite(limits[name]) or limits[name] < 0):
+            fail("schema", f"{name} 必须是有限非负数", where=f"train.health_limits.{name}")
+    if limits.get("slow_ratio", 0.4) > 1 or limits.get("eval_drop", 0.1) > 1:
+        fail("schema", "slow_ratio 和 eval_drop 必须在 0 到 1 之间", where="train.health_limits")
+    if train.get("align_queue", 1024) < 0 or train.get("align_temperature", 0.07) <= 0:
+        fail("schema", "对齐队列不能为负，温度必须为正", where="train.align_queue")
+    evaluation = data.get("eval") or {}                                   # 验证数据为空时不会启动验证循环
+    if evaluation.get("every", 50) < 1:
+        fail("schema", "eval.every 必须为正整数", where="eval.every")
+    low = train.get("lora") or {}                                        # 所有挂件变体共用缩放与丢弃约束
+    if low.get("r", 16) <= 0 or not 0 <= low.get("dropout", 0.0) < 1:
+        fail("schema", "lora.r 要为正，dropout 要在 [0, 1)", where="train.lora")
     if train.get("strategy") in {"ddp", "fsdp2"} and not train.get("devices"):
         fail("schema", "多卡不给 devices 就不知道该用哪几张", where="train.devices", hint="例: [0, 1]")
     if data.get("task") == "distill" and not (data.get("model") or {}).get("teacher"):

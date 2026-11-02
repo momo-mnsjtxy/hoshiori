@@ -1,0 +1,14 @@
+{
+  "dataset": "lhoestq/demo1",
+  "eval_split": "train[:3]",
+  "fewshot_split": "train[3:5]",
+  "num_fewshot": 1,
+  "count": 3,
+  "notes": [
+    "已拼接 1-shot 示范，seed=17，排除与当前题面相同的记录"
+  ],
+  "revision": "87ecf163bedca9d80598b528940a9c4f99e14c11",
+  "datasets_version": "5.1.0",
+  "python_version": "3.12.14",
+  "verification": "Real Hub download; imported 3 evaluation tasks; each prompt contains exactly 1 demonstration and 1 evaluation question."
+}

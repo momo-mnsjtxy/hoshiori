@@ -36,3 +36,17 @@ def test_run_randomizes_call_order_but_keeps_a_b_scores(monkeypatch, tmp_path):
     assert {tuple(match["order"]) for match in result["matches"]} == {("A", "B"), ("B", "A")}
     assert all(match["players"][0]["score"] == 1.0 for match in result["matches"])
     assert result["ranking"][0]["backend"] == "first"
+
+
+def test_configurable_elo_and_stability_stop(monkeypatch, tmp_path):
+    """平局使窗口稳定后停止，实际后端调用次数与已记录场数一致。"""
+    calls = []  # 记录真正执行多少次答题
+    monkeypatch.setattr(arena.lm_eval, "answer", lambda command, prompt: calls.append(command) or "same")
+    tasks = [suite.Task(id=str(index), prompt="q", rule="exact", answer="same") for index in range(100)]
+    one = suite.Suite(name="stable", desc="", tasks=tasks, path=tmp_path / "stable.yaml")
+    result = arena.run("a", "b", [one], k=12, initial=1000, min_matches=8, window=4, tolerance=0.01)
+    assert result["stopping"]["converged"] is True
+    assert len(result["matches"]) == 8 and len(calls) == 16
+    assert result["elo"] == {"k": 12, "initial": 1000}
+    assert [row["elo"] for row in result["ranking"]] == [1000, 1000]
+    assert arena.elo([1], k=20, initial=800) == (810, 790)

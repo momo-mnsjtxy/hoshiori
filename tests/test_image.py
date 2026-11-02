@@ -142,9 +142,10 @@ def test_image_alignment_state_and_loss(geo):                                   
     assert logits.shape == (2, 12, geo.vocab) and loss.ndim == 0                       # 二元组第二项必须是标量张量
     assert torch.isfinite(loss) and loss.requires_grad                                # 对齐目标可以直接参与反向
     with torch.no_grad():                                                             # 手算同一次确定性前向的损失
-        image_hidden = net.image_align(net.image_proj(blocks.flatten(2)))              # 图片先投影再过两层对齐
-        hidden = net.model(ids, image_hidden)                                          # 主体给出同批文本隐状态
-        expected = model.align_loss(image_hidden, hidden[:, image_hidden.shape[1]:]) * net.align_weight  # 公式只缩放一次
+        pictures, texts, _ = net.embeddings(ids, blocks)                              # 图和文独立编码，不能靠图片泄漏匹配答案
+        scores = pictures @ texts.T / net.contrast.temperature                        # 本批候选的归一化相似度
+        labels = torch.arange(2)                                                      # 每条样本的配对位于对角线
+        expected = (torch.nn.functional.cross_entropy(scores, labels) + torch.nn.functional.cross_entropy(scores.T, labels)) / 2 * net.align_weight  # 对称 InfoNCE
     torch.testing.assert_close(loss, expected)                                         # forward 交回的就是约定公式
 
 
@@ -212,7 +213,7 @@ def test_patch_at_interleaves_blocks_and_default_stays_prefix(geo):             
     hook.remove()                                                                      # 两次观察已经完成
     with torch.no_grad():                                                             # 手工只算拼接两边的原始表示
         text = net.model.embed_tokens(ids)                                             # 四个文字嵌入
-        pictures = net.image_align(net.image_proj(blocks.flatten(2)))                  # 两个图片块表示
+        pictures = net.encode_image(blocks)                  # 两个图片块表示
         interleaved = torch.stack((text[:, 0], pictures[:, 0], text[:, 1], text[:, 2], pictures[:, 1], text[:, 3]), dim=1)  # 指定次序
         prefixed = torch.cat((pictures, text), dim=1)                                  # 旧行为是整段图片在前
     torch.testing.assert_close(seen[0], interleaved)                                   # 两块准确落在各自指定文本之后

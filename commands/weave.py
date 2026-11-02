@@ -14,7 +14,7 @@ import json
 import os
 from pathlib import Path
 
-from features import duplicate
+from features import clean, duplicate
 from features.dataset import Choice, Dataset
 from features.sample import Policy
 from utils import logs
@@ -52,6 +52,7 @@ def command(args) -> int:
             max_chars=args.max_chars,
             min_score=args.min_score,
             scrub=args.scrub,
+            quality_weights=clean.profile(args.quality_profile) if args.quality_profile else None,  # 开跑前验档
         ),
         rule=duplicate.Rule(threshold=args.threshold, size=args.size, count=args.count, exact=not args.no_exact),
         algo=args.algo,

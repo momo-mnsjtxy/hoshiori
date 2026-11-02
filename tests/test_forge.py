@@ -878,3 +878,81 @@ def test_onnx_accepts_batch_greater_than_one(tmp_path):
     single = session.run(None, {"input_ids": ids[:1], **{k: v[:1] for k, v in past.items()}})[0]  # 单独一条
     error = float(np.max(np.abs(got[:1] - single)) / max(float(np.max(np.abs(single))), 1e-9))
     assert error < 1e-5  # 批里两条互不影响
+
+
+def test_hf_llama_rope_permutation_preserves_attention(tmp_path):
+    """HF 半向量旋转和导出后相邻旋转算出的内积一致，包括不同 KV 头数。"""
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"model_type": "llama", "num_attention_heads": 2, "num_key_value_heads": 1}))
+    rng = np.random.default_rng(23)
+    weights = {"blk.0.attn_q.weight": rng.normal(size=(8, 6)), "blk.0.attn_k.weight": rng.normal(size=(4, 6))}
+    exported = forge.gguf_rope(weights, config)
+    token = rng.normal(size=6)
+    angles = np.array([.2, .7])
+    for name, before in weights.items():
+        heads = 2 if "attn_q" in name else 1
+        hf = (before @ token).reshape(heads, 4)
+        cosine, sine = np.tile(np.cos(angles), 2), np.tile(np.sin(angles), 2)
+        rotated = hf * cosine + np.concatenate((-hf[:, 2:], hf[:, :2]), axis=1) * sine
+        ggml = (exported[name] @ token).reshape(heads, 2, 2)
+        adjacent = np.stack((-ggml[:, :, 1], ggml[:, :, 0]), axis=-1)
+        actual = ggml * np.cos(angles)[None, :, None] + adjacent * np.sin(angles)[None, :, None]
+        assert np.allclose(actual.reshape(heads, 4), rotated[:, [0, 2, 1, 3]])
+    config.write_text(json.dumps({"model_type": "hoshiori"}))
+    assert forge.gguf_rope(weights, config) is weights  # 星织本身已经按相邻位置旋转
+
+
+def test_gguf_keeps_chat_template_and_bos_flags(tmp_path):
+    folder = tokenizer_files(tmp_path)
+    config = folder / "tokenizer_config.json"
+    data = json.loads(config.read_text()) if config.exists() else {}
+    data.update({"chat_template": "{{ messages[0]['content'] }}", "add_bos_token": False})
+    config.write_text(json.dumps(data))
+    metadata = forge.tokenizer(folder, [])
+    assert metadata["tokenizer.chat_template"] == (forge.K_STRING, data["chat_template"])
+    assert metadata["tokenizer.ggml.add_bos_token"] == (forge.K_BOOL, False)
+
+
+def test_benchmark_uses_clean_batch_output(tmp_path, monkeypatch):
+    """新版交互横幅不能进判分，批处理终止标记也不属于模型答案。"""
+    from types import SimpleNamespace
+    from pathlib import Path
+    suite = tmp_path / "suite.yaml"
+    suite.write_text('name: smoke\ntasks:\n  - id: one\n    prompt: Question\n    rule: exact\n    answer: Paris\n')
+    monkeypatch.setattr(forge.shutil, "which", lambda name: '/tools/' + name)
+    original_run = forge.subprocess.run  # 硬件探测仍走真实系统调用，只替换推理结果
+    def answer(command, **kwargs):
+        if command[0] != '/tools/llama-completion':
+            return original_run(command, **kwargs)
+        assert command[0] == '/tools/llama-completion'
+        assert '--log-disable' not in command  # 新版该选项会把生成文本一起关闭
+        return SimpleNamespace(returncode=0, stdout='Paris [end of text]\n', stderr='timing log')
+    monkeypatch.setattr(forge.subprocess, "run", answer)
+    result = forge.benchmark(Path('model.gguf'), [str(suite)], 'q8_0')
+    assert result['total'] == 1 and result['tasks'][0]['answer'] == 'Paris'
+
+
+def test_q8_batch_boundary_and_zero_blocks():
+    """跨过8192块批界，回读仍保持原顺序；零块不得出现NaN或随机字节。"""
+    source = np.tile(np.arange(-16, 16, dtype=np.float32), (8193, 1))
+    source[8191] = 0
+    raw = forge.q8_0(source)
+    packed = np.frombuffer(raw, dtype=np.dtype([('scale', '<f2'), ('values', 'i1', (32,))]))
+    decoded = packed['scale'].astype(np.float32)[:, None] * packed['values']
+    assert len(raw) == 8193 * 34
+    assert np.all(decoded[8191] == 0)
+    assert np.max(abs(decoded - source)) < .13
+
+
+
+def test_smollm_numeric_pretokenizer_is_exported(tmp_path):
+    """数字拆分规则必须随 GGUF 导出，否则同一题会被编码成不同 token。"""
+    folder = tokenizer_files(tmp_path)
+    path = folder / "tokenizer.json"
+    data = json.loads(path.read_text())
+    data["pre_tokenizer"] = {"type": "Sequence", "pretokenizers": [
+        {"type": "Digits", "individual_digits": True},
+        {"type": "ByteLevel", "add_prefix_space": False, "trim_offsets": True, "use_regex": True},
+    ]}
+    path.write_text(json.dumps(data))
+    assert forge.tokenizer(folder, [])["tokenizer.ggml.pre"] == (forge.K_STRING, "smollm")

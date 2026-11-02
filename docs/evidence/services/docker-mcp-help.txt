@@ -1,0 +1,5 @@
+usage: ori mcp serve [-h] [--root ROOT]
+
+options:
+  -h, --help   show this help message and exit
+  --root ROOT  工具可以访问的工作目录

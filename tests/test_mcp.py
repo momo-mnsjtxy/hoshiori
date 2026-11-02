@@ -241,3 +241,40 @@ def test_cli_requires_an_action():
     with pytest.raises(SystemExit) as stopped:             # argparse 在命令模块导入前拦住
         main.run(["mcp"])                                 # 少一层动作
     assert stopped.value.code == 2                         # 标准命令行用法错误码
+
+
+def test_real_hoshiori_server_handshake_call_and_containment(tmp_path):
+    """现有真实客户端连接新服务端，协议握手、业务工具、越界错误都走子进程管道。"""
+    from pathlib import Path
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "card.json").write_text('{"name":"MCP card"}')
+    config = tmp_path / "servers.yaml"
+    script = Path(main.__file__).resolve()
+    config.write_text(json.dumps({"ori": {"command": sys.executable, "args": [str(script), "mcp", "serve", "--root", str(root)]}}))
+    servers = Servers(config, timeout=3)
+    try:
+        assert {one["name"] for one in servers.start("ori")} == {"read_card", "validate_recipe", "list_suites"}
+        assert servers.call("ori", "read_card", {"path": "."})["structuredContent"]["name"] == "MCP card"
+        assert servers.call("ori", "read_card", {"path": "../outside/card.json"})["isError"] is True
+        assert "zh-lite" in servers.call("ori", "list_suites", {})["structuredContent"]["suites"]
+    finally:
+        servers.stop("ori")
+
+
+def test_server_protocol_errors_notifications_and_symlink(tmp_path):
+    """错误帧有标准编号，通知不回包，目录下 card.json 符号链接也不能逃根。"""
+    from features.mcp import Server
+    root = tmp_path / "root"
+    root.mkdir()
+    (tmp_path / "card.json").write_text('{"secret":true}')
+    (root / "card.json").symlink_to(tmp_path / "card.json")
+    server = Server(root)
+    assert server.handle([])["error"]["code"] == -32600
+    assert server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})["error"]["code"] == -32002
+    result = server.handle({"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}})
+    assert result["result"]["serverInfo"]["name"] == "hoshiori"
+    assert server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}) is None
+    result = server.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "read_card", "arguments": {"path": "."}}})
+    assert result["result"]["isError"] is True
+    assert "secret" not in result["result"]["content"][0]["text"]

@@ -1,0 +1,77 @@
+[
+  {
+    "model": "HuggingFaceTB/SmolLM2-360M-Instruct",
+    "score": 0.9167,
+    "recipe": "sha256:bc33670680793b4092c649827d5d1f9e288ad64145b1fb53023d6807e1881662",
+    "hardware": {
+      "cpu": "AMD Ryzen 9 8945HX with Radeon Graphics",
+      "cores": "x86_64 x32",
+      "mem_gb": 30.6,
+      "gpu": [
+        "GPU 0: NVIDIA GeForce RTX 5060 Laptop GPU"
+      ],
+      "os": "Linux-7.2.11-arch1-1-x86_64-with-glibc2.44"
+    },
+    "time": "2026-11-02T14:27:14.675619+00:00"
+  },
+  {
+    "model": "HuggingFaceTB/SmolLM2-360M",
+    "score": 0.75,
+    "recipe": "sha256:62e20f5e732e02085f90a98f3cbeb8eb3074c9d0eb76bb23de97d976058e1abd",
+    "hardware": {
+      "cpu": "AMD Ryzen 9 8945HX with Radeon Graphics",
+      "cores": "x86_64 x32",
+      "mem_gb": 30.6,
+      "gpu": [
+        "GPU 0: NVIDIA GeForce RTX 5060 Laptop GPU"
+      ],
+      "os": "Linux-7.2.11-arch1-1-x86_64-with-glibc2.44"
+    },
+    "time": "2026-11-02T14:28:04.694924+00:00"
+  },
+  {
+    "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+    "score": 0.6667,
+    "recipe": "sha256:dab6859fceb3399b6ef7e8fce21a50c6d9862722c170afb82f43f2b84d2eec63",
+    "hardware": {
+      "cpu": "AMD Ryzen 9 8945HX with Radeon Graphics",
+      "cores": "x86_64 x32",
+      "mem_gb": 30.6,
+      "gpu": [
+        "GPU 0: NVIDIA GeForce RTX 5060 Laptop GPU"
+      ],
+      "os": "Linux-7.2.11-arch1-1-x86_64-with-glibc2.44"
+    },
+    "time": "2026-11-02T14:26:51.395587+00:00"
+  },
+  {
+    "model": "HuggingFaceTB/SmolLM2-135M",
+    "score": 0.5,
+    "recipe": "sha256:e45938b95c10dad5ccd6e74a2d4f1999d83bb9fd8b19983ad2e06d88ef6259aa",
+    "hardware": {
+      "cpu": "AMD Ryzen 9 8945HX with Radeon Graphics",
+      "cores": "x86_64 x32",
+      "mem_gb": 30.6,
+      "gpu": [
+        "GPU 0: NVIDIA GeForce RTX 5060 Laptop GPU"
+      ],
+      "os": "Linux-7.2.11-arch1-1-x86_64-with-glibc2.44"
+    },
+    "time": "2026-11-02T14:26:58.487655+00:00"
+  },
+  {
+    "model": "HuggingFaceTB/SmolLM-135M-Instruct",
+    "score": 0.5,
+    "recipe": "sha256:1dfaad12744ef4d812e982dd6a5856f1a382ac1e2ec0a5dcb1ab62efef0a51e8",
+    "hardware": {
+      "cpu": "AMD Ryzen 9 8945HX with Radeon Graphics",
+      "cores": "x86_64 x32",
+      "mem_gb": 30.6,
+      "gpu": [
+        "GPU 0: NVIDIA GeForce RTX 5060 Laptop GPU"
+      ],
+      "os": "Linux-7.2.11-arch1-1-x86_64-with-glibc2.44"
+    },
+    "time": "2026-11-02T14:28:17.787471+00:00"
+  }
+]

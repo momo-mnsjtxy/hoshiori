@@ -1,0 +1,21 @@
+version: 1
+name: measured-small-text
+task: pretrain
+model:
+  geometry:
+    layers: 4
+    d_model: 256
+    heads: 4
+    d_head: 64
+    vocab: 512
+    max_seq_len: 128
+train:
+  precision: bf16
+  strategy: single
+  devices: [0]
+  max_steps: 100
+  batch_size: 2
+  grad_accum: 1
+cost:
+  profile: ../docs/evidence/cost-5090d-profile.json
+  price: ../docs/evidence/runpod-5090-price.json

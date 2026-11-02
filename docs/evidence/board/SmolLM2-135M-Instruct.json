@@ -1,0 +1,114 @@
+{
+  "schema": "hoshiori/judge/1",
+  "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+  "backend": "llama-completion",
+  "suite": "en-smoke",
+  "recipe": "sha256:dab6859fceb3399b6ef7e8fce21a50c6d9862722c170afb82f43f2b84d2eec63",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 8945HX with Radeon Graphics",
+    "cores": "x86_64 x32",
+    "mem_gb": 30.6,
+    "gpu": [
+      "GPU 0: NVIDIA GeForce RTX 5060 Laptop GPU"
+    ],
+    "os": "Linux-7.2.11-arch1-1-x86_64-with-glibc2.44"
+  },
+  "count": 12,
+  "total": 0.6667,
+  "tasks": [
+    {
+      "suite": "en-smoke",
+      "id": "france",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)\\bParis\\b",
+      "answer": "The capital of France is Paris."
+    },
+    {
+      "suite": "en-smoke",
+      "id": "japan",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)\\bTokyo\\b",
+      "answer": "The capital of Japan is Tokyo."
+    },
+    {
+      "suite": "en-smoke",
+      "id": "addition",
+      "score": 1.0,
+      "reason": "匹配上了正则 \\b12\\b",
+      "answer": "To find the sum of 7 and 5, we need to add them together and then subtract 5 from that sum.\n\nThe sum of 7 and 5 is 12.\n\nNow, we subtract 5 from 12 to get 6.\n\nSo, the sum"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "multiply",
+      "score": 1.0,
+      "reason": "匹配上了正则 \\b48\\b",
+      "answer": "To find 6 times 8, we can use the concept of multiplication and the concept of the number line. We can start by multiplying 6 by 8, which gives us 48. Then, we can multiply 48 by 8, which gives us 360.\n\nSo"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "opposite",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)\\bcold\\b",
+      "answer": "The opposite of hot is cold."
+    },
+    {
+      "suite": "en-smoke",
+      "id": "color",
+      "score": 0.0,
+      "reason": "没匹配上正则 (?i)\\byellow\\b",
+      "answer": "A ripe banana is a red fruit."
+    },
+    {
+      "suite": "en-smoke",
+      "id": "sequence",
+      "score": 0.0,
+      "reason": "没匹配上正则 \\b10\\b",
+      "answer": "The number that comes next is 8."
+    },
+    {
+      "suite": "en-smoke",
+      "id": "animal",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)\\bcat\\b",
+      "answer": "The animal that says \"meow\" is a cat."
+    },
+    {
+      "suite": "en-smoke",
+      "id": "water",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)H2O|H₂O",
+      "answer": "The chemical formula for water is H2O. This is because water is composed of two hydrogen atoms bonded to one oxygen atom, which is the most common type of atom in the universe."
+    },
+    {
+      "suite": "en-smoke",
+      "id": "days",
+      "score": 1.0,
+      "reason": "匹配上了正则 \\b7\\b",
+      "answer": "A week is 7 days."
+    },
+    {
+      "suite": "en-smoke",
+      "id": "square",
+      "score": 0.0,
+      "reason": "没匹配上正则 \\b9\\b",
+      "answer": "The square root of 81 is 13."
+    },
+    {
+      "suite": "en-smoke",
+      "id": "planet",
+      "score": 0.0,
+      "reason": "没匹配上正则 (?i)\\bMars\\b",
+      "answer": "The Red Planet is a fictional planet in the popular science fiction series \"Star Trek: The Next Generation\" and the Star Trek: The Next Generation universe. It is a planet in the outer reaches of the galaxy, known for its harsh environment and toxic atmosphere. The Red Planet is often referred to as \"Nebula"
+    }
+  ],
+  "provenance": {
+    "repo": "HuggingFaceTB/SmolLM2-135M-Instruct",
+    "revision": "12fd25f77366fa6b3b4b768ec3050bf629380bac",
+    "quant": "q8_0",
+    "suite_sha256": "063d98b8a37100b8bab92a226863aa0a0b5bb043ee10163742e5bff98bb64578",
+    "seed": 1,
+    "temperature": 0,
+    "max_tokens": 64
+  },
+  "time": "2026-11-02T14:26:51.395587+00:00"
+}

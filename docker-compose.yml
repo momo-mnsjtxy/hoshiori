@@ -1,33 +1,38 @@
-# 出厂即跑的一套：网关加面板，产物和数据都在卷里。
-# 用法：docker compose up -d       然后 curl 127.0.0.1:8080/v1/models
-# 换后端：改 serve 的 command，或者在 .env 里给 ORI_TOKEN。
-
+# 网关和可编辑面板。先按 docs/DEPLOY.md 准备 data 与两份访问令牌，再 build/up。
 services:
   serve:
     build: .
     image: hoshiori:local
-    command: ["serve", "/data/model", "--port", "8080", "--host", "0.0.0.0", "--log", "/data/gateway.jsonl"]
+    command: ["serve", "/data/model", "--backend", "echo", "--port", "8080", "--host", "0.0.0.0", "--log", "/data/gateway.jsonl"]
     environment:
-      ORI_TOKEN: "${ORI_TOKEN:?先在 .env 里给一个令牌}"
+      ORI_TOKEN: "${ORI_TOKEN:?先在 .env 里给网关令牌}"
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
-      - ./data:/data
+      - "${ORI_DATA_DIR:-./data}:/data"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "ori", "doctor"]
-      interval: 30s
+      test: ["CMD", "python", "-c", "import os,urllib.request; r=urllib.request.Request('http://127.0.0.1:8080/v1/models',headers={'Authorization':'Bearer '+os.environ['ORI_TOKEN']}); urllib.request.urlopen(r,timeout=3).read()"]
+      interval: 5s
       timeout: 5s
-      retries: 3
+      start_period: 5s
+      retries: 6
 
   loom:
     image: hoshiori:local
     command: ["loom", "/data/bolt", "--port", "8765", "--host", "0.0.0.0"]
+    environment:
+      ORI_LOOM_TOKEN: "${ORI_LOOM_TOKEN:?先在 .env 里给面板令牌}"
     ports:
-      - "8765:8765"
+      - "127.0.0.1:8765:8765"
     volumes:
-      - ./data:/data:ro
+      - "${ORI_DATA_DIR:-./data}:/data"
     depends_on:
       serve:
         condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request; r=urllib.request.Request('http://127.0.0.1:8765/',headers={'Authorization':'Bearer '+os.environ['ORI_LOOM_TOKEN']}); urllib.request.urlopen(r,timeout=3).read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 6

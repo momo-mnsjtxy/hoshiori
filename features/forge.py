@@ -178,6 +178,7 @@ class Export:
             return self._onnx(named)
         if self.choice.format == "mlx":  # 交给 mlx_lm 自己转
             return self._mlx(named)
+        named = gguf_rope(named, self.choice.config)  # HF Llama 的半向量旋转需转成 GGML 的相邻对
         kv = metadata(self.choice.config, self.choice.name, self.choice.quant, self.choice.dropped)  # 元数据转 kv
         if self.choice.with_tokenizer:  # 不导词表就不塞这些 kv
             kv.update(tokenizer(self._token_dir(), self.choice.dropped))  # 词表照着基座目录读，缺了记进 dropped
@@ -319,16 +320,17 @@ class Export:
 # --- 量化自评 ---
 
 def benchmark(model: Path, suites: list, label: str) -> dict:
-    """用 llama-cli 跑套件并按 scorer 的规则出一份 judge 同形报告。
+    """用 llama.cpp 批处理入口跑套件并按 scorer 的规则出一份 judge 同形报告。
 
     model 是 f16 基线或刚写出的量化 GGUF；suites 可给内置名，也可给套件文件路径。
     固定 seed、temperature 与生成上限，避免采样抖动被误认成量化退化。
+    新版优先 llama-completion；旧版沿用 llama-cli。stderr 保留诊断，stdout 只判生成正文。
     """
     from features import report, scorer, suite  # 自评才需要套件与报告，普通导出不多载模块
 
-    program = shutil.which("llama-cli")  # GGUF 两边都交给同一个运行时，后端差异不会混进分差
+    program = shutil.which("llama-completion") or shutil.which("llama-cli")  # 新版 CLI 是交互 UI，批处理用 completion
     if program is None:  # 没运行时就不能声称跑过模型
-        fail("missing", "量化自评要 llama-cli", hint="安装 llama.cpp 并把 llama-cli 放进 PATH，或先不加 --self-check")
+        fail("missing", "量化自评要 llama.cpp", hint="将 llama-completion（新版）或 llama-cli（旧版）放进 PATH")
 
     found = []  # 已装载的套件，命令层验过后这里直接读
     for given in suites:  # 内置名和显式文件都收
@@ -347,9 +349,7 @@ def benchmark(model: Path, suites: list, label: str) -> dict:
                 "--seed", "1",  # 两边固定同一随机种子
                 "--temp", "0",  # 贪心解码，去掉采样噪声
                 "--no-display-prompt",  # stdout 只留模型答案
-                "--no-show-timings",  # 计时不混进答案
                 "--simple-io",  # 子进程管道下不用终端控制符
-                "--log-disable",  # 模型装载日志也不混进输出
                 "--single-turn",  # 一题答完就退，不等下一轮输入
             ]
             try:
@@ -359,7 +359,10 @@ def benchmark(model: Path, suites: list, label: str) -> dict:
             if done.returncode:  # 运行时拒绝模型或执行失败都不能当零分吞掉
                 detail = done.stderr.strip()[-400:] or done.stdout.strip()[-400:]  # 最后一段通常就是根因
                 fail("input", f"自评题 {one.name}/{task.id} 跑失败（退出码 {done.returncode}）", where=str(model), hint=detail)
-            answer = done.stdout.strip()  # stdout 已靠上面的静默参数收成纯答案
+            answer = done.stdout.strip()  # 装载与计时在 stderr，不关闭会连生成文本一起关闭的日志器
+            answer = re.sub(r"\s*\[end of text\]\s*$", "", answer).strip()  # 只剥运行时终止标记，不改模型正文
+            if "available commands:" in answer and "Loading model" in answer:
+                fail("missing", "llama-cli 输出了交互界面，不能作为评测答案", hint="请安装同版本的 llama-completion")
             verdict = scorer.grade(task, answer)  # 与 ori judge 共用同一套判分
             rows.append({
                 "suite": one.name,  # 哪套题
@@ -371,7 +374,7 @@ def benchmark(model: Path, suites: list, label: str) -> dict:
 
     return report.make(  # 字段与 judge/report.json 一致，self_check 只认这一种形状
         model=label,  # f16 或具体量化档
-        backend="llama-cli",  # 两边用同一个本地运行时
+        backend=Path(program).name,  # 报告记录实际批处理程序
         suite=", ".join(one.name for one in found),  # 实际跑过的套件
         recipe="forge:self-check",  # 这不是另一次训练配方
         rows=rows,  # 全部逐题结果
@@ -426,6 +429,7 @@ def self_check(baseline_report, quant_report) -> dict:
         "degradation": degradation,  # 正数表示退化幅度
         "count": len(items),  # 比了多少项
         "items": items,  # 逐项差，按退化从大到小
+        "raw_reports": {"baseline": baseline, "quantized": quantized},  # 留住实际答案/运行时/硬件，便于审查零分与解析污染
     }
     folder = paths[1].parent  # 量化报告在哪，最终比较报告就落在哪
     markdown_path, json_path = folder / "report.md", folder / "report.json"  # 用户约定的固定文件名
@@ -713,6 +717,29 @@ def read_metadata(path: Path) -> dict:
 
 # --- 改名 ---
 
+def gguf_rope(tensors: dict, config: Path) -> dict:
+    """将 HF Llama/Mistral Q/K 的半向量布局转成 GGML 相邻旋转对；星织权重已是相邻对。
+
+    与 llama.cpp b12040 conversion/llama.py 的 permute 保持一致；只用于 GGUF，
+    safetensors 原始权重和 ONNX 不经过这一步。每个 KV 头单独置换，支持 GQA。
+    """
+    if config is None:                                       # 没有结构不能推断头数，沿用原始布局
+        return tensors
+    data = json.loads(Path(config).read_text(encoding="utf-8"))  # 配置为外部模型的结构事实
+    if data.get("model_type") not in {"llama", "mistral"} or data.get("rope_interleaved"):
+        return tensors                                      # 星织、Qwen 等结构不套用 Llama 的转换
+    out = dict(tensors)                                     # 不改调用方拿来做其他格式导出的权重
+    for name, weight in tensors.items():
+        if not name.endswith(("attn_q.weight", "attn_q.bias", "attn_k.weight", "attn_k.bias")):
+            continue                                        # V、O、MLP 不参与旋转位置编码
+        heads = data["num_attention_heads"]                 # 查询头的分组数
+        if ".attn_k." in name:
+            heads = data.get("num_key_value_heads", heads)  # GQA 键头可能比查询头少
+        shape = (heads, 2, weight.shape[0] // heads // 2, *weight.shape[1:])
+        out[name] = weight.reshape(shape).swapaxes(1, 2).reshape(weight.shape)  # 半向量变成交错配对
+    return out
+
+
 def ggml_name(name: str):
     """HF 张量名换成 ggml 的名字。不认识返回 None。"""
     if name in NAMES:  # 词表、输出层这种整名映射
@@ -811,6 +838,22 @@ def _tokenizer_json(path: Path, folder: Path, dropped: list) -> dict:
         "tokenizer.ggml.merges": (K_ARRAY, (K_STRING, merges)),  # 合并表
         "tokenizer.ggml.token_type": (K_ARRAY, (K_I32, types)),  # 每个词的类型
     }
+    # SmolLM 在 ByteLevel 前先拆单个数字；默认 GPT-2 会把多位数字合并，实际推理会变。
+    # 布局对应 llama.cpp b12040 conversion/base.py 的 smollm，按完整预分词结构识别。
+    smollm = {"type": "Sequence", "pretokenizers": [
+        {"type": "Digits", "individual_digits": True},
+        {"type": "ByteLevel", "add_prefix_space": False, "trim_offsets": True, "use_regex": True},
+    ]}
+    if data.get("pre_tokenizer") == smollm:
+        kv["tokenizer.ggml.pre"] = (K_STRING, "smollm")        # 数字和空白必须与源 tokenizer 保持一致
+    settings_path = folder / "tokenizer_config.json"          # 对话模板和特殊词表开关跟模型一起导出
+    if settings_path.is_file():
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        if isinstance(settings.get("chat_template"), str):  # 多模板映射需用户选择，不能随意猜一种
+            kv["tokenizer.chat_template"] = (K_STRING, settings["chat_template"])
+        for flag in ("add_bos_token", "add_eos_token"):
+            if isinstance(settings.get(flag), bool):         # 仅导出明确给出的开关
+                kv[f"tokenizer.ggml.{flag}"] = (K_BOOL, settings[flag])
     for key, label, default in (  # 三个特殊 id，配置里指到哪个词就用哪个 id
         ("bos_token", "bos_token_id", 1),
         ("eos_token", "eos_token_id", 2),
@@ -938,15 +981,19 @@ def tensor_bytes(kind: int, shape) -> int:
 
 
 def q8_0(rows: np.ndarray) -> bytes:
-    """q8_0：每 32 个值一块，一块一个 fp16 比例加 32 个 int8。"""
-    out = bytearray()
-    for row in rows.astype(np.float32):  # 一行行来
-        for start in range(0, row.size, 32):  # 32 个一段
-            chunk = row[start : start + 32]
-            d = np.float16(max(abs(chunk).max(), 1e-8) / 127)  # 比例存 fp16，除 127 落在 int8 上半区
-            step = float(d)  # 量化用存下去的那个值再算，读回来才对得上
-            q = np.clip(np.rint(chunk / step), -127, 127).astype(np.int8)  # 归一到 int8
-            out += d.tobytes() + q.tobytes()  # 比例在前，32 个 int8 在后
+    """每32值写 fp16 比例与32个 int8；分批向量化，避免大模型逐块进入Python。"""
+    chunks = rows.astype(np.float32, copy=False).reshape(-1, 32)  # prepare 已补齐每行块宽
+    layout = np.dtype([("scale", "<f2"), ("values", "i1", (32,))])  # GGML 紧凑34字节，不插结构体padding
+    out = bytearray()                                         # 每批写完就释放中间浮点矩阵
+    for start in range(0, len(chunks), 8192):                  # 每批约1MiB像素，峰值不随模型块数增长
+        batch = chunks[start:start + 8192]                   # 保持行优先，和旧标量实现同一字节序
+        scales = (np.maximum(np.abs(batch).max(axis=1), 1e-8) / 127).astype(np.float16)
+        values = np.zeros_like(batch)                        # 全零及低于fp16范围的块写成零，避免0/0
+        np.divide(batch, scales[:, None].astype(np.float32), out=values, where=scales[:, None] != 0)
+        packed = np.empty(len(batch), dtype=layout)            # 每一项恰是一块GGML数据
+        packed["scale"] = scales                              # 使用真实存盘比例计算，回读才对得上
+        packed["values"] = np.clip(np.rint(values), -127, 127).astype(np.int8)
+        out.extend(packed.tobytes())                          # 比例在前、量化数在后，一批顺序追加
     return bytes(out)
 
 

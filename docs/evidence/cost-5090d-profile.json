@@ -1,0 +1,169 @@
+{
+  "version": 1,
+  "kind": "cuda-training-calibration",
+  "scope": "synthetic_full_length_training",
+  "measured_at": "2026-11-02T14:29:33.817695+00:00",
+  "hardware": {
+    "name": "NVIDIA GeForce RTX 5090 D",
+    "capability": [
+      12,
+      0
+    ],
+    "total_gib": 31.35833740234375,
+    "free_gib_before": 30.86297607421875,
+    "torch": "2.8.0+cu128",
+    "cuda": "12.8"
+  },
+  "runs": [
+    {
+      "status": "ok",
+      "configuration": {
+        "geometry": {
+          "d_model": 256,
+          "layers": 4,
+          "heads": 4,
+          "d_head": 64,
+          "vocab": 512,
+          "max_seq_len": 128,
+          "rope_base": 10000.0,
+          "tie": true,
+          "image_side": 0,
+          "vision": "conv",
+          "patch": 16
+        },
+        "task": "pretrain",
+        "precision": "bf16",
+        "batch_size": 1,
+        "grad_accum": 1,
+        "strategy": "single",
+        "cards": 1,
+        "lora": null,
+        "grad_checkpoint": false,
+        "optimizer": "AdamW",
+        "declared_params_b": null
+      },
+      "parameters": 4327680,
+      "steps": 10,
+      "warmup_steps": 3,
+      "seconds_per_step": 0.01834286623634398,
+      "step_seconds": [
+        0.013720357324928045,
+        0.014787720050662756,
+        0.01671695616096258,
+        0.01767258020117879,
+        0.017882688902318478,
+        0.01936529576778412,
+        0.020157114136964083,
+        0.020486866123974323,
+        0.020825740415602922,
+        0.0218133432790637
+      ],
+      "tokens": 1270,
+      "tokens_per_second": 6923.672580044562,
+      "peak_allocated_gib": 0.05631256103515625,
+      "peak_reserved_gib": 0.0625,
+      "last_loss": 1.3046875,
+      "configuration_sha256": "bb7303e8ad77f18681c4444ce0e50d9ddd58bdd5763e6dce654745434fbc6586"
+    },
+    {
+      "status": "ok",
+      "configuration": {
+        "geometry": {
+          "d_model": 256,
+          "layers": 4,
+          "heads": 4,
+          "d_head": 64,
+          "vocab": 512,
+          "max_seq_len": 128,
+          "rope_base": 10000.0,
+          "tie": true,
+          "image_side": 0,
+          "vision": "conv",
+          "patch": 16
+        },
+        "task": "pretrain",
+        "precision": "bf16",
+        "batch_size": 2,
+        "grad_accum": 1,
+        "strategy": "single",
+        "cards": 1,
+        "lora": null,
+        "grad_checkpoint": false,
+        "optimizer": "AdamW",
+        "declared_params_b": null
+      },
+      "parameters": 4327680,
+      "steps": 10,
+      "warmup_steps": 3,
+      "seconds_per_step": 0.027290574554353953,
+      "step_seconds": [
+        0.023566560819745064,
+        0.024815051816403866,
+        0.025541153270751238,
+        0.026429027784615755,
+        0.027100209146738052,
+        0.028351800050586462,
+        0.028512652032077312,
+        0.028885866049677134,
+        0.029574405401945114,
+        0.030129019170999527
+      ],
+      "tokens": 2540,
+      "tokens_per_second": 9307.24267069257,
+      "peak_allocated_gib": 0.05912017822265625,
+      "peak_reserved_gib": 0.064453125,
+      "last_loss": 1.3046875,
+      "configuration_sha256": "f2dde4fdf15c3d91012abab3f195b94e6ae3d2442f71dadb8bd6e44b25f5744e"
+    },
+    {
+      "status": "ok",
+      "configuration": {
+        "geometry": {
+          "d_model": 256,
+          "layers": 4,
+          "heads": 4,
+          "d_head": 64,
+          "vocab": 512,
+          "max_seq_len": 128,
+          "rope_base": 10000.0,
+          "tie": true,
+          "image_side": 0,
+          "vision": "conv",
+          "patch": 16
+        },
+        "task": "pretrain",
+        "precision": "bf16",
+        "batch_size": 4,
+        "grad_accum": 1,
+        "strategy": "single",
+        "cards": 1,
+        "lora": null,
+        "grad_checkpoint": false,
+        "optimizer": "AdamW",
+        "declared_params_b": null
+      },
+      "parameters": 4327680,
+      "steps": 10,
+      "warmup_steps": 3,
+      "seconds_per_step": 0.030132303992286325,
+      "step_seconds": [
+        0.04347327025607228,
+        0.026713299099355936,
+        0.027259981259703636,
+        0.030208854004740715,
+        0.029784156940877438,
+        0.029617105145007372,
+        0.020600318908691406,
+        0.02146965730935335,
+        0.04303639894351363,
+        0.029159998055547476
+      ],
+      "tokens": 5080,
+      "tokens_per_second": 16858.98297488452,
+      "peak_allocated_gib": 0.07811546325683594,
+      "peak_reserved_gib": 0.083984375,
+      "last_loss": 1.3046875,
+      "configuration_sha256": "eb113ffd58276ed269e99dd54b43b9c9f96634c7da95d3f281491ba53a7897d7"
+    }
+  ]
+}

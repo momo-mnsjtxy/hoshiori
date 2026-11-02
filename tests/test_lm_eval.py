@@ -300,3 +300,112 @@ def test_judge_import_flag_writes_builtin_folder(tmp_path):
     finally:
         for path in made:  # 内置目录留着干净，test_suite 的清单才对得上
             path.unlink(missing_ok=True)
+
+
+def test_fewshot_prefix_is_sent_without_evaluation_answer_leak(tmp_path):
+    """评分题答案留在判分字段，示范问题和答案进入真正发送的提示词。"""
+    body = """
+task: shots
+num_fewshot: 1
+target_delimiter: ' => '
+fewshot_delimiter: '\n\n'
+doc_to_text: '{{q}}'
+doc_to_target: '{{a}}'
+samples: [{q: test-question, a: secret-answer}]
+fewshot_config:
+  samples: [{q: demo-question, a: demo-answer}]
+"""
+    one = lm_eval.import_file(_write(tmp_path, body), tmp_path)
+    task = suite.read(one.path).tasks[0]
+    assert "demo-question => demo-answer" in task.prompt
+    assert task.prompt.endswith("test-question") and "secret-answer" not in task.prompt
+    assert task.answer == "secret-answer"
+    assert any("1-shot" in line for line in one.notes)
+
+
+def test_hf_dataset_and_training_split_are_separate(tmp_path, monkeypatch):
+    """Datasets 边界传入仓库、配置、revision 与正确 split，测试集不会被示范覆盖。"""
+    import sys
+    from types import SimpleNamespace
+    calls = []
+
+    def load_dataset(path, name, split, **options):
+        calls.append((path, name, split, options))
+        return [{"q": "held-out", "a": "held-out-label"}] if split == "validation" else [{"q": "demo", "a": "demo-label"}]
+
+    monkeypatch.setitem(sys.modules, "datasets", SimpleNamespace(load_dataset=load_dataset))
+    body = """
+task: hub
+dataset_path: organization/data
+dataset_name: subset
+validation_split: validation
+training_split: train
+dataset_kwargs: {revision: pinned-commit}
+num_fewshot: 1
+doc_to_text: '{{q}}'
+doc_to_target: '{{a}}'
+"""
+    imported = lm_eval.import_file(_write(tmp_path, body), tmp_path)
+    task = suite.read(imported.path).tasks[0]
+    assert calls == [("organization/data", "subset", "validation", {"revision": "pinned-commit"}),
+                     ("organization/data", "subset", "train", {"revision": "pinned-commit"})]
+    assert "demo-label" in task.prompt and "held-out-label" not in task.prompt
+    assert task.answer == "held-out-label"
+
+
+def test_fewshot_never_reuses_current_question(tmp_path):
+    """只有自己可供示范时明确报错，不能把正确答案偷偷拼到问题前面。"""
+    body = "task: leak\nnum_fewshot: 1\nsamples: [{input: q, target: a}]\n"
+    with pytest.raises(Failure, match="无泄漏示范"):
+        lm_eval.import_file(_write(tmp_path, body), tmp_path)
+
+
+def test_local_split_selection_prefers_test(tmp_path):
+    """data_files 字典里 train 排在前面也不会被误当测试集。"""
+    (tmp_path / "train.jsonl").write_text('{"input":"train","target":"train-label"}\n')
+    (tmp_path / "test.jsonl").write_text('{"input":"test","target":"test-label"}\n')
+    body = "task: split\ndataset_path: json\ndataset_kwargs:\n  data_files: {train: train.jsonl, test: test.jsonl}\n"
+    task = suite.read(lm_eval.import_file(_write(tmp_path, body), tmp_path).path).tasks[0]
+    assert task.prompt == "test" and task.answer == "test-label"
+
+
+def test_missing_test_split_never_falls_back_to_only_training_file(tmp_path):
+    """显式 test 不存在时必须失败，不能因只有一份 train 就自动拿来评分。"""
+    (tmp_path / "train.jsonl").write_text('{"input":"seen","target":"seen-label"}\n')
+    body = "task: wrong-split\ndataset_path: json\ntest_split: test\ndataset_kwargs:\n  data_files: {train: train.jsonl}\n"
+    with pytest.raises(Failure, match="没有 split test"):
+        lm_eval.import_file(_write(tmp_path, body), tmp_path)
+
+
+# ---------- 外部题面只能作为参数 ----------
+
+def test_backend_receives_shell_characters_without_executing(tmp_path):
+    import shlex  # 这里只引用可信 Python 路径和固定程序
+    import sys  # 让测试与当前解释器使用同一版本
+
+    marker = tmp_path / "command-executed"
+    prompt = f'引号 " 与单引号 \'\n第二行 $(touch {marker}) `touch {marker}` ; touch {marker}; # {{model}}'
+    program = "import sys; sys.stdout.write(sys.argv[1])"  # 程序自身固定，外部文本只在 argv[1]
+    template = f"{shlex.quote(sys.executable)} -c {shlex.quote(program)} {{prompt}}"
+    assert lm_eval.answer(template, prompt) == prompt  # 换行、引号与占位字面全部原样到达后端
+    assert not marker.exists()  # shell 命令替换和分号都没有执行
+    assert lm_eval.answer("echo {prompt}", "ordinary words").strip() == "ordinary words"  # 原有回声命令照常可用
+
+
+@pytest.mark.parametrize("template", [
+    "python -c 'print({prompt})'",
+    "python -c'print({prompt})'",
+    'sh -c "{prompt}"',
+    'bash -lc "{prompt}"',
+    'bash --command="{prompt}"',
+])
+def test_backend_rejects_direct_code_interpolation(template):
+    with pytest.raises(Failure, match="不要把占位符"):
+        lm_eval.answer(template, "untrusted text")  # 不让题面落入已知直接代码参数
+
+
+def test_backend_reports_invalid_template_and_missing_program():
+    with pytest.raises(Failure, match="不能启动"):
+        lm_eval.answer("echo 'unterminated", "text")  # 模板引号错误不能在主入口变成未知崩溃
+    with pytest.raises(Failure, match="不能启动"):
+        lm_eval.answer("/does-not-exist/ori-backend {prompt}", "text")  # shell=False 的 OSError 仍走原来的 input 出口

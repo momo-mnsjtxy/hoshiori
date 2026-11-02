@@ -55,7 +55,7 @@ ori spin sft.warp.yaml --dry-run
 ori import lmlab ../configs/sft_lora.yaml --out imported
 
 # 5. 评测，跟基线比
-ori judge sft.warp.yaml --suite zh-lite --answer-cmd 'ollama run {model} {prompt}' --baseline out/base/report.json
+ori judge sft.warp.yaml --suite zh-lite --answer-cmd 'ollama run my-model {prompt}' --baseline out/base/report.json
 
 # 6. 导出、起服务、看面板
 ori forge sft.warp.yaml --out out/gguf --format gguf --quant q8_0
@@ -116,7 +116,7 @@ docs/                命名与 PRD
 
 ## 已知慢点
 
-去重索引在百万条以上、而且开了 `--store` 的时候总时长偏长（一百一十万条约二十分钟），慢的是一遍里要挨个片查同一个键，跟条数一起线性涨。转冷本身已经挪到后台线程、不影响主流程，也不再是瓶颈。二十万条七十秒、内存比 16.5，这个量级没有影响。
+新建落盘索引已改为 v5 哈希前缀分片，位置表携带记录片号；查询只访问对应前缀，不再遍历全部片。旧 v4 目录保持原格式，可显式迁移。新布局节省内存，但目前仍未达到 110 万条十分钟的性能目标；具体布局、压测规模和实测耗时见 [索引说明](docs/INDEX.md)，不沿用旧布局的性能数字。
 
 ## 退出码
 
@@ -131,3 +131,10 @@ docs/                命名与 PRD
 ## 许可
 
 Apache-2.0。文档 CC-BY-4.0。
+
+
+补齐项的逐条状态、真实运行证据与尚需硬件的验收见 [功能补齐记录](docs/GAP_COMPLETION.md)。
+人工标注校准可运行 `ori quality fit labels.jsonl --annotator <来源> --out quality.json`，
+然后在 `ori weave` 加 `--quality-profile quality.json`。仓库附带 OASST1 人工投票的
+[校准档案](docs/evidence/quality/oasst1-profile.json)，使用范围和独立留出误差见补齐记录。
+奖励执行的资源限制**不是安全边界**；详细信任要求见 [插件说明](docs/PLUGIN.md)。

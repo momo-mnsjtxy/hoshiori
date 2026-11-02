@@ -217,3 +217,36 @@ def test_spin_dry_run_missing_data(tmp_path, capsys):
 def test_doctor_runs(capsys):
     main.run(["doctor"])
     assert "python" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("framework", ["axolotl", "llama-factory"])
+def test_framework_migration_cli_produces_valid_recipe(framework, tmp_path):
+    """两家配置真实经过命令入口，迁出的配方能校验，未知项不丢失。"""
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "train.jsonl").write_text('{"text":"training sample"}\n')
+    if framework == "axolotl":
+        body = {"base_model": "base", "adapter": "lora", "micro_batch_size": 2, "num_epochs": 1,
+                "learning_rate": "2e-4", "lora_r": 4, "lora_target_modules": ["q_proj"],
+                "datasets": [{"path": "data/train.jsonl"}], "bf16": True, "custom_field": 42}
+    else:
+        (data / "dataset_info.json").write_text(json.dumps({"demo": {"file_name": "train.jsonl"}}))
+        body = {"model_name_or_path": "base", "stage": "sft", "finetuning_type": "lora", "lora_rank": 4,
+                "lora_target": "all", "dataset": "demo", "dataset_dir": "data", "per_device_train_batch_size": 2,
+                "learning_rate": "2e-4", "bf16": True, "custom_field": 42}
+    source = tmp_path / "source.yaml"
+    source.write_text(json.dumps(body))
+    out = tmp_path / "imported"
+    assert main.run(["import", framework, str(source), "--out", str(out)]) == 0
+    imported = recipe.load(out / "source.warp.yaml")
+    recipe.check(imported)
+    assert imported["train"]["lr"] == 0.0002 and imported["train"]["precision"] == "bf16"
+    assert imported["data"]["files"] == [str(data / "train.jsonl")]
+    assert "custom_field" in (out / "source.diff.md").read_text()
+
+
+def test_unresolved_factory_dataset_blocks_instead_of_guessing(tmp_path):
+    """注册表缺失时不把数据集名字当作本地文件，报告标为阻塞。"""
+    job = migration.convert({"model_name_or_path": "base", "dataset": "not-registered"}, str(tmp_path / "task.yaml"), "llama-factory")
+    assert job.blocked
+    assert "dataset_info.json" in job.report()

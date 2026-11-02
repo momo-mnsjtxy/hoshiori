@@ -36,6 +36,7 @@ class Adapter:
             import json
 
             data = json.loads(config.read_text(encoding="utf-8"))
+        self.variant = data.get("variant") or ("loha" if data.get("peft_type") == "LOHA" else "dora" if data.get("use_dora") else "lora")  # 配置决定实际权重公式
         self.r = int(r or data.get("r") or 16)  # 秩数，缺了就按 16
         self.alpha = float(alpha or data.get("lora_alpha") or self.r)  # 缩放分子，缺了就按 r，倍数等于 1
 
@@ -44,24 +45,56 @@ class Adapter:
         """增量要乘的倍数。"""
         return self.alpha / self.r
 
-    def pairs(self) -> dict:
-        """读出全部 A/B 对，返回 基座名 → (A, B)。"""
-        from safetensors.numpy import load_file  # 只有这里要库
+    def tensors(self) -> dict:
+        """读出挂件张量；三种变体都复用同一文件读取路径。"""
+        from features.forge import read_tensors                                   # 共用 BF16 位解码，不让 numpy 假装支持 bfloat16
+        files = sorted(self.path.glob("*.safetensors")) if self.path.is_dir() else [self.path]
+        if not files:
+            fail("input", f"adapter 里没有 safetensors: {self.path}")
+        state = {}                                                               # 张量保留磁盘上的完整名称
+        for path in files:
+            state.update({name: value.astype(np.float32) for name, value in read_tensors(path).items()})
+        return state
 
-        files = sorted(self.path.glob("*.safetensors")) if self.path.is_dir() else [self.path]  # 目录全收
-        if not files:  # 一个权重都没有
-            fail("input", f"adapter 里没有 safetensors: {self.path}", hint="指到 adapter 目录或 .safetensors 文件")
-        found = {}
-        for one in files:  # 逐个文件往里并
-            for name, tensor in load_file(str(one)).items():
-                if SUFFIX_A in name:  # A 矩阵先记下，等它的 B
-                    found.setdefault(_base(name, SUFFIX_A), [None, None])[0] = tensor.astype(np.float32)
-                elif SUFFIX_B in name:  # B 矩阵补上另一半
-                    found.setdefault(_base(name, SUFFIX_B), [None, None])[1] = tensor.astype(np.float32)
-        for name, pair in found.items():  # 缺一半的对就是坏 adapter
-            if pair[0] is None or pair[1] is None:
-                fail("input", f"adapter 里 {name} 只配了一半", hint="A 和 B 要成对出现")
+    def pairs(self) -> dict:
+        """兼容标准 LoRA 的旧接口，返回基座权重名到 A/B 的映射。"""
+        state = self.tensors()                                                   # 读取一次全部张量
+        found = {}                                                               # 每层都必须有完整的一对
+        for name in state:
+            if name.endswith(SUFFIX_A):
+                base = _base(name, SUFFIX_A)
+                if base + SUFFIX_B not in state:
+                    fail("input", f"adapter 里 {base} 只配了一半")
+                found[base] = (state[name], state[base + SUFFIX_B])
+            elif name.endswith(SUFFIX_B) and _base(name, SUFFIX_B) + SUFFIX_A not in state:
+                fail("input", f"adapter 里 {_base(name, SUFFIX_B)} 只配了一半")
         return found
+
+    def apply(self, base: dict) -> None:
+        """按存档变体更新一份 fp32 基座；缺张量在读取边界明确报错。"""
+        state = self.tensors()                                                   # 不把 LoHa 当 LoRA 配对而静默跳过
+        first = ".hada_w1_a" if self.variant == "loha" else SUFFIX_A
+        names = [name[:-len(first)] for name in state if name.endswith(first)]
+        if not names:
+            fail("input", f"adapter 没有 {self.variant} 权重: {self.path}")
+        suffixes = [".hada_w1_a", ".hada_w1_b", ".hada_w2_a", ".hada_w2_b"] if self.variant == "loha" else [SUFFIX_A, SUFFIX_B]
+        if self.variant == "dora":
+            suffixes.append(".lora_magnitude_vector")                            # DoRA 缺幅值就不能重建有效权重
+        for name in names:
+            if name not in base:
+                fail("input", f"基座里没有 {name}", hint=f"核对 {self.path} 挂载的基座")
+            missing = [suffix for suffix in suffixes if name + suffix not in state]
+            if missing:
+                fail("input", f"adapter 里 {name} 缺少 {missing[0]}")
+            if self.variant == "loha":
+                delta = (state[name + suffixes[0]] @ state[name + suffixes[1]]) * (state[name + suffixes[2]] @ state[name + suffixes[3]])
+            else:
+                delta = state[name + SUFFIX_B] @ state[name + SUFFIX_A]             # 常规低秩方向更新
+            weight = base[name] + delta * self.scale                              # 先合方向，再处理 DoRA 幅值
+            if self.variant == "dora":
+                norm = np.maximum(np.linalg.norm(weight, axis=1), 1e-12)
+                weight *= (state[name + ".lora_magnitude_vector"] / norm)[:, None]
+            base[name] = weight                                                   # 后一个挂件以此结果为起点
 
 
 def _base(name: str, suffix: str) -> str:
@@ -72,9 +105,6 @@ def _base(name: str, suffix: str) -> str:
 def merge(base: dict, adapters: list) -> dict:
     """把每个 adapter 的增量加进去，返回新字典，不动传进来的基座。"""
     out = {name: one.astype(np.float32) for name, one in base.items()}  # 拷成 fp32，下面直接改
-    for adapter in adapters:  # 一个 adapter 一趟
-        for name, (left, right) in adapter.pairs().items():  # 一对一对来
-            if name not in out:  # 基座里没有这个权重
-                fail("input", f"基座里没有 {name}", hint=f"核对 {adapter.path} 是不是挂在别的模型上")
-            out[name] += right @ left * adapter.scale  # B@A 是低秩增量，乘 alpha/r 再加
+    for adapter in adapters:                                                     # 顺序叠加，DoRA 的归一使次序有意义
+        adapter.apply(out)                                                       # 每个挂件知道自己的权重公式
     return out

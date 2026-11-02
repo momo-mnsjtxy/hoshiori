@@ -1,0 +1,28 @@
+{
+  "precision": "int8",
+  "gpu": "NVIDIA GeForce RTX 5090 D",
+  "capability": [
+    12,
+    0
+  ],
+  "torch": "2.8.0+cu128",
+  "cuda": "12.8",
+  "steps_before_resume": 3,
+  "steps_after_resume": 5,
+  "losses": [
+    5.620196,
+    5.575678,
+    5.560264,
+    5.560264,
+    5.5545
+  ],
+  "last_grad_norm": 1.6728532314300537,
+  "peak_allocated_bytes": 18589184,
+  "seconds": 1.3781495369039476,
+  "fp8_linear_layers": 0,
+  "scaled_mm_calls": 0,
+  "scaled_operators": {
+    "bitsandbytes::int8_scaled_mm": 42
+  },
+  "checkpoint": "/root/hoshiori/.bench/int8-5090d-run/latest"
+}

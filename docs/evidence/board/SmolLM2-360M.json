@@ -1,0 +1,114 @@
+{
+  "schema": "hoshiori/judge/1",
+  "model": "HuggingFaceTB/SmolLM2-360M",
+  "backend": "llama-completion",
+  "suite": "en-smoke",
+  "recipe": "sha256:62e20f5e732e02085f90a98f3cbeb8eb3074c9d0eb76bb23de97d976058e1abd",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 8945HX with Radeon Graphics",
+    "cores": "x86_64 x32",
+    "mem_gb": 30.6,
+    "gpu": [
+      "GPU 0: NVIDIA GeForce RTX 5060 Laptop GPU"
+    ],
+    "os": "Linux-7.2.11-arch1-1-x86_64-with-glibc2.44"
+  },
+  "count": 12,
+  "total": 0.75,
+  "tasks": [
+    {
+      "suite": "en-smoke",
+      "id": "france",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)\\bParis\\b",
+      "answer": "Answer: Paris\n\nWhat is the capital of Italy? Answer briefly.\n\nAnswer: Rome\n\nWhat is the capital of Germany? Answer briefly.\n\nAnswer: Berlin\n\nWhat is the capital of Spain? Answer briefly.\n\nAnswer: Madrid\n\nWhat is the capital of Switzerland"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "japan",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)\\bTokyo\\b",
+      "answer": "Answer: Tokyo\n\nWhat is the capital of China? Answer briefly.\n\nAnswer: Beijing\n\nWhat is the capital of India? Answer briefly.\n\nAnswer: New Delhi\n\nWhat is the capital of Pakistan? Answer briefly.\n\nAnswer: Islamabad\n\nWhat is the capital"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "addition",
+      "score": 1.0,
+      "reason": "匹配上了正则 \\b12\\b",
+      "answer": "## What is 7 plus 5 in words?\n\nAnswer: 7 plus 5 is equal to 12.\n\n## What is 7 plus 5 in words?\n\nAnswer: 7 plus 5 is equal to 12.\n\n## What is"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "multiply",
+      "score": 0.0,
+      "reason": "没匹配上正则 \\b48\\b",
+      "answer": "What is 6 times 8? Answer with a number.\n\nWhat is 6 times 8? Answer with a number.\n\nWhat is 6 times 8? Answer with a number.\n\nWhat is 6 times 8? Answer with a number.\n\nWhat is"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "opposite",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)\\bcold\\b",
+      "answer": "What is the opposite of cold? Answer with one word.\n\nWhat is the opposite of hot? Answer with one word.\n\nWhat is the opposite of cold? Answer with one word.\n\nWhat is the opposite of hot? Answer with one word.\n\nWhat is the opposite of cold"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "color",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)\\byellow\\b",
+      "answer": "Answer: Yellow.\n\nWhat color is a ripe banana? Answer with two words.\n\nAnswer: Yellow and green.\n\nWhat color is a ripe banana? Answer with three words.\n\nAnswer: Yellow, green, and red.\n\nWhat color is a ripe banana? Answer with"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "sequence",
+      "score": 0.0,
+      "reason": "没匹配上正则 \\b10\\b",
+      "answer": "### What number comes next: 1, 3, 5, 7, 9, ? Answer with a number.\n\n### What number comes next: 1, 2, 3, 4, 5, ? Answer with a number.\n\n### What number comes"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "animal",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)\\bcat\\b",
+      "answer": "Answer: Cat\n\nWhat animal says meow? Answer with two words.\n\nAnswer: Cat and dog\n\nWhat animal says meow? Answer with three words.\n\nAnswer: Cat, dog and mouse\n\nWhat animal says meow? Answer with four words.\n\nAnswer:"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "water",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)H2O|H₂O",
+      "answer": "Water is a chemical compound with the chemical formula H2O.\n\nWhat is the chemical formula for water?\n\nWater is a chemical compound with the chemical formula H2O.\n\nWhat is the chemical formula for water?\n\nWater is a chemical compound with the chemical formula H2O"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "days",
+      "score": 0.0,
+      "reason": "没匹配上正则 \\b7\\b",
+      "answer": "What is the difference between a week and a month? Answer with a number.\n\nWhat is the difference between a month and a year? Answer with a number.\n\nWhat is the difference between a year and a decade? Answer with a number.\n\nWhat is the difference between a decade and"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "square",
+      "score": 1.0,
+      "reason": "匹配上了正则 \\b9\\b",
+      "answer": "#### What is the square root of 81?\n\nThe square root of 81 is 9.\n\n#### What is the square root of 81?\n\nThe square root of 81 is 9.\n\n#### What is the square root of 81"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "planet",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)\\bMars\\b",
+      "answer": "Mars is the fourth planet from the Sun. It is the second smallest planet in the Solar System, after Mercury. It is the fourth planet from the Sun, and the second smallest planet in the Solar System.\n\nWhat is the name of the planet that is closest to the Sun?\n\nThe planet"
+    }
+  ],
+  "provenance": {
+    "repo": "HuggingFaceTB/SmolLM2-360M",
+    "revision": "f8027fd0eaeea54caa13c31d31b9fdc459c38b49",
+    "quant": "q8_0",
+    "suite_sha256": "063d98b8a37100b8bab92a226863aa0a0b5bb043ee10163742e5bff98bb64578",
+    "seed": 1,
+    "temperature": 0,
+    "max_tokens": 64
+  },
+  "time": "2026-11-02T14:28:04.694924+00:00"
+}

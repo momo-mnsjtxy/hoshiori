@@ -1,0 +1,10 @@
+{
+  "count": 200000,
+  "layout": "hash-prefix-v5",
+  "disk_peak_kib": 47928,
+  "disk_seconds": 164.61,
+  "memory_peak_kib": 3628588,
+  "memory_seconds": 56.87,
+  "memory_ratio": 75.70914705391421,
+  "includes_save_close": true
+}

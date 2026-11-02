@@ -61,7 +61,7 @@ def command(args) -> int:
             fail("input", f"训练数据不在: {one}", hint="先用 ori weave 出 bolt/，或把相对路径改成相对配方的")
         files.append(found)
 
-    table = plan.build(data)
+    table = plan.build(data, base_dir=Path(args.recipe).parent)
     print(table.show())
     print(f"\n配方哈希 {recipe.stamp(data)}")
     if args.dry_run:  # 只出账就停
@@ -95,7 +95,10 @@ def command(args) -> int:
 
     if not _has_cuda():  # 没卡就明说，跑到一半才发现更费劲
         logs.warn("spin", "没有可用的卡，按 CPU fp32 跑", precision=precision)
-    net = model.Model(geo, precision, float((data.get("train") or {}).get("align_weight") or 0.0))  # 搭架子，顺手带上对齐权重
+    if _has_cuda() and "LOCAL_RANK" in os.environ:
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))  # 分配模型之前认领本rank的卡，不能先全挤到cuda:0
+    torch.manual_seed(int(train.get("seed", 42)))  # 从随机权重起时，各rank与再次启动必须使用同一基座
+    net = model.Model(geo, precision, float(train.get("align_weight") or 0.0), align_queue=train.get("align_queue", 1024), align_temperature=train.get("align_temperature", 0.07))  # 搭架子，顺手带上对齐权重
     base = (data.get("model") or {}).get("path")  # 基座权重
     loaded = None  # 真载进来的基座目录
     if base:
@@ -117,7 +120,7 @@ def command(args) -> int:
     if quant and not low:  # 量化层自己没梯度，全量训等于没东西可训
         fail("input", f"{precision} 只能训 LoRA，配方里要写 train.lora", where="train.lora", hint="例: lora: {r: 16, alpha: 32}")
     if low:
-        low = {"r": int(low.get("r") or 16), "alpha": float(low.get("alpha") or 32), "dropout": float(low.get("dropout") or 0.0), "target": low.get("target")}
+        low = {"r": int(low.get("r") or 16), "alpha": float(low.get("alpha") or 32), "dropout": float(low.get("dropout") or 0.0), "target": low.get("target"), "variant": low.get("variant", "lora")}
     choice = trainer.Choice(
         out=out,
         files=files,
@@ -139,6 +142,10 @@ def command(args) -> int:
         strategy=train.get("strategy") or "single",  # 单卡 single，多卡 ddp / fsdp2
         devices=train.get("devices"),  # 只记账，真分配在 torchrun
         grad_checkpoint=bool(train.get("grad_checkpoint")),  # 前向重算换显存
+        health_limits=train.get("health_limits") or {},  # 停机阈值与动作分开配置
+        eval_files=[Path(path) if Path(path).is_absolute() else Path(args.recipe).parent / path for path in (data.get("eval") or {}).get("files", [])],  # 验证集路径随配方解析
+        eval_every=(data.get("eval") or {}).get("every", 50),  # 验证周期不占训练步数
+        curriculum_by=train.get("curriculum_by", "length"),  # 默认保持既有长度课程
         health=train.get("health") or "stop",  # 指标坏了停还是喊
         curriculum=bool(train.get("curriculum")),  # 先短后长地放进课程
         task=task,  # 任务族，决定读什么数据、算哪种损失

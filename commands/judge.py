@@ -50,7 +50,10 @@ def command(args) -> int:
 
     contest = None                                                            # 普通评测没有擂台附表
     if args.arena is not None:                                                # 两个后端走同一批题的成对擂台
-        rows, contest = fight(found, args.answer_cmd, args.arena, args.limit)
+        rows, contest = fight(found, args.answer_cmd, args.arena, args.limit,
+                              k=getattr(args, "elo_k", arena.ELO_K), initial=getattr(args, "elo_initial", arena.ELO_INITIAL),
+                              min_matches=getattr(args, "arena_min_matches", 30), window=getattr(args, "arena_window", 10),
+                              tolerance=getattr(args, "arena_tolerance", 0.0))
     else:                                                                     # 一个后端走普通逐题评测
         rows = score(found, args.answer_cmd or "", args.limit)
 
@@ -92,10 +95,10 @@ def score(found: list, backend_cmd: str, limit: int) -> list:
     return rows                                                              # 已按套件、题目顺序排好
 
 
-def fight(found: list, first_backend: str, second_backend: str, limit: int) -> tuple:
+def fight(found: list, first_backend: str, second_backend: str, limit: int, **settings) -> tuple:
     """让两个后端对打，打印逐题比分和最终排名，并返回 A 方报告行与擂台附表。"""
     suites = [one for _, one in found]                                        # 路径名已经完成检查，擂台只需套件对象
-    contest = arena.run(first_backend, second_backend, suites, limit)         # 两方乱序答同一批题
+    contest = arena.run(first_backend, second_backend, suites, limit, **settings)         # 两方乱序答同一批题
     rows = []                                                                 # 普通报告主体沿用 A 方结果，保持旧格式可读
     current = None                                                           # 打印时套件切换才出一次标题
     for match in contest["matches"]:                                         # 每道题就是一场对局

@@ -10,7 +10,7 @@
   GET  /v1/models            报出身上挂的这一个模型
 
 后端抽成一个纯函数 answer(model, messages, options)：默认拿外部命令，把模板里的 {prompt}
-换成最后一条消息。换 vllm / llama.cpp 只换这一个函数，接口和字段都不动。
+先在可信模板内拆出独立参数，再换成最后一条消息；不执行 shell 管道/重定向。换 vllm / llama.cpp 只换这一个函数，接口和字段都不动。
 
 网关自己真干的事只有四件：设了 token 就验 Authorization；按 IP+自然分钟限流，超了回 429；
 每个请求一行 JSON 落日志；一个请求一个线程。计数和日志两个线程都会改，所以都要过锁。
@@ -43,6 +43,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from utils import command  # 外部输入只填入已解析的参数，不能进入系统 shell
 from utils.fail import fail
 
 PIECE = 8  # 流式一块吐几个字。太小 HTTP 头开销大，太大不像逐字
@@ -51,12 +52,17 @@ PIECE = 8  # 流式一块吐几个字。太小 HTTP 头开销大，太大不像�
 # --- 后端 ---
 
 def answer(model: str, messages: list, options: dict) -> str:
-    """默认后端：把最后一条消息填进外部命令，跑它，它的输出就是回复。"""
-    prompt = messages[-1]["content"]                                            # 只把最后一条当问题，历史上下文由模板自己接
-    command = options["answer_cmd"]                                             # 命令模板由命令层给，这里不兜底
-    command = command.replace("{prompt}", prompt)                               # 填问题占位
-    command = command.replace("{model}", model)                                 # 填模型占位
-    done = subprocess.run(command, shell=True, capture_output=True, text=True)  # 起外部命令，收输出
+    """默认后端：固定模板先拆 argv，再填消息与模型；不执行 shell 管道或重定向。
+
+    题面应作为独立参数传入固定程序；不要把 {prompt}/{model} 嵌入 python -c 或 sh -c 源码。
+    后端自行 eval 参数的行为不属于 argv 传递保证。
+    """
+    prompt = messages[-1]["content"]                                           # 只发送最后一条，历史语义保持原样
+    try:
+        arguments = command.argv(options["answer_cmd"], prompt=prompt, model=model)  # 模型名也来自外部请求，和题面同样按数据传递
+        done = subprocess.run(arguments, shell=False, capture_output=True, text=True)
+    except (ValueError, OSError) as error:                                     # 网关的既有错误出口统一接 RuntimeError
+        raise RuntimeError(f"后端命令不能启动: {error}") from error
     if done.returncode:                                                         # 外部命令自己的故障要连它的 stderr 一起报
         raise RuntimeError(f"后端命令失败({done.returncode}): {done.stderr.strip() or '没给输出'}")
     return done.stdout.strip()                                                  # 命令的标准输出就是回复正文

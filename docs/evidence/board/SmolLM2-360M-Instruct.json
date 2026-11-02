@@ -1,0 +1,114 @@
+{
+  "schema": "hoshiori/judge/1",
+  "model": "HuggingFaceTB/SmolLM2-360M-Instruct",
+  "backend": "llama-completion",
+  "suite": "en-smoke",
+  "recipe": "sha256:bc33670680793b4092c649827d5d1f9e288ad64145b1fb53023d6807e1881662",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 8945HX with Radeon Graphics",
+    "cores": "x86_64 x32",
+    "mem_gb": 30.6,
+    "gpu": [
+      "GPU 0: NVIDIA GeForce RTX 5060 Laptop GPU"
+    ],
+    "os": "Linux-7.2.11-arch1-1-x86_64-with-glibc2.44"
+  },
+  "count": 12,
+  "total": 0.9167,
+  "tasks": [
+    {
+      "suite": "en-smoke",
+      "id": "france",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)\\bParis\\b",
+      "answer": "The capital of France is Paris."
+    },
+    {
+      "suite": "en-smoke",
+      "id": "japan",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)\\bTokyo\\b",
+      "answer": "The capital of Japan is Tokyo."
+    },
+    {
+      "suite": "en-smoke",
+      "id": "addition",
+      "score": 1.0,
+      "reason": "匹配上了正则 \\b12\\b",
+      "answer": "7 plus 5 equals 12."
+    },
+    {
+      "suite": "en-smoke",
+      "id": "multiply",
+      "score": 1.0,
+      "reason": "匹配上了正则 \\b48\\b",
+      "answer": "6 times 8 equals 48."
+    },
+    {
+      "suite": "en-smoke",
+      "id": "opposite",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)\\bcold\\b",
+      "answer": "Cold."
+    },
+    {
+      "suite": "en-smoke",
+      "id": "color",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)\\byellow\\b",
+      "answer": "Yellow"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "sequence",
+      "score": 0.0,
+      "reason": "没匹配上正则 \\b10\\b",
+      "answer": "To find the next number in the sequence, let's analyze the pattern. The differences between consecutive numbers are increasing by 2 each time. \n\nStarting from 2, the next difference would be 4, then 6, and so on. Since the differences are increasing by 2, the next difference would"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "animal",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)\\bcat\\b",
+      "answer": "Cat"
+    },
+    {
+      "suite": "en-smoke",
+      "id": "water",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)H2O|H₂O",
+      "answer": "The chemical formula for water is H2O. This formula represents the molecular formula of water, which is the simplest formula for a compound that contains two hydrogen atoms bonded to a single oxygen atom."
+    },
+    {
+      "suite": "en-smoke",
+      "id": "days",
+      "score": 1.0,
+      "reason": "匹配上了正则 \\b7\\b",
+      "answer": "There are 7 days in a week."
+    },
+    {
+      "suite": "en-smoke",
+      "id": "square",
+      "score": 1.0,
+      "reason": "匹配上了正则 \\b9\\b",
+      "answer": "The square root of 81 is 9."
+    },
+    {
+      "suite": "en-smoke",
+      "id": "planet",
+      "score": 1.0,
+      "reason": "匹配上了正则 (?i)\\bMars\\b",
+      "answer": "The planet known as the Red Planet is Mars. It is named after the Roman god of war, Mars, due to its reddish appearance due to the presence of iron oxide, or rust, on its surface."
+    }
+  ],
+  "provenance": {
+    "repo": "HuggingFaceTB/SmolLM2-360M-Instruct",
+    "revision": "a10cc1512eabd3dde888204e902eca88bddb4951",
+    "quant": "q8_0",
+    "suite_sha256": "063d98b8a37100b8bab92a226863aa0a0b5bb043ee10163742e5bff98bb64578",
+    "seed": 1,
+    "temperature": 0,
+    "max_tokens": 64
+  },
+  "time": "2026-11-02T14:27:14.675619+00:00"
+}

@@ -1,32 +1,14 @@
 #!/usr/bin/env python
-"""落盘索引的压测：同一批语料，纯内存跑一遍、落盘跑一遍，各自在独立子进程里量峰值内存。
+"""同一语料分别跑纯内存与默认 v5 前缀索引，子进程测耗时和 VmHWM。
 
-调用示例：
-  python tests/stress_index.py             # 默认 20 万条
-  python tests/stress_index.py 1000000     # 100 万条，进度每 10 万条一行
-  python tests/stress_index.py 200000      # 二十万，一两分钟
-  python tests/stress_index.py 200000 190000  # 二十万条，温层上限压到十九万：末尾转冷一片
-  python tests/stress_index.py 1200000 --no-pack  # 冷片不压 zlib：省 CPU，占盘多，看吞吐上限
-
-第八个参数 --no-pack 可以出现在任意位置，走的是 features.index 的 COLD_PACK。
-转冷在后台线程里做（见 features/index.py），所以这里的耗时量的是主流程不被转冷挡住的样子。
-
-为什么先落语料文件：100 万条要是每次现摇随机词，光造数就能吃掉大半时间，
-两种模式还各摇一遍。先写一次文件，两个子进程都读它，才量的是索引本身的代价。
-
-为什么开子进程：VmHWM 是进程级的只升不降高水位。两种模式挤在一个进程里，
-后跑的那种会把前一种的峰值一起算进来，量不出差，所以一种一个子进程。
-
-输出：每 10 万条一行进度；结束时把落盘模式的峰值分成两段报：热层跑完（首次转冷那一刻）、
-转冷之后（跑完那一刻），再报内存比（纯内存 ÷ 落盘，越大越省）和落盘模式的热层峰值条数。
-分成两段是为了看清内存到底是涨在哪一层：热层段只跟热层容量有关，段数一多就该是平的；
-转冷段涨，就是转冷时攒在内存里的键缓冲没管住。两句都该是平的，才说明曲线走平。
-默认温层上限 100 万条，二十万条以内不会转冷，转冷段就是空的；想看转冷那一段要传第二个参数。
-温层上限压到比一片稍小，就在末尾转一片冷出来；压得太低（比如两万）会摊出十几个冷片，
-每查一个键都要把这十几个冷片各翻一个桶，整体慢好几倍。
+调用：python tests/stress_index.py 200000；百万级可用 --disk-only 避免纯内存基线耗尽机器。
+--json /tmp/index.json 保存实测数字。--directory 指定有足够空间的临时工作盘。
+旧位置参数 warm 与 --no-pack 仍接受，但 v5 不做转冷，因此不改变新布局行为。
+耗时包含 save 与 close；完成后重开抽查首条候选，避免只测未提交的写入。
 """
 
-import os
+import argparse  # 压测参数与输出位置由命令行明确指定
+import json      # 保存机器可读的实测记录
 import random
 import subprocess
 import sys
@@ -71,10 +53,20 @@ with open({corpus!r}, encoding="utf-8") as lines:
         if seen % {step} == 0:  # 打点走 stderr，跟最后的结果行分开
             print(f"  {{seen}} 条 · {{time.perf_counter() - started:.0f}} s", file=sys.stderr, flush=True)
 spent = time.perf_counter() - started
-dup._index.settle()  # 后台排着的片搬完，峰值和耗时才是整轮的数
+dup._index.settle()  # 旧布局等后台，新布局没有待搬任务
+if dup._index.store:
+    dup.save()  # 耗时包含持久化，不能只量尚未提交的写入
 spent = time.perf_counter() - started
 assert dup.result.kept == {count}, dup.result.kept  # 语料互不重复，一条都不该判掉
 hot_rows = len(dup._index._order) if dup._index.store else -1  # 纯内存没有热层淘汰
+dup.close()  # 关闭也算在本轮耗时里
+spent = time.perf_counter() - started
+if {store!r}:
+    back = duplicate.Duplicate(duplicate.Rule(), store={store!r})
+    with open({corpus!r}, encoding="utf-8") as source:
+        first = next(source).rstrip("\\n")
+    assert back.check(first) is not None  # 重开确实命中已保存的首条语料
+    back.close()
 print(hot_rows, before_cold[0] if before_cold else 0, peak(), round(spent, 2), flush=True)
 """
 
@@ -109,34 +101,46 @@ def run(store, hot: int, count: int, corpus: Path, warm: int = 0, no_pack: bool 
 
 def main() -> None:
     """跑两种模式并打印对比。第一个参数是语料条数，第二个是温层上限（不给就用默认），--no-pack 不压冷片。"""
-    given = [one for one in sys.argv[1:] if one != "--no-pack"]  # 标志位挪出去，剩下的是位置参数
-    no_pack = len(given) != len(sys.argv) - 1  # 参数被挪掉过，就是给了标志
-    count = int(given[0]) if given else 200_000
-    warm = int(given[1]) if len(given) > 1 else 0  # 0 就是默认温层上限
+    parser = argparse.ArgumentParser(description=__doc__)  # 参数错误在启动时直接报清
+    parser.add_argument("count", type=int, nargs="?", default=200_000)
+    parser.add_argument("warm", type=int, nargs="?", default=0)
+    parser.add_argument("--no-pack", action="store_true")
+    parser.add_argument("--disk-only", action="store_true")
+    parser.add_argument("--json", type=Path)
+    parser.add_argument("--directory", type=Path)
+    args = parser.parse_args()
+    count, warm, no_pack = args.count, args.warm, args.no_pack
+    if count < 1:
+        parser.error("count 必须大于零")
     hot = 50_000  # 和默认热层一样，这个数就是落盘模式的内存地板
-    print(f"语料 {count} 条 · 冷片{'不压' if no_pack else '压'} zlib · 纯内存与落盘各跑一个子进程，量 VmHWM")
+    print(f"语料 {count} 条 · v5 哈希前缀布局 · 每种模式独立子进程量 VmHWM")
 
-    held = tempfile.mkdtemp(prefix="stress-index-")  # 落盘模式的目录，跑完删
+    held = tempfile.mkdtemp(prefix="stress-index-", dir=args.directory)  # 落盘模式的目录，跑完删
     corpus = Path(held) / "corpus.txt"
     try:
         print("摇语料…", flush=True)
         make_corpus(corpus, count)
-        print(f"语料 {corpus.stat().st_size / 1e6:.0f} MB，纯内存跑起", flush=True)
-        _, _, memory_peak, memory_spent = run(None, hot, count, corpus)  # 纯内存：全留在内存里
+        print(f"语料 {corpus.stat().st_size / 1e6:.0f} MB", flush=True)
+        memory_peak = memory_spent = None  # disk-only 不捏造内存基线
+        if not args.disk_only:
+            print("纯内存跑起", flush=True)
+            _, _, memory_peak, memory_spent = run(None, hot, count, corpus)
         print("落盘跑起", flush=True)
-        hot_rows, before_cold, disk_peak, disk_spent = run(held, hot, count, corpus, warm, no_pack)  # 落盘：热层封顶
+        hot_rows, before_cold, disk_peak, disk_spent = run(Path(held) / "index", hot, count, corpus, warm, no_pack)  # 落盘：热层封顶
     finally:
         import shutil
 
         shutil.rmtree(held, ignore_errors=True)  # 100 万条能摊出好几个 G，别留着
 
-    print(f"纯内存  峰值 {memory_peak / 1024:8.1f} MB  耗时 {memory_spent:6.2f} s  {count / memory_spent:8.0f} 条/秒")
-    print(f"落盘    热层段峰值 {before_cold / 1024:8.1f} MB  转冷段峰值 {disk_peak / 1024:8.1f} MB  耗时 {disk_spent:6.2f} s  {count / disk_spent:8.0f} 条/秒")
-    if before_cold:  # 这一轮转过冷，两段能分开看
-        print(f"        转冷这一段涨了 {(disk_peak - before_cold) / 1024:.1f} MB")
-    else:
-        print("        这一轮没转冷（语料没到温层上限），转冷段就是跑完那一刻的数")
-    print(f"内存比 {memory_peak / disk_peak:.1f}  热层峰值 {hot_rows} 条")
+    if memory_peak is not None:
+        print(f"纯内存  峰值 {memory_peak / 1024:.1f} MiB  耗时 {memory_spent:.2f} s")
+        print(f"内存比 {memory_peak / disk_peak:.1f}")
+    print(f"v5 前缀  峰值 {disk_peak / 1024:.1f} MiB  耗时 {disk_spent:.2f} s  {count / disk_spent:.0f} 条/秒")
+    result = {"count": count, "layout": "hash-prefix-v5", "disk_peak_kib": disk_peak,
+              "disk_seconds": disk_spent, "memory_peak_kib": memory_peak, "memory_seconds": memory_spent,
+              "memory_ratio": memory_peak / disk_peak if memory_peak else None, "includes_save_close": True}
+    if args.json:
+        args.json.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")  # 实测不混进历史报告
 
 
 if __name__ == "__main__":

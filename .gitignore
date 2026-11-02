@@ -11,3 +11,5 @@ dist/
 .probe/
 .bench/
 .work/
+
+.playwright-cli/

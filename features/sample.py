@@ -11,6 +11,7 @@ image_at 可给每张图在清理后正文里的插入下标，数量要与 imag
   sample.read({"text": ""}, policy)                                               # 抛 Refused("too_short")
 """
 
+import math                                # 难度必须是有限数，NaN 无法排序
 import re                                  # 清理控制符和多余空白
 import unicodedata                         # 统一字符的 Unicode 表示
 from dataclasses import dataclass          # 把样本规矩集中成一份数据
@@ -43,7 +44,8 @@ class Policy:
     max_chars: int = 0  # 0 表示不限长
     max_images: int = 4  # 一条样本最多带几张图片
     min_score: float = 0.0  # 质量分低于此线拒收；0 表示不筛
-    scrub: bool = True  # 默认替换邮箱、手机号、身份证号、密钥和 IP
+    scrub: bool = True  # 默认替换敏感片段
+    quality_weights: dict = None  # 人工标注校准权重；None 保持启发式默认
 
 
 def text_of(record: dict, policy: Policy) -> str:
@@ -90,7 +92,7 @@ def read(record: dict, policy: Policy) -> dict:
     text = clean(text_of(record, policy), policy)                              # 认正文再统一字符与空白
     if policy.scrub:                                                           # 命令行可以明确关闭脱敏
         text, _ = text_clean.scrub(text)                                       # 命中数由公开 scrub 接口按需取用
-    quality = text_clean.score(text)                                           # 对最终会训练的正文打分
+    quality = text_clean.score(text, policy.quality_weights)                                           # 对最终会训练的正文打分
     if quality < policy.min_score:                                             # 低质量样本和其他拒收走同一条路
         raise Refused("low_score", f"{quality:.4f} < {policy.min_score:.4f}")  # 拒收档留下实际分数与门槛
     given = record.get("images")                                               # 图片在正文之外单独读取
@@ -112,6 +114,11 @@ def read(record: dict, policy: Policy) -> dict:
             raise Refused("bad_image_at", f"{image_at[-1]} > {len(text)}")      # 留下实际越界值和正文长度
 
     out = {"text": text, "chars": len(text)}                                  # 正文和长度交给下游
+    if "difficulty" in record:                                               # 人工难度跟着 weave 产物进入课程训练
+        difficulty = record["difficulty"]                                    # 仅接受明确的 0–1 数字
+        if type(difficulty) not in (int, float) or not math.isfinite(difficulty) or not 0 <= difficulty <= 1:
+            raise Refused("bad_difficulty", "difficulty 必须是 0–1 有限数")    # 在样本入口拒绝，训练内部无需猜测
+        out["difficulty"] = float(difficulty)                                # 难度方向统一为越大越难
     out["source"] = record.get("source") or "unknown"                         # 记来源，混配时按来源称重
     if "images" in record:                                                     # 原记录带图时保留规范后的路径列表
         out["images"] = images                                                 # 训练器按原顺序准备每张图片

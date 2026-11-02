@@ -30,7 +30,7 @@ from utils.fail import fail                                # 失败类型交给 
 
 PROTOCOL_VERSION = "2025-11-25"                           # initialize 生命周期最后一版协议
 TIMEOUT = 10.0                                             # 每个 JSON-RPC 请求最多等十秒
-CLIENT_VERSION = (Path(__file__).resolve().parents[1] / "VERSION").read_text().strip()  # 版本只读项目唯一来源
+from main import VERSION as CLIENT_VERSION                # 源码与 wheel 都复用入口的版本来源
 
 
 @dataclass
@@ -302,3 +302,125 @@ def _stderr_detail(text: str) -> str:
     if not words:                                           # 没写 stderr 就不加空标签
         return ""                                          # 主错误串已经足够明确
     return f"；stderr: {words[-1000:]}"                    # 只留末尾，通常是最近的根因
+
+
+# --- 把星织作为 stdio MCP 服务器 ---
+
+class Server:
+    """在明确根目录内提供卡片、配方校验和套件清单，不启动任意 shell。
+
+    调用示例：Server(Path("out")).serve()；CLI 为 ``ori mcp serve --root out``。
+    协议参考：https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle
+    stdout 只发送 JSON-RPC；现有 Servers 客户端可以直接连接这个服务端。
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.root = Path(root).expanduser().resolve()       # 一次固定可访问的工作区
+        if not self.root.is_dir():                          # root 是命令行外部输入
+            fail("input", f"MCP 根目录不存在: {self.root}")
+        self.initialized = False                            # 通知到达前不开放业务方法
+        self.negotiated = False                             # initialize 成功和 initialized 分开记录
+
+    def tools(self) -> list:
+        """返回实际可执行的三种工具；输入参数只允许声明的字段。"""
+        path_schema = {"type": "object", "properties": {"path": {"type": "string"}},
+                       "required": ["path"], "additionalProperties": False}
+        return [                                             # 少量固定工具直接列出，避免额外注册层
+            {"name": "read_card", "description": "读取根目录内的数据集 card.json", "inputSchema": path_schema},
+            {"name": "validate_recipe", "description": "校验根目录内的完整星织配方（不展开 extends）", "inputSchema": path_schema},
+            {"name": "list_suites", "description": "列出安装内置的评测套件", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
+        ]
+
+    def call(self, name: str, arguments: dict) -> dict:
+        """执行工具并返回 MCP content 与 structuredContent，业务错误由协议边界翻译。"""
+        from features import recipe, suite                 # 业务能力按需导入，MCP 本身仍是轻依赖
+        if name == "list_suites":
+            if arguments:                                  # 不接受拼错的无效参数
+                fail("input", "list_suites 不接受参数")
+            result = {"suites": [path.stem for path in sorted(suite.folder().glob("*.yaml"))]}
+        else:
+            if name not in {"read_card", "validate_recipe"}:
+                fail("input", f"没有工具 {name}")
+            if set(arguments) != {"path"} or not isinstance(arguments["path"], str) or not arguments["path"].strip():
+                fail("input", "工具需要非空 path，且不接受额外参数")
+            path = (self.root / arguments["path"].strip()).resolve()  # resolve 同时消除 .. 和符号链接
+            if not path.is_relative_to(self.root):          # MCP 客户端不能读取根目录外的文件
+                fail("input", "path 跑出了 MCP 根目录")
+            if name == "read_card":
+                path = path / "card.json" if path.is_dir() else path
+                path = path.resolve()                      # 目录里的 card.json 本身也可能是越界链接
+                if not path.is_relative_to(self.root):
+                    fail("input", "card.json 跑出了 MCP 根目录")
+                if path.name != "card.json":              # 这个工具只提供卡片，不能当任意文件读取器
+                    fail("input", "read_card 只读取 card.json")
+                result = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(result, dict):            # 卡片是外部文件，必须是 JSON 对象
+                    fail("input", "card.json 必须是对象")
+            else:
+                data = yaml_io.read(path)                   # 不展开 extends，避免间接读到工作区外
+                if data.get("extends"):
+                    fail("input", "先将 extends 展开为完整配方，再用 MCP 校验")
+                recipe.check(data)                         # 使用 CLI 相同的配方规则
+                result = {"valid": True, "path": str(path.relative_to(self.root)), "stamp": recipe.stamp(data)}
+        return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}], "structuredContent": result}
+
+    def handle(self, message) -> dict | None:
+        """处理一帧 JSON-RPC；通知不返回响应，协议错误与工具执行错误分开。"""
+        from utils.fail import Failure                     # 只在统一入口翻译项目错误
+        if not isinstance(message, dict) or message.get("jsonrpc") != "2.0" or not isinstance(message.get("method"), str):
+            return self.error(None, -32600, "无效 JSON-RPC 请求")
+        ident = message.get("id")                          # 通知没有 id
+        notification = "id" not in message
+        if not notification and (isinstance(ident, bool) or not isinstance(ident, (int, str))):
+            return self.error(None, -32600, "请求 id 必须是字符串或整数")
+        method = message["method"]
+        params = message.get("params", {})                 # 无参数方法统一用空对象
+        if not isinstance(params, dict):
+            return None if notification else self.error(ident, -32602, "params 必须是对象")
+        if notification:
+            if method == "notifications/initialized" and self.negotiated:
+                self.initialized = True                    # 只有握手完成后才接收就绪通知
+            return None                                    # 其他通知同样不得回复
+        if method == "initialize":
+            if self.negotiated:
+                return self.error(ident, -32600, "连接已经 initialize")
+            if not isinstance(params.get("protocolVersion"), str) or not isinstance(params.get("capabilities"), dict) or not isinstance(params.get("clientInfo"), dict):
+                return self.error(ident, -32602, "initialize 缺 protocolVersion/capabilities/clientInfo")
+            self.negotiated = True                         # 客户端不支持返回版本时应自行断开
+            result = {"protocolVersion": PROTOCOL_VERSION, "capabilities": {"tools": {}},
+                      "serverInfo": {"name": "hoshiori", "version": CLIENT_VERSION}}
+        elif method == "ping":
+            result = {}                                    # ping 在生命周期各阶段都可用
+        elif not self.initialized:
+            return self.error(ident, -32002, "先 initialize 并发送 notifications/initialized")
+        elif method == "tools/list":
+            result = {"tools": self.tools()}               # 当前工具数固定，无需分页游标
+        elif method == "tools/call":
+            if not isinstance(params.get("name"), str) or not isinstance(params.get("arguments", {}), dict):
+                return self.error(ident, -32602, "tools/call 需要 name 和对象 arguments")
+            try:
+                result = self.call(params["name"], params.get("arguments", {}))
+            except (Failure, OSError, ValueError) as wrong:  # 外部文件与业务参数错误按 MCP 工具失败返回
+                result = {"isError": True, "content": [{"type": "text", "text": str(wrong)}]}
+        else:
+            return self.error(ident, -32601, f"没有方法 {method}")
+        return {"jsonrpc": "2.0", "id": ident, "result": result}
+
+    @staticmethod
+    def error(ident, code: int, message: str) -> dict:
+        """构造一条标准 JSON-RPC 错误，保留对应请求编号。"""
+        return {"jsonrpc": "2.0", "id": ident, "error": {"code": code, "message": message}}
+
+    def serve(self, incoming=None, outgoing=None) -> None:
+        """逐行处理 stdio，收到 EOF 自然结束；测试可传 StringIO 观察完整协议。"""
+        import sys                                         # 默认协议流是当前进程的标准输入输出
+        incoming = incoming or sys.stdin
+        outgoing = outgoing or sys.stdout
+        for line in incoming:                              # 一行一帧；不会把日志打印到协议 stdout
+            try:
+                response = self.handle(json.loads(line))   # JSON 解析只在协议边界做一次
+            except json.JSONDecodeError:
+                response = self.error(None, -32700, "帧不是合法 JSON")
+            if response is not None:                       # 通知没有响应帧
+                outgoing.write(json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n")
+                outgoing.flush()                           # 对端立刻能收到，不等待缓冲区装满

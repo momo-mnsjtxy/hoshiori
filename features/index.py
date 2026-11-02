@@ -1,4 +1,4 @@
-"""落盘索引：把「分带键 → 下标」这层映射从进程内存挪到磁盘上，百万级语料也不会把人撑爆。
+"""落盘索引（新目录默认 v5 哈希前缀布局，旧 v4 原样继续读写）：把「分带键 → 下标」这层映射从进程内存挪到磁盘上，百万级语料也不会把人撑爆。
 
 调用示例：
   from pathlib import Path
@@ -19,7 +19,13 @@
 接口：put 登记、get 取候选下标、out/save 落盘与读回、size 报已收条数；
 另有一个 record 按下标读回签名与窗口，回算真实重合度要用，落盘的记录靠它按需取。
 
-三层，越往下越省内存、越慢：
+v5 布局：每个键取 BLAKE2b 的 4 位前缀，只查 keys_00..keys_0f 中的一张 B-tree；
+记录顺序写 records-NNNNNN.rec，位置表 positions 同时存片号、字节偏移和长度。
+16 张键表在同一 SQLite 文件里，共享 8 MiB 页缓存和同一个事务，保存时先 fsync
+记录片再提交位置与键，避免候选已落盘而记录还没写完。读记录只 pread 对应一条。
+旧目录不会迁移；需要转换时调用 migrate(source, target)，目标必须是空目录。
+
+以下三层说明只适用于 LegacyIndex / 旧 v4 目录，继续保留以便旧数据可读写：
   热层  内存里的 LRU，默认 5 万条键，查得最快；装不下就从头成批挤出去。
   温层  每片 50 万条的顺序文件，记录靠偏移表按需映射读，写只往片尾追加；
         键走哈希桶，桶头是内存里的一格定长数组，只在落盘和读回来的时候整块读写；
@@ -65,7 +71,9 @@
 压成「片号 << 21 | 片内位置」一个数只要 8MB，片内位置 2^21 远大于一片的 50 万条。
 """
 
+import hashlib                 # 键前缀必须跨进程稳定，不能用 Python 的随机 hash
 import json
+import sqlite3                 # 前缀各有自己的 B-tree，所有表共享有界页缓存与事务
 import mmap
 import os
 import shutil
@@ -518,7 +526,7 @@ class Shard:
             one.unlink()
 
 
-class Index:
+class LegacyIndex:
     """分带键 → 下标的映射。一次 weave 用一个实例。
 
     store 给 None 就是纯内存：热层不淘汰，记录全留在内存里，行为和没有这个类时一样。
@@ -932,3 +940,236 @@ def _unpack(body: bytes, key_size: int) -> tuple:
     sig, at = _read_words(body, 10 + len(keys))
     windows, at = _read_words(body, at)
     return sub, keys, list(sig), set(windows)
+
+
+# --- 新目录：哈希前缀键片与带片号的位置表 ---
+
+PREFIX_BITS = 4                 # 16 个前缀片；片数固定，查询次数不随记录片数增加
+PAGE_CACHE_KIB = 8192           # 所有键片共享 8 MiB 页缓存，不按语料量扩大
+CHECKPOINT_KEYS = 65_536        # 每批提交键与位置，限制一次未提交事务的规模
+
+
+class PrefixIndex:
+    """v5 落盘索引：一次键查询只读一个前缀 B-tree，记录按位置直读。
+
+    一份索引只允许一个写进程；同实例的线程通过锁串行操作。hot/warm 为旧调用保留，
+    新布局不用热键缓存或转冷，缓存上限由 PAGE_CACHE_KIB 决定。
+    save/out/close 都提交；累计 CHECKPOINT_KEYS 条键后，在下一条记录开始前自动提交。
+    """
+
+    def __init__(self, store, hot=HOT, per_shard=SHARD, warm=WARM, key_size=32):
+        if hot < 0 or per_shard < 1 or key_size < 1:  # 对外构造入口拒绝无意义的容量
+            raise ValueError("hot 不能为负；per_shard 和 key_size 必须为正")
+        self.store = Path(store)                 # 用户给定的目录就是唯一数据位置
+        self.store.mkdir(parents=True, exist_ok=True)
+        self.hot, self.warm = hot, warm          # 兼容已有配方参数，不驱动新布局
+        self.per_shard, self.key_size = per_shard, key_size
+        self.watch = None                       # 新布局无转冷，保留旧的观察入口
+        self._order = {}                        # 新布局没有 Python 热键表，压测可读零容量
+        self._lock = threading.RLock()          # 同一个连接只在此锁保护下使用
+        self._files = OrderedDict()            # 记录片句柄最多 16 个，避免随规模增长
+        self._last_sub = None                   # 连续登记同一记录的多条分带键，免重复查位置
+        self._pending = 0                       # 距离上次提交写了多少条键
+        self._closed = False                    # close 可重复调用，方便上层 finally
+        manifest = self.store / MANIFEST        # 清单只记格式，数量以事务内元数据为准
+        if manifest.exists():
+            config = json.loads(manifest.read_text(encoding="utf-8"))
+            if config["version"] != 5:
+                raise ValueError("PrefixIndex 只读取 v5；旧目录请通过 Index 打开")
+            if config.get("hash") != "blake2b-64" or config.get("prefix_bits") != PREFIX_BITS:
+                raise ValueError("索引哈希或前缀宽度不受支持，不能按另一套路由读写")
+            self.key_size = config["key_size"]  # 续写沿用原来键宽和记录片容量
+            self.per_shard = config["per_shard"]
+        elif any(self.store.iterdir()):
+            raise ValueError("新索引需要空目录，已有文件不会被覆盖")
+        database_path = self.store / "prefix.sqlite3"  # 已有清单时缺数据库必须报错，不能建空库
+        database_uri = database_path.resolve().as_uri() + ("?mode=rw" if manifest.exists() else "?mode=rwc")
+        self._database = sqlite3.connect(database_uri, uri=True, check_same_thread=False)
+        self._database.execute(f"PRAGMA cache_size=-{PAGE_CACHE_KIB}")  # 全库共用缓存上限
+        self._database.execute("PRAGMA mmap_size=0")  # 不把随机访问过的全库页面留在 RSS
+        self._database.execute("PRAGMA synchronous=FULL")  # 提交成功后位置与键都有持久记录
+        self._database.execute("PRAGMA journal_mode=DELETE")  # 备份不依赖额外 WAL 文件
+        if not manifest.exists():              # 只给新目录建结构，既有损坏库不能被修饰成空库
+            self._database.execute("CREATE TABLE metadata (id INTEGER PRIMARY KEY, count INTEGER NOT NULL)")
+            self._database.execute("INSERT INTO metadata VALUES (1, 0)")  # 空索引从零计数
+            self._database.execute("CREATE TABLE positions (sub INTEGER PRIMARY KEY, shard INTEGER NOT NULL, offset INTEGER NOT NULL, length INTEGER NOT NULL)")
+            for prefix in range(1 << PREFIX_BITS):   # 每个前缀是独立 B-tree，不是全库过滤扫描
+                self._database.execute(f"CREATE TABLE keys_{prefix:02x} (key BLOB NOT NULL, sub INTEGER NOT NULL, PRIMARY KEY (key, sub)) WITHOUT ROWID")
+            self._database.commit()            # 空结构先落地；之后追加都进入同一事务
+        self.count = self._database.execute("SELECT count FROM metadata WHERE id=1").fetchone()[0]
+        if not manifest.exists():
+            config = {"version": 5, "layout": "hash-prefix", "hash": "blake2b-64", "prefix_bits": PREFIX_BITS,
+                      "key_size": self.key_size, "per_shard": self.per_shard}
+            temporary = self.store / "index.json.tmp"  # 清单原子发布，不留下半截 JSON
+            temporary.write_text(json.dumps(config, indent=2), encoding="utf-8")
+            temporary.replace(manifest)
+
+    def prefix(self, key: bytes) -> int:
+        """返回键的稳定哈希前缀；同键永远只属于这一片。"""
+        return hashlib.blake2b(key, digest_size=8).digest()[0] >> (8 - PREFIX_BITS)
+
+    def put(self, key: bytes, sub: int, sig=None, windows=None) -> None:
+        """登记键与记录；同一下标后续加键不重复存签名，重复键登记幂等。"""
+        if len(key) != self.key_size or sub < 0 or sub >= 2**63:
+            raise ValueError(f"键须为 {self.key_size} 字节，下标须在 [0, 2^63) 内")
+        with self._lock:                        # 记录片和数据库中的位置保持同一写入顺序
+            if sub != self._last_sub:          # 一个样本几十条分带键，只在第一条检查位置
+                if self._pending >= CHECKPOINT_KEYS:
+                    self._checkpoint()        # 只在记录之间自动提交，不把同一样本的分带键切成两档
+                exists = self._database.execute("SELECT 1 FROM positions WHERE sub=?", (sub,)).fetchone()
+                if exists is None:             # 首次见到这条样本，记录顺序追加一次
+                    self._append(sub, sig or [], windows or set())
+                self._last_sub = sub           # 只缓存一个下标，不做随规模增长的键路由缓存
+            table = f"keys_{self.prefix(key):02x}"  # 表名只来自受限的前缀整数
+            self._database.execute(f"INSERT OR IGNORE INTO {table} VALUES (?, ?)", (key, sub))
+            self._pending += 1                 # 一次提交覆盖本批全部前缀，跨片不会半成半败
+
+    def _append(self, sub, sig, windows):
+        """签名和窗口只存一次，位置表直接给出记录片号与字节位置。"""
+        serial = self.count // self.per_shard    # 按记录条数滚片，键前缀与记录片各管自己的事
+        output = self._file(serial)             # 无缓冲写，随后同实例 pread 立即可见
+        offset = output.seek(0, os.SEEK_END)     # 未提交后崩溃的尾部可以保留，不被任何位置引用
+        body = _words(sig) + _words(windows)    # 记录不再复制全部键，键只存在前缀 B-tree 中
+        output.write(body)                     # 先有正文，事务提交才会公开它的位置
+        self._database.execute("INSERT INTO positions VALUES (?, ?, ?, ?)", (sub, serial, offset, len(body)))
+        self.count += 1                        # 数量随键事务一起提交或回滚
+
+    def _file(self, serial, create=True):
+        """打开指定记录片；保留最近 16 个句柄，老片关前先同步写入。"""
+        if serial in self._files:
+            self._files.move_to_end(serial)    # 常读的片放在池子末尾
+            return self._files[serial]
+        if len(self._files) >= 16:
+            _, old = self._files.popitem(last=False)
+            os.fsync(old.fileno())             # 即使位置尚未提交，旧片正文也先落稳
+            old.close()
+        path = self.store / f"records-{serial:06d}.rec"
+        output = path.open("w+b" if create and not path.exists() else "r+b", buffering=0)
+        self._files[serial] = output            # 句柄池只保存打开的片，不复制记录内容
+        return output
+
+    def get(self, key: bytes) -> list:
+        """只查询键所在前缀片；B-tree 用完整键比对，哈希碰撞不产生误命中。"""
+        if len(key) != self.key_size:
+            raise ValueError(f"键要正好 {self.key_size} 字节")
+        with self._lock:
+            table = f"keys_{self.prefix(key):02x}"  # 无温片/冷片列表循环，片数不影响查询扇出
+            rows = self._database.execute(f"SELECT sub FROM {table} WHERE key=? ORDER BY sub", (key,))
+            return [row[0] for row in rows]     # 保持旧接口的候选下标列表形状
+
+    def record(self, sub: int) -> tuple:
+        """查带片号的位置表，再用一次 pread 读回签名与窗口。"""
+        with self._lock:
+            position = self._database.execute("SELECT shard, offset, length FROM positions WHERE sub=?", (sub,)).fetchone()
+            if position is None:
+                raise KeyError(sub)            # 缺记录是公开查询接口的正常失败
+            serial, offset, length = position
+            body = os.pread(self._file(serial, create=False).fileno(), length, offset)
+            if len(body) != length:
+                raise ValueError(f"记录片 {serial} 损坏：下标 {sub} 的正文不完整")
+            sig, at = _read_words(body, 0)      # 第一段是 MinHash 签名
+            windows, _ = _read_words(body, at)  # 第二段是真实窗口集合
+            return list(sig), set(windows)
+
+    def size(self) -> int:
+        """返回已登记的不同样本数，稀疏下标也不分配空洞数组。"""
+        return self.count
+
+    def _checkpoint(self):
+        """先同步正文，再原子提交全部前缀键、位置与数量。"""
+        for output in self._files.values():
+            os.fsync(output.fileno())          # 数据库提交成功不能先于正文写入成功
+        directory = os.open(self.store, os.O_RDONLY)  # 新记录片的目录项也须先于数据库提交落稳
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        self._database.execute("UPDATE metadata SET count=? WHERE id=1", (self.count,))
+        self._database.commit()                # 16 个键片与位置表使用同一个原子事务
+        self._pending = 0                      # 下批重新计算提交间隔
+
+    def out(self, count=None) -> None:
+        """新布局无热层；保留此入口作为提交检查点，count 不再限制淘汰数。"""
+        with self._lock:
+            self._checkpoint()
+
+    def settle(self, wait=COLD_WAIT):
+        """新布局没有后台转冷，所有写入在调用线程内完成。"""
+        return None
+
+    def save(self, directory=None) -> Path:
+        """提交当前索引；给另一空目录时复制完整快照，不覆盖任何已有用户文件。"""
+        target = Path(directory) if directory is not None else self.store
+        with self._lock:
+            self._checkpoint()                 # 正文和全部位置先成为同一个持久检查点
+            if target.resolve() == self.store.resolve():
+                return self.store
+            target.mkdir(parents=True, exist_ok=True)
+            if any(target.iterdir()):
+                raise ValueError("另存目标必须为空目录，已有数据不会被覆盖")
+            for source in self.store.glob("records-*.rec"):
+                shutil.copyfile(source, target / source.name)  # 逐文件复制，不整库读入内存
+            with sqlite3.connect(target / "prefix.sqlite3") as destination:
+                self._database.backup(destination)  # SQLite 提供一致快照，避免复制半页
+            shutil.copyfile(self.store / MANIFEST, target / MANIFEST)  # 最后发布可打开的清单
+        return target
+
+    def close(self) -> None:
+        """提交并关闭，重复调用无副作用。"""
+        with self._lock:
+            if self._closed:
+                return                          # 上层多个 finally 可安全共用
+            self._checkpoint()                  # 与旧接口相比，新布局 close 保留全部已登记内容
+            self._database.close()
+            for output in self._files.values():
+                output.close()                  # 释放所有记录片句柄
+            self._files.clear()
+            self._closed = True
+
+
+def Index(store=None, hot=HOT, per_shard=SHARD, warm=WARM, key_size=32):
+    """打开索引：内存用原实现，新目录用 v5，既有 v4 原样续用，绝不隐式迁移。
+
+    示例：idx = Index(Path("my-index")); idx.put(b"x" * 32, 0); idx.save(); idx.close()
+    """
+    if store is None:
+        return LegacyIndex(None, hot, per_shard, warm, key_size)  # 内存行为保持不变
+    manifest = Path(store) / MANIFEST
+    if manifest.exists():
+        version = json.loads(manifest.read_text(encoding="utf-8"))["version"]
+        if version == 4:
+            return LegacyIndex(store, hot, per_shard, warm, key_size)  # 旧文件不改布局
+        if version != 5:
+            raise ValueError(f"索引清单版本 {version} 不认识")
+    return PrefixIndex(store, hot, per_shard, warm, key_size)  # 新目录使用前缀分片
+
+
+def migrate(source, target) -> Path:
+    """将已保存的 v4 索引复制为 v5；源目录只读，目标必须为空目录。
+
+    示例：migrate(Path("old-index"), Path("new-index"))；确认新索引后由用户决定旧目录去留。
+    """
+    source, target = Path(source), Path(target)   # 迁移只处理明确指定的两个位置
+    manifest = json.loads((source / MANIFEST).read_text(encoding="utf-8"))
+    if manifest["version"] != 4:
+        raise ValueError("迁移源必须是 v4 索引")
+    if target.exists() and any(target.iterdir()):
+        raise ValueError("迁移目标必须为空目录")
+    new = PrefixIndex(target, key_size=manifest["key_size"], per_shard=manifest["per_shard"])
+    try:
+        for shard in manifest["shards"]:        # 只读原记录文件，不打开会重写偏移表的旧索引
+            path = source / f"{shard['layer']}-{shard['serial']:04d}.rec"
+            with path.open("rb") as rows:
+                for _ in range(shard["count"]):
+                    length = int.from_bytes(rows.read(4), "big")
+                    body = rows.read(length)   # 每次只搬一条，迁移内存不随源目录大小增长
+                    if shard["layer"] == "cold" and manifest.get("pack", True):
+                        body = zlib.decompress(body)
+                    sub, keys, sig, windows = _unpack(body, new.key_size)
+                    for at in range(0, len(keys), new.key_size):
+                        new.put(keys[at:at + new.key_size], sub, sig, windows)
+        if new.size() != manifest["count"]:
+            raise ValueError("源清单的记录数与实际内容不一致，迁移未完成")
+        return new.save()                       # 所有键和位置都落地后才交给调用方
+    finally:
+        new.close()                             # 中断时释放连接；目标可检查，源目录始终不变

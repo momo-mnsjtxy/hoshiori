@@ -1,0 +1,16 @@
+{
+  "model_type": "hoshiori",
+  "hidden_size": 32,
+  "num_hidden_layers": 1,
+  "num_attention_heads": 2,
+  "head_dim": 16,
+  "vocab_size": 32,
+  "max_position_embeddings": 12,
+  "rope_theta": 10000.0,
+  "tie_word_embeddings": true,
+  "vision": "conv",
+  "text_max_seq_len": 8,
+  "image_side": 8,
+  "patch": 4,
+  "torch_dtype": "fp32"
+}

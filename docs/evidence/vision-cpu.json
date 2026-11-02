@@ -1,0 +1,30 @@
+{
+  "experiment": "controlled-color-retrieval",
+  "device": "cpu",
+  "torch": "2.14.1",
+  "seed": 41,
+  "steps": 120,
+  "batch_size": 2,
+  "train_pairs": 6,
+  "heldout": "independent pixel noise; same six color classes",
+  "vision": "two spatial Conv2d layers per patch",
+  "negative_queue": 12,
+  "seconds": 2.8142983069992624,
+  "initial_loss": 0.6485399007797241,
+  "final_loss": 0.006370595656335354,
+  "before": {
+    "pairs": 6,
+    "image_to_text_r1": 0.3333333432674408,
+    "image_to_text_r5": 0.8333333134651184,
+    "text_to_image_r1": 0.1666666716337204,
+    "text_to_image_r5": 0.8333333134651184
+  },
+  "after": {
+    "pairs": 6,
+    "image_to_text_r1": 1.0,
+    "image_to_text_r5": 1.0,
+    "text_to_image_r1": 1.0,
+    "text_to_image_r5": 1.0
+  },
+  "model": "docs/evidence/vision-cpu-model"
+}

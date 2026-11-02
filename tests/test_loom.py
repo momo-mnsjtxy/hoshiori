@@ -174,3 +174,50 @@ def test_bad_port_exits_2(tmp_path, capsys):
     (root / "card.json").write_text("{}", encoding="utf-8")
     assert cli.run(["loom", str(root), "--port", "70000"]) == 2
     assert "端口" in capsys.readouterr().err
+
+
+def test_authenticated_read_and_write(tmp_path):
+    """真实 HTTP 核对匿名拒绝、Bearer 写入、Basic 登录、跨源/伪造字段拒绝。"""
+    import base64
+    root = tmp_path / "bolt"
+    root.mkdir()
+    _fill(root, tmp_path)
+    token = "test-token-with-enough-entropy"
+    server = loom.make(root, token=token)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def request(path, payload=None, authorization="", origin=""):
+        headers = {"Authorization": authorization, "Content-Type": "application/json"}
+        if origin:
+            headers["Origin"] = origin
+        data = json.dumps(payload).encode() if payload is not None else None
+        sent = urllib.request.Request(base + path, data=data, headers=headers)
+        return _get(sent)
+
+    try:
+        assert request("/")[0] == 401
+        assert request("/metrics.json")[0] == 401
+        basic = "Basic " + base64.b64encode(("ori:" + token).encode()).decode()
+        assert "card-editor" in request("/", authorization=basic)[1]
+        before = json.loads((root / "card.json").read_text())
+        assert request("/api/card", {"name": "edited"})[0] == 401
+        assert request("/api/card", {"name": "edited"}, "Bearer " + token, "https://evil.example")[0] == 403
+        assert request("/api/card", {"counts": {"kept": 100000}}, "Bearer " + token)[0] == 400
+        assert json.loads((root / "card.json").read_text()) == before
+        code, body = request("/api/card", {"name": " edited ", "description": "reviewed"}, "Bearer " + token)
+        assert code == 200 and json.loads(body)["name"] == "edited"
+        saved = json.loads((root / "card.json").read_text())
+        assert saved["description"] == "reviewed" and saved["counts"] == before["counts"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_public_panel_requires_token(tmp_path):
+    """绑定公网地址前就拒绝缺认证配置，不能先开放再等待人配置。"""
+    from utils.fail import Failure
+    with pytest.raises(Failure, match="必须配置访问令牌"):
+        loom.make(tmp_path, host="0.0.0.0")

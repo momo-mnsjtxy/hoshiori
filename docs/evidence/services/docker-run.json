@@ -1,0 +1,10 @@
+{
+  "gateway_unauthenticated": 401,
+  "panel_unauthenticated": 401,
+  "gateway_models": 200,
+  "gateway_chat": 200,
+  "gateway_backend": "echo (HTTP integration only)",
+  "panel_authenticated": 200,
+  "panel_write": 200,
+  "write_persisted_to_bind_mount": true
+}

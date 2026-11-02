@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hoshiori"
-version = "0.1.0.dev0"
+dynamic = ["version"]
 description = "星织 — 从语料到上线的全链路开源训练与评测台"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -16,7 +16,9 @@ dependencies = [
 [project.optional-dependencies]
 speed = ["numpy>=1.26"]
 dedup = ["numpy>=1.26", "blake3>=0.3"]
-full = ["numpy>=1.26", "blake3>=0.3", "torch>=2.4", "safetensors>=0.4"]
+full = ["numpy>=1.26", "blake3>=0.3", "torch>=2.4", "safetensors>=0.4", "pillow>=10", "tokenizers>=0.20"]
+eval = ["datasets>=3"]  # HF Hub 远端评测题库；本地 JSONL 无需这一组
+export = ["onnx>=1.16", "onnxruntime>=1.19"]  # ONNX 导出和本机运行
 dev = ["pytest>=8.0", "ruff>=0.6"]
 
 [project.scripts]
@@ -34,3 +36,9 @@ markers = ["slow: 跑得慢的压测，默认不跑"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.setuptools.dynamic]
+version = {file = ["VERSION"]}
+
+[tool.setuptools.package-data]
+features = ["suites/*.yaml"]

@@ -15,7 +15,7 @@
 import json                                               # 命令行参数和 MCP 结果都用 JSON
 from pathlib import Path                                  # 默认配置明确落在当前工作目录
 
-from features.mcp import Servers                          # 连接、握手、调用都归 MCP 主体
+from features.mcp import Server, Servers                          # 连接、握手、调用都归 MCP 主体
 from utils.fail import fail                               # 用户能改的参数按退出码 2 返回
 
 CONFIG = Path("mcp.yaml")                                # CLI 没有隐藏搜索路径，只认这一份
@@ -23,6 +23,9 @@ CONFIG = Path("mcp.yaml")                                # CLI 没有隐藏搜�
 
 def command(args) -> int:
     """执行 mcp 的 list、tools 或 call 动作。"""
+    if args.action == "serve":                           # 服务端无需客户端连接配置 mcp.yaml
+        Server(Path(args.root)).serve()                    # stdout 严格留给协议，不打印启动横幅
+        return 0
     servers = Servers(CONFIG)                             # 先读配置，名字清单只有一个来源
     if args.action == "list":                            # list 没有别的用户输入要检查
         return show_servers(servers)                      # 不启动任何服务器就能列出配置

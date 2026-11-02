@@ -26,7 +26,7 @@ def command(args) -> int:
     for spec in args.files:
         source = Path(spec)
         preset = migration.read_preset(source)  # 读，坏 yaml 在这里就停
-        job = migration.convert(preset, where=str(source))  # 转，unknown 一项都不丢
+        job = migration.convert(preset, where=str(source), framework=args.kind)  # 转，unknown 一项都不丢
         name = source.stem
         recipe_path = out / f"{name}.warp.yaml"
         if recipe_path.exists() and not args.force:  # 不覆盖默认
@@ -40,6 +40,6 @@ def command(args) -> int:
 
     print(f"\n共搬 {total} 项。先看 {out}/*.diff.md 再 ori validate。")
     if blocked:
-        print(f"这几份缺 model.path，补上才能跑: {', '.join(blocked)}")
+        print(f"这几份仍有阻塞项，请按差异清单补齐: {', '.join(blocked)}")
         return 1
     return 0
