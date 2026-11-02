@@ -1,18 +1,15 @@
 """配方：训练要什么全写在一份 yaml 里。这个文件负责读它、合并父配方、按白名单验它。
 
+调用方式：load 读配方并展开 extends，check 在命令开头验字段和类型，stamp 给完整配方算哈希。
+字段白名单集中在 FIELDS，拼错会报最近似的候选。model.geometry.image_side 是原图边长，0 表示不接图；
+patch 是块边长，默认 16。两个字段只描述模型的图片通路，训练批次携带图片需要后续接入。
+
 调用示例：
-  from features import recipe
-  data = recipe.load(Path("sft.warp.yaml"))   # 读并展开 extends 链，循环会当场报错
-  recipe.check(data)                          # 验字段名、类型、必备项
-  recipe.stamp(data)                          # 拿一个能锁死的哈希
-
-配方长这样（只列几项，全部字段见 FIELDS）：
-  task: sft
-  model: {path: ../base}
-  train: {strategy: fsdp2, devices: [0, 1], lora: {r: 16}}
-
-为什么字段名要白名单：拼错的字段会被静默忽略，跑完才发现那行没生效。
-白名单里查不到就报错，并从最近似的几个名字里挑候选提示，改起来一眼就知道改成什么。
+  from pathlib import Path                      # 配方文件的位置
+  from features import recipe                   # 读取、校验和指纹都在这里
+  data = recipe.load(Path("sft.warp.yaml"))       # 展开父配方，循环会当场报错
+  recipe.check(data)                            # 验字段名、类型、必备项
+  recipe.stamp(data)                            # 拿一个能锁死的哈希
 """
 
 import difflib
@@ -40,14 +37,16 @@ FIELDS = {
         "dtype": str,  # 载入权重时的精度
         "params_b": (int, float),  # 参数量（十亿），只给显存估算用；写 3 或 3.0 都行
         "geometry": {
-            "d_model": int,  # 隐藏维度
-            "layers": int,  # 层数
-            "heads": int,  # 注意力头数
-            "d_head": int,  # 每头宽度，heads × d_head 要等于 d_model
-            "vocab": int,  # 词表大小
-            "max_seq_len": int,  # 最长序列
+            "d_model": int,             # 隐藏维度
+            "layers": int,              # 层数
+            "heads": int,               # 注意力头数
+            "d_head": int,              # 每头宽度，heads × d_head 要等于 d_model
+            "vocab": int,               # 词表大小
+            "max_seq_len": int,         # 最长文本序列，图片前缀额外预留位置
             "rope_base": (int, float),  # RoPE 底数，写 10000 或 10000.0 都行
-            "tie": bool,  # 输出层是否复用词表权重
+            "tie": bool,                # 输出层是否复用词表权重
+            "image_side": int,          # 原图边长，0 表示不接图
+            "patch": int,               # 图片块边长；image_side 为 0 时不接图，不使用此值
         },
         "tokenizer": str,  # 词表文件，给了就按它编，没给按字节取模兜底
         "teacher": str,  # distill 的教师权重

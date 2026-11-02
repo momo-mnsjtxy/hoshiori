@@ -1,4 +1,8 @@
-"""训练：真的把模型往前推。取批 → 前向 → 交叉熵 → 反向 → 累积 → 裁剪 → 一步更新。
+"""训练：真的把模型往前推，并管理本次任务的 CPU 参考模型和教师模型。
+
+调用方式：Trainer(model, geo, choice).run() 跑完并释放冻结模型；只构建而不运行时调用 close()。
+Choice.base 接收命令层已载入的 model.path；参考模型重新读这份权重，随机起步时才拷贝学生。
+Choice.teacher 接收 model.teacher；参考模型和教师都在 CPU 上 eval、冻结，只把前向结果送回学生设备。
 
 调用示例：
   from features.trainer import Choice, Trainer
@@ -71,7 +75,7 @@ class Choice:
     seed: int = 42  # 随机种子
     precision: str = "fp32"  # 精度，只有卡上才真生效
     resume: Path = None  # 从哪一档接着跑
-    base: Path = None  # 基座目录，挂件存档要写上
+    base: Path = None  # 已载入的 model.path，参考模型重载和挂件存档共用；随机起步为 None
     lora: dict = None  # 低秩配置，给了就只训挂件
     strategy: str = "single"  # single 单卡 / ddp 每卡一份 / fsdp2 摊开
     devices: list = None  # 用哪几张卡，只记账和进 run.json；真分配在命令层的 torchrun
@@ -97,8 +101,8 @@ class Trainer:
         self.rank, self.world = _setup()  # torchrun 起的进程有 LOCAL_RANK；自己起的单进程就是 0/1
         self.lead = self.rank == 0  # 只有 0 号进程存盘打日志，别的进程只算
         self.pad_id = getattr(choice.vocab, "pad_id", 0)  # 补位用词表的 pad；没词表还是老的 0
-        self.ref_model = None  # 对齐任务的冻结参考模型，dpo / grpo 要它算 ref 概率
-        self.teacher = None  # distill 的教师，冻结
+        self.ref_model = None  # dpo / grpo / ppo 的参考模型，只在 CPU 前向
+        self.teacher = None    # distill 的教师，同样留在 CPU
         self.samples = self._read()  # 编好的样本，一次读进来，别边跑边读盘
         self.total = choice.steps or max(1, math.ceil(choice.epochs * len(self.samples) / (choice.batch_size * choice.grad_accum)))  # 没给步数就按轮数换算
         model.grad_checkpoint = choice.grad_checkpoint  # 前向按配方决定要不要重算
@@ -106,12 +110,19 @@ class Trainer:
             lora.attach(model, choice.lora.get("target") or list(lora.TARGETS)[:4], choice.lora["r"], choice.lora["alpha"], choice.lora["dropout"])  # 挂件以外全冻上
         if choice.lora:  # 挂件是新建的层，建在 CPU，得跟基座放一起
             model.to(_device_of(model))
-        if choice.task in {"dpo", "grpo", "ppo"}:  # 这三类要一份不动的参考模型
-            self.ref_model = copy.deepcopy(_unwrap(model)).eval()  # 深拷贝一份基线，挂件和量化都在上面
-            for one in self.ref_model.parameters():
-                one.requires_grad_(False)  # 参考模型只前向
-        if choice.task == "distill":  # 蒸馏要教师
-            self.teacher = _teacher(choice, geo).eval()  # 载入教师并冻上
+        if choice.task in {"dpo", "grpo", "ppo"}:                         # 这三类要一份不动的参考模型
+            if choice.base is None:                                    # 命令层没载入基座，这一趟从随机权重起
+                self.ref_model = copy.deepcopy(_unwrap(model)).cpu()    # 只在随机起步时拷贝学生，随后搬到 CPU
+                if self.lead:                                          # 多进程只记一份日志
+                    logs.warn("spin", "无已载入的 model.path，参考模型拷贝学生并放 CPU")  # 明说本次走了拷贝
+            else:                                                      # 基座已经由命令层确认可用
+                self.ref_model = _load_cpu(choice.base, geo)            # 按同一份几何重建，再从基座读权重
+        if choice.task == "distill":                                    # 教师路径已由命令层检查
+            self.teacher = _load_cpu(choice.teacher, geo)               # 教师也独立构建和载入
+        for net in (self.ref_model, self.teacher):                      # 两类冻结模型共用同一套设置
+            if net is not None:                                        # 普通训练没有额外模型
+                net.eval()                                             # 关闭训练行为
+                net.requires_grad_(False)                              # 所有参数都不参与反向
         self.model = _wrap(model, choice.strategy, self.world, self.rank)  # 多卡才包，单卡原样
         self.params = [one for one in self.model.parameters() if one.requires_grad]  # 包完再取一遍：fsdp2 会把参数换成新的
         self.optim = torch.optim.AdamW(self.params, lr=choice.lr, weight_decay=choice.weight_decay)  # 优化器只管可训的
@@ -239,12 +250,14 @@ class Trainer:
         return self._logp_of(self.model, ids)
 
     def _logp_of(self, net, ids: torch.Tensor) -> torch.Tensor:
-        """指定网络算对数概率（每条一个数），补位不算。"""
-        ids = ids.to(next(self.model.parameters()).device)  # 跟模型放同一张卡
-        logits = net(ids[:, :-1])  # 前向，最后一位没有答案
+        """在指定网络的设备上算对数概率，结果回到输入设备；每条一个数，补位不算。"""
+        here = ids.device                                         # 留住学生批次的设备，结果要搬回来
+        ids = ids.to(next(net.parameters()).device)                # 批次跟实际前向的网络走，参考模型就在 CPU
+        logits = net(ids[:, :-1])                                  # 前向，最后一位没有答案
         picked = F.log_softmax(logits.float(), dim=-1).gather(2, ids[:, 1:].unsqueeze(-1)).squeeze(-1)  # 只取答案那一位
-        keep = ids[:, 1:] != self.pad_id  # 补位不算
-        return (picked * keep).sum(dim=1) / keep.sum(dim=1).clamp(min=1)  # 按真 token 平均
+        keep = ids[:, 1:] != self.pad_id                           # 补位不算
+        logps = (picked * keep).sum(dim=1) / keep.sum(dim=1).clamp(min=1)  # 按真 token 平均
+        return logps.to(here)                                      # 只传每条的概率，不把整份 logits 搬上卡
 
     def _align_loss(self) -> tuple:
         """对齐任务的一步损失，返回（损失, 真 token 数）。"""
@@ -254,23 +267,17 @@ class Trainer:
             good = self._stack([one[0] for one in rows])  # 正例
             bad = self._stack([one[1] for one in rows])  # 负例
             logp_c, logp_r = self._logp(good), self._logp(bad)  # 当前策略
-            if self.ref_model is not None:  # 有参考模型就真算参考概率
-                ref_c, ref_r = self._logp_ref(good), self._logp_ref(bad)
-            else:  # 没有就拿当前值 detach，第一步起步够用
-                ref_c, ref_r = logp_c.detach(), logp_r.detach()
+            ref_c, ref_r = self._logp_ref(good), self._logp_ref(bad)  # 构建时已有冻结参考模型，概率回到学生设备
             out = alignment.dpo(logp_c, logp_r, ref_c, ref_r, self.choice.beta)  # DPO 损失
             margin = out["margin"].mean()  # 这一批的平均间隔
-            self.last_extra = {"acc": float(out["accuracy"]), "margin": float(margin.detach() if hasattr(margin, "detach") else margin)}  # 记账，张量先摘图
+            self.last_extra = {"acc": float(out["accuracy"]), "margin": float(margin.detach())}  # 记账，张量先摘图
             return out["loss"], int(good.numel() + bad.numel())  # 真 token 数
 
         rows = self._next()  # 一组：候选与分数
         ids, rewards = rows  # 拆开
         batch = self._stack(ids)  # 同一组的候选并成一批
         logps = self._logp(batch)  # 每条的对数概率
-        if self.ref_model is not None:  # GRPO 的 KL 要参考概率
-            refs = self._logp_ref(batch)
-        else:
-            refs = logps.detach()
+        refs = logps.detach() if task == "rloo" else self._logp_ref(batch)  # RLOO 不要参考模型，其余取 CPU 算回的概率
         if task == "grpo":  # 组相对
             out = alignment.grpo(logps, rewards, clip=self.choice.clip_ratio, kl_coef=self.choice.kl_coef, ref_logps=refs)
         elif task == "rloo":  # 留一基线
@@ -282,8 +289,8 @@ class Trainer:
 
     @torch.no_grad()
     def _logp_ref(self, ids: torch.Tensor) -> torch.Tensor:
-        """参考模型的对数概率，不建图。"""
-        return self._logp_of(self.ref_model, ids)
+        """CPU 参考模型不建图，概率回到学生批次所在设备。"""
+        return self._logp_of(self.ref_model, ids)  # 输入和结果的搬运统一在概率计算里完成
 
     def _align_update(self) -> float:
         """对齐任务的一步：攒够累积再更新，收尾与语言模型那条路一致。"""
@@ -315,7 +322,7 @@ class Trainer:
             with self._context():  # 半精度上下文
                 if self.choice.task == "distill":  # 蒸馏换成交叉熵之外的目标
                     with torch.no_grad():  # 教师不建图
-                        teach = self.teacher(ids)
+                        teach = self.teacher(ids.cpu()).to(ids.device)  # 教师只在 CPU 前向，打分回到学生设备
                     loss = alignment.distill(self.model(ids), teach, self.choice.temperature).mean() / self.choice.grad_accum
                 else:  # 普通语言模型目标
                     loss = cross_entropy(self.model(ids), labels) / self.choice.grad_accum  # 除开累积数，梯度才不跟着放大
@@ -375,8 +382,24 @@ class Trainer:
         torch.distributed.broadcast(flag, src=0)  # 发给所有进程
         return bool(flag.item())
 
+    # --- 运行与收尾 ---
+
     def run(self) -> int:
-        """跑到总步数；中途 Ctrl-C 或健康检查叫停，都是存一档再退。"""
+        """跑到总步数；正常结束、中断或出错都释放本次任务的冻结模型。"""
+        try:                      # 训练与存档先走完，再收尾
+            return self._body()   # Ctrl-C 和健康停机仍由训练主线存档
+        finally:                  # 出错也释放资源，错误原样交回入口
+            self.close()          # 不把参考模型或教师留到下一次任务
+
+    def close(self) -> None:
+        """释放参考模型、教师和进程组；只构建而不运行的任务也可直接调用。"""
+        del self.ref_model, self.teacher           # 去掉任务持有的冻结模型
+        self.ref_model = self.teacher = None       # 留下已释放状态，重复收尾也无需检查
+        torch.cuda.empty_cache()                  # 归还已不用的 CUDA 缓存，CPU 环境下无操作
+        _done()                                   # 存档已结束，分片用的进程组可以拆掉
+
+    def _body(self) -> int:
+        """训练主线；中途 Ctrl-C 或健康检查叫停，都是存一档再退。"""
         self.out.mkdir(parents=True, exist_ok=True)  # 产物目录先建
         if self.lead:  # 结构描述和这一趟的设定只留一份
             self.net.write_config(self.out, self.choice.precision)  # 导出时能用
@@ -407,7 +430,6 @@ class Trainer:
             _barrier()
             if self.lead:
                 logs.warn("spin", "已中断，断点存下了", step=self.step)
-            _done()  # 先存完再拆组，fsdp2 的存盘要用组
             return self.step
         _barrier()  # 存盘要跨进程拼分片，先等齐
         self.save()  # 收尾必存；拆组放在它后面，分片得先拼回来
@@ -417,7 +439,6 @@ class Trainer:
             logs.done("spin", "健康停机", step=self.step, why=self.reason)
         elif self.lead:  # 正常收尾
             logs.done("spin", "训练完成", step=self.step, total=self.total)
-        _done()  # 进程组收尾，单进程调了也没事
         return self.step
 
     @property
@@ -515,18 +536,19 @@ def _unwrap(model):
     return model.module if hasattr(model, "module") else model
 
 
-def _teacher(choice, geo):
-    """按 model.teacher 载一份教师，几何要与学生一致。"""
-    from features import model as models
+# --- CPU 权重 ---
 
-    if choice.teacher is None:  # 没给教师就做不了蒸馏
-        fail("input", "distill 要给 model.teacher 指教师权重", where="model.teacher")
-    net = models.Model(geo)  # 同构的学生结构
-    where = Path(choice.teacher)  # 教师权重目录，给了产物根目录就跟着 latest 走
-    if where.is_dir() and (where / "latest").is_file():
-        where = where / (where / "latest").read_text(encoding="utf-8").strip()
-    net.load(where)  # 灌教师的权重
-    return net
+def _load_cpu(source, geo):
+    """按学生几何独立构建 CPU 模型，从基座或教师路径载入；产物根目录跟随 latest。"""
+    from features.model import Model                                        # 基座和教师用同一种模型结构
+
+    where = Path(source)                                                    # 路径由命令层整理好，内部直接使用
+    if where.is_dir() and (where / "latest").is_file():                       # 产物根目录指向最近一档
+        where = where / (where / "latest").read_text(encoding="utf-8").strip()  # 跟着已有存档指针找到权重
+    with torch.device("cpu"):                                               # 构造时就落 CPU，避免临时占卡
+        net = Model(geo)                                                    # 默认 fp32，不复制学生的量化层或挂件
+    net.load(where)                                                         # 从盘上逐份载入，不接触学生参数
+    return net                                                              # 冻结和 eval 由任务统一设置
 
 
 def _setup() -> tuple:

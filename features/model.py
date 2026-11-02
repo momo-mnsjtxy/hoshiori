@@ -1,24 +1,27 @@
 """模型：一个从零搭的小型 decoder-only 因果 Transformer，几何从配方的 model.geometry 读。
+每层是 RMSNorm → 带 RoPE 的因果注意力 → 残差 → RMSNorm → 前馈 → 残差，末尾再归一、算词表打分。
+
+调用方式：Model(Geometry.from_recipe(recipe)) 建模；load 灌权重，save 存 model.safetensors，config 描述几何。
+image_side=0 不建图片参数，旧文本存档照常载入；非零时按原图边长预留 ceil(image_side/patch)² 个位置。
+max_seq_len 仍是文本长度预算，图片前缀额外占位置；实际图片尺寸和同批块数由下游统一，本层不缩放图片。
+forward(ids, patches=None) 接收 (批, 文本长)；可选 patches 是归一后的 RGB，形状 (批, 块数, patch, patch, 3)，
+也可预先展平成 (批, 块数, patch*patch*3)，张量的设备、精度与模型一致。返回 (批, 块数+文本长, 词表)，
+下游取 logits[:, 块数:] 后沿用文本标签和损失；图片与文字共用 RoPE，图片从 0 开始，文字接着编号。
+量化顺序仍是 load → quantize → 建优化器；无卡时保持 fp32，压过后可训的只剩 LoRA 的 A/B。
+文本权重沿用 HF 名字，tie 为真时只存一份词表；图片投影以 image_proj.weight 随完整权重保存、载入。
 
 调用示例：
-  from features.model import Geometry, Model
-  geo = Geometry.from_recipe(recipe)      # 读 d_model、layers、heads、d_head、vocab、max_seq_len、rope_base、tie
-  model = Model(geo)                      # 按几何搭架子，权重随机起
-  model.load(Path("ckpt"))                # 灌权重：把同名张量逐个灌回去
-  model.quantize("nf4")                   # 灌完之后、建优化器之前压成 4bit；返回真压了没有
-  logits = model(ids)                     # 形状 (批, 序列, 词表)
-  model.save(Path("out/1"))               # 存成 model.safetensors
-
-量化的时序不能换：先把权重灌进 fp32 的线层，再换层压下去；先压再灌的话，safetensors 里的 fp32 数字没地方放。
-压过之后量化层自己不带梯度，能训的只剩 LoRA 的 A/B；没挂件时训练器没有可训参数，命令层会拦。
-没有卡的时候量不了，quantize 保持 fp32 并 warn 一行，不崩。
-
-一层长这样：RMSNorm → 因果注意力（带 RoPE）→ 残差 → RMSNorm → 前馈 → 残差。
-整摞是 pre-norm，最后一道 RMSNorm 之后接输出层；tie 为真时输出层直接复用词表权重。
-
-张量名照 HF 那套叫法（model.embed_tokens.weight、model.layers.0.self_attn.q_proj.weight、model.norm.weight），
-features/forge.py 的改名表就是按这套写的，导出 GGUF 不用另配一份映射。
-tie 为真时输出层不单独占参数，存盘只写一份词表，前向直接拿词表权重转置当输出层。
+  from pathlib import Path                                                    # 存档位置
+  import torch                                                                # 造一批模型输入
+  from features.model import Geometry, Model                                   # 几何与模型
+  geo = Geometry(image_side=32, patch=16)                                      # 四块图片前缀
+  model = Model(geo)                                                          # 按几何搭架子，权重随机起
+  ids = torch.tensor([[1, 2]])                                                # 两个文本位置
+  patches = torch.zeros(1, 4, 16, 16, 3)                                      # 已归一的 RGB 图片块
+  logits = model(ids, patches=patches)                                        # 形状 (1, 6, 512)
+  text_logits = logits[:, patches.shape[1]:]                                  # 两个文本位置的打分
+  model.save(Path("out/1"))                                                   # 存成 model.safetensors
+  model.load(Path("out/1"))                                                   # 几何一致就能完整灌回
 """
 
 import json
@@ -40,18 +43,22 @@ DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16, 
 QUANT = {"nf4", "int8"}  # 真要压下去的精度；其余是普通 dtype，压不压都不经过 bitsandbytes
 
 
-@dataclass
-class Geometry:
+# ---------- 模型几何 ----------
+
+@dataclass                        # 几何字段可直接传给构造器
+class Geometry:                   # 文本和图片共用一份几何
     """模型几何。默认值是一套能在 CPU 上几十秒跑完的演示尺寸。"""
 
-    d_model: int = 128  # 隐藏维度
-    layers: int = 4  # 层数
-    heads: int = 4  # 注意力头数
-    d_head: int = 32  # 每个头的宽度，heads × d_head 要等于 d_model
-    vocab: int = 512  # 词表大小
-    max_seq_len: int = 128  # 最长序列
-    rope_base: float = 10000.0  # RoPE 的底数
-    tie: bool = True  # 输出层是否复用词表权重
+    d_model: int = 128             # 隐藏维度
+    layers: int = 4                # 层数
+    heads: int = 4                 # 注意力头数
+    d_head: int = 32               # 每个头的宽度，heads × d_head 要等于 d_model
+    vocab: int = 512               # 词表大小
+    max_seq_len: int = 128         # 最长文本序列，图片前缀额外预留位置
+    rope_base: float = 10000.0     # RoPE 的底数
+    tie: bool = True              # 输出层是否复用词表权重
+    image_side: int = 0           # 原图边长，0 表示不接图
+    patch: int = 16               # 图片块边长，接图时用正整数，右侧和底部可补齐
 
     @classmethod
     def from_recipe(cls, recipe: dict) -> "Geometry":
@@ -180,51 +187,65 @@ class Block(nn.Module):
 class Core(nn.Module):
     """主体那一摞：词表、各层、收尾归一。名字前面挂 model. 就是为了对上 HF 的叫法。"""
 
-    def __init__(self, geo: Geometry, dtype: torch.dtype) -> None:
-        super().__init__()
-        self.embed_tokens = nn.Embedding(geo.vocab, geo.d_model)  # 词表
-        nn.init.normal_(self.embed_tokens.weight, std=0.02)  # 小方差起，初始打分不会一上来就几百，loss 从 ln(词表) 附近开始
-        self.layers = nn.ModuleList([Block(geo) for _ in range(geo.layers)])  # 一摞层
-        self.norm = RMSNorm(geo.d_model)  # 收尾归一
-        cos, sin = rope_cache(geo.max_seq_len, geo.d_head, geo.rope_base, dtype)  # 位置编码的表
-        self.register_buffer("rope_cos", cos, persistent=False)  # 不存盘，载入时重建
-        self.register_buffer("rope_sin", sin, persistent=False)  # 同上
+    # ---------- 建主体 ----------
 
-    def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        """查表 → 逐层 → 收尾归一。"""
-        _, steps = ids.shape  # 批和序列
-        x = self.embed_tokens(ids)  # 查表
-        cos, sin = self.rope_cos[:, :, :steps], self.rope_sin[:, :, :steps]  # 按当前长度切表
-        for block in self.layers:  # 一层一层往下走
-            x = block(x, cos, sin)  # 每层都带残差
-        return self.norm(x)  # 收尾归一
+    def __init__(self, geo: Geometry, dtype: torch.dtype) -> None:                         # 按几何搭词表和各层
+        super().__init__()                                                              # 注册模型模块
+        self.embed_tokens = nn.Embedding(geo.vocab, geo.d_model)                          # 文本词表
+        nn.init.normal_(self.embed_tokens.weight, std=0.02)                               # 小方差起，初始损失靠近 ln(词表)
+        self.layers = nn.ModuleList([Block(geo) for _ in range(geo.layers)])               # 文字和图片走同一摞层
+        self.norm = RMSNorm(geo.d_model)                                                 # 收尾归一
+        image_steps = math.ceil(geo.image_side / geo.patch) ** 2 if geo.image_side else 0  # 非整除边长也要容下补边的块
+        length = geo.max_seq_len + image_steps                                           # 保留原文本预算，再加图片位置
+        cos, sin = rope_cache(length, geo.d_head, geo.rope_base, dtype)                    # 图片、文字共用一张位置表
+        self.register_buffer("rope_cos", cos, persistent=False)                          # 不存盘，载入时重建
+        self.register_buffer("rope_sin", sin, persistent=False)                          # 同一位置的正弦分量
+
+    # ---------- 图片前缀与文本一起过各层 ----------
+
+    def forward(self, ids: torch.Tensor, prefix: torch.Tensor = None) -> torch.Tensor:    # prefix 已投影到隐藏维
+        """查词表 → 拼可选图片前缀 → 共用 RoPE 逐层计算 → 收尾归一，保留全部位置。"""
+        x = self.embed_tokens(ids)                                                      # 文本仍从同一张词表取嵌入
+        if prefix is not None:                                                          # 有图片才增加前缀位置
+            x = torch.cat((prefix, x), dim=1)                                            # 图片在前，所有文本都能看见图片
+        steps = x.shape[1]                                                              # 实际总长度包括图片块
+        cos, sin = self.rope_cos[:, :, :steps], self.rope_sin[:, :, :steps]                # 从 0 连续编号，文字接在图片后
+        for block in self.layers:                                                       # 一层一层往下走
+            x = block(x, cos, sin)                                                      # 同一因果注意力处理全部位置
+        return self.norm(x)                                                             # 收尾归一
 
 
 class Model(nn.Module):
     """整摞模型：主体那摞加上输出层。"""
 
-    def __init__(self, geo: Geometry, precision: str = "fp32") -> None:
-        super().__init__()
-        self.geo = geo  # 几何留在身上，存盘和报数都要用
-        self.dtype = geo.dtype(precision)  # 权重类型
-        self.grad_checkpoint = False  # 打开后前向分段重算，用时间换显存；训练器按配方设
-        self.quantized = False  # 压过量化层没有
-        self.model = Core(geo, self.dtype)  # 主体
-        self.lm_head = None if geo.tie else nn.Linear(geo.d_model, geo.vocab, bias=False)  # 不共用就单独一层
-        for name, one in self.named_parameters():  # 残差两路的输出投影按层数缩小，深堆时激活不炸
-            if name.endswith("o_proj.weight") or name.endswith("down_proj.weight"):
-                nn.init.normal_(one, std=0.02 / math.sqrt(2 * geo.layers))
-        self.to(self.dtype)  # 整体落到目标精度
+    # ---------- 建完整模型 ----------
 
-    def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        """前向，返回每个位置的词表打分。"""
-        if self.grad_checkpoint and self.training:  # 重算模式：中间激活不驻留，反向时把这一段前向再跑一遍
-            x = checkpoint(self.model, ids, use_reentrant=False)  # 只留输入和输出
-        else:  # 常规一次过
-            x = self.model(ids)  # 走完整摞
-        if self.lm_head is None:  # 共用词表就直接拿词表权重做输出
-            return x @ self.model.embed_tokens.weight.T  # (批, 序列, 词表)
-        return self.lm_head(x)  # 独立输出层
+    def __init__(self, geo: Geometry, precision: str = "fp32") -> None:                                  # 默认仍是纯文本模型
+        super().__init__()                                                                           # 注册模型模块
+        self.geo = geo                                                                               # 几何留在身上，存盘和报数都要用
+        self.dtype = geo.dtype(precision)                                                            # 权重类型
+        self.grad_checkpoint = False                                                                # 训练器可开启前向重算，节省显存
+        self.quantized = False                                                                      # 记下量化层是否已替换
+        self.model = Core(geo, self.dtype)                                                           # 主体
+        self.lm_head = None if geo.tie else nn.Linear(geo.d_model, geo.vocab, bias=False)                # 不共用就单独一层
+        for name, one in self.named_parameters():                                                     # 残差输出按层数缩小，深堆时激活不炸
+            if name.endswith("o_proj.weight") or name.endswith("down_proj.weight"):                    # 注意力与前馈各自的出口
+                nn.init.normal_(one, std=0.02 / math.sqrt(2 * geo.layers))                             # 保持已有文本权重的初始化顺序
+        self.image_proj = nn.Linear(geo.patch ** 2 * 3, geo.d_model, bias=False) if geo.image_side else None  # RGB 块投影；最后才建，不扰动文本初始化
+        self.to(self.dtype)                                                                          # 图片层也一起落到目标精度
+
+    # ---------- 前向打分 ----------
+
+    def forward(self, ids: torch.Tensor, patches: torch.Tensor = None) -> torch.Tensor:                # 下游显式传入图片块
+        """返回 (批, 图片块数+文本长, 词表)；patches 为同设备、同精度的归一 RGB 块，可预先展平。"""
+        prefix = None if patches is None else self.image_proj(patches.flatten(2))                     # 每块展平后投到 d_model
+        if self.grad_checkpoint and self.training:                                                    # 重算时也把图片前缀带上
+            x = checkpoint(self.model, ids, prefix, use_reentrant=False)                              # 保留图片投影的梯度链
+        else:                                                                                        # 常规一次过
+            x = self.model(ids, prefix)                                                              # 图片和文字走完整摞
+        if self.lm_head is None:                                                                      # 共用词表就直接拿词表权重做输出
+            return x @ self.model.embed_tokens.weight.T                                              # 图片与文字位置都返回词表打分
+        return self.lm_head(x)                                                                       # 独立输出层
 
     def count(self) -> int:
         """参数量，只含真正占参数的张量。"""
@@ -282,20 +303,24 @@ class Model(nn.Module):
         self.quantized = True
         return True
 
-    def config(self, precision: str) -> dict:
+    # ---------- 描述存档结构 ----------
+
+    def config(self, precision: str) -> dict:                      # 配置跟权重一起交给下游
         """给导出和排查用的结构描述，字段名照 HF 的 config.json。"""
-        return {
-            "model_type": "hoshiori",  # 结构名
-            "hidden_size": self.geo.d_model,  # 隐藏维
-            "num_hidden_layers": self.geo.layers,  # 层数
-            "num_attention_heads": self.geo.heads,  # 头数
-            "head_dim": self.geo.d_head,  # 头宽
-            "vocab_size": self.geo.vocab,  # 词表
-            "max_position_embeddings": self.geo.max_seq_len,  # 上下文长度
-            "rope_theta": self.geo.rope_base,  # RoPE 底数
-            "tie_word_embeddings": self.geo.tie,  # 输出层是否共用词表
-            "torch_dtype": precision,  # 权重精度
-        }
+        return {                                                 # 直接读取模型正在使用的几何
+            "model_type": "hoshiori",                             # 结构名
+            "hidden_size": self.geo.d_model,                      # 隐藏维
+            "num_hidden_layers": self.geo.layers,                 # 层数
+            "num_attention_heads": self.geo.heads,                # 头数
+            "head_dim": self.geo.d_head,                          # 头宽
+            "vocab_size": self.geo.vocab,                         # 词表
+            "max_position_embeddings": self.model.rope_cos.shape[2],  # 文本预算加图片前缀的总位置数
+            "rope_theta": self.geo.rope_base,                     # RoPE 底数
+            "tie_word_embeddings": self.geo.tie,                  # 输出层是否共用词表
+            "image_side": self.geo.image_side,                   # 原图边长，0 表示不接图
+            "patch": self.geo.patch,                             # 图片块边长，决定投影输入宽度
+            "torch_dtype": precision,                            # 权重精度
+        }                                                        # 图片结构也随配置落盘
 
     def write_config(self, folder: Path, precision: str) -> None:
         """把结构描述写到 folder/config.json。"""

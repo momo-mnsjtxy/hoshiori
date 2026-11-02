@@ -1,4 +1,8 @@
-"""训练的测试：loss 真在掉、存档结构对、续训接得上、LoRA 只动 A/B、分块交叉熵不跑偏。
+"""训练的测试：训练、存档和续训能跑通，参考模型与教师独立载入、冻结在 CPU 并按任务释放。
+
+调用方式：在项目根目录用 pytest 运行本文件；模型缩到 2 层 32 维 64 词表，CPU 上也能验。
+
+调用示例：python -m pytest tests/test_trainer.py -q
 
 约定：
   模型缩到 2 层 32 维 64 词表，数据是 10 条假样本，步数只给二十来步，CPU 上也只跑一两秒。
@@ -13,6 +17,7 @@ import socket
 import sys
 import time
 import types
+import weakref  # 检查任务收尾后冻结模型确实已释放
 
 import pytest
 import torch
@@ -403,12 +408,87 @@ def test_vocab_sets_embedding_size(geo, files, tmp_path):
     assert job.run() == 3  # 按词表编码也能跑
 
 
+# --- 参考模型的独立存储 ---
+
+@pytest.mark.parametrize("loaded", [False, True])
+def test_reference_has_separate_storage(geo, tmp_path, loaded):
+    """随机拷贝和基座重载都不与学生共用参数内存。"""
+    net = model.Model(geo)                                               # 先建学生，保留随机权重
+    base = tmp_path / "base" if loaded else None                         # 两条构建路径都要验
+    if loaded:                                                          # 有基座时由训练器从盘上重载
+        net.save(base)                                                  # 落一份与学生相同的初始权重
+    choice = short(geo, _prefs(tmp_path), tmp_path / "run", task="dpo", base=base)  # 走偏好任务构建参考模型
+    job = trainer.Trainer(net, geo, choice)                              # 参考模型单独存在
+    student = dict(net.named_parameters())                              # 按名字逐个对照学生参数
+    assert job.ref_model is not net                                     # 模型对象也必须独立
+    for name, one in job.ref_model.named_parameters():                   # 每个参数都检查，避免漏掉共享层
+        assert one.untyped_storage().data_ptr() != student[name].untyped_storage().data_ptr()  # 底层存储没有重用
+        assert torch.equal(one, student[name])                          # 初始权重仍与基座一致
+    before = next(job.ref_model.parameters()).detach().clone()          # 留下参考参数的原值
+    with torch.no_grad():                                               # 模拟学生更新
+        next(net.parameters()).add_(1)                                 # 只修改学生的一块权重
+    assert torch.equal(next(job.ref_model.parameters()), before)        # 参考权重不跟着学生变化
+    job.close()                                                         # 没有运行的任务显式释放
+
+
+# --- 参考模型的设备与冻结 ---
+
+@pytest.mark.parametrize("task", ["dpo", "grpo", "ppo"])
+def test_reference_stays_frozen_on_cpu(geo, tmp_path, task):
+    """三种对齐任务的参考模型都在 CPU，输出回到学生设备且不建图。"""
+    here = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # 有卡时同时验跨设备前向
+    net = model.Model(geo).to(here)                                      # 学生按实际环境放设备
+    files = _prefs(tmp_path) if task == "dpo" else _groups(tmp_path)      # 各任务使用对应数据
+    job = trainer.Trainer(net, geo, short(geo, files, tmp_path / "run", task=task))  # 随机起步也得把拷贝搬到 CPU
+    assert all(one.device.type == "cpu" and not one.requires_grad for one in job.ref_model.parameters())  # 全部参数在 CPU 且冻结
+    assert all(one.device.type == "cpu" for one in job.ref_model.buffers())  # 位置编码缓存也不能留在卡上
+    assert all(not one.training for one in job.ref_model.modules())      # 每层都切到 eval
+    ids = torch.randint(1, geo.vocab, (2, 8), device=here)                # 批次先在学生设备上
+    logps = job._logp_ref(ids)                                          # 真跑一次参考前向
+    assert logps.device == ids.device and not logps.requires_grad       # 概率回到学生设备且没有梯度图
+    assert torch.isfinite(logps).all()                                  # 设备搬运后仍有有效数值
+    job.close()                                                         # 验完就释放冻结模型
+
+
+# --- 参考模型从基座载入 ---
+
+def test_reference_loads_base_instead_of_copy(geo, tmp_path, monkeypatch):
+    """给 model.path 对应的 base 时必须调用 Model.load，不许深拷贝学生。"""
+    net = model.Model(geo)                                               # 先建学生
+    base = tmp_path / "base"                                            # 命令层传给 Choice.base 的权重目录
+    net.save(base)                                                      # 保存初始权重
+    before = next(net.parameters()).detach().clone()                    # 磁盘上的第一块权重
+    with torch.no_grad():                                               # 让内存中的学生与磁盘不同
+        next(net.parameters()).add_(1)                                 # 深拷贝学生会读到这个改动
+    calls = []                                                          # 只记载入路径，不持有模型对象
+    original = model.Model.load                                         # 真载入仍然执行
+
+    def load(self, source):                                             # 包一层给载入计数
+        calls.append(source)                                            # 记录每次 Model.load 的来源
+        return original(self, source)                                  # 灌回真实权重
+
+    def copied(memo):                                                   # 只拦这个学生的深拷贝
+        pytest.fail("已有 model.path 时不应深拷贝学生")                  # 载入前偷偷拷贝也不能通过
+
+    monkeypatch.setattr(model.Model, "load", load)                       # 统计 Trainer 内部的载入调用
+    monkeypatch.setattr(net, "__deepcopy__", copied, raising=False)       # 避免影响优化器等对象自己的拷贝
+    choice = short(geo, _prefs(tmp_path), tmp_path / "run", task="dpo", base=base)  # 路径由现有 Choice 字段传入
+    job = trainer.Trainer(net, geo, choice)                              # 独立构造参考模型并读取磁盘
+    assert calls == [base]                                              # Model.load 恰好为参考模型调用一次
+    assert torch.equal(next(job.ref_model.parameters()), before)        # 参考权重来自磁盘，没有学生的内存改动
+    job.close()                                                         # 释放本次构造出的参考模型
+
+
+# --- 偏好训练与释放 ---
+
 def test_dpo_one_step(geo, files, tmp_path):
-    net = model.Model(geo)
-    job = trainer.Trainer(net, geo, short(geo, _prefs(tmp_path), tmp_path / "run", task="dpo", steps=2))
-    assert job.run() == 2  # 偏好对这条路能走完
-    assert math.isfinite(job.history[-1])  # 损失是个正常数
-    assert job.ref_model is not None  # 参考模型建起来了
+    net = model.Model(geo)                                              # 随机起步的学生
+    job = trainer.Trainer(net, geo, short(geo, _prefs(tmp_path), tmp_path / "run", task="dpo", steps=2))  # 两步偏好训练
+    reference = weakref.ref(job.ref_model)                              # 弱引用不会替任务留住模型
+    assert reference() is not None                                     # 开始前参考模型已建好
+    assert job.run() == 2                                               # 偏好对这条路能走完
+    assert math.isfinite(job.history[-1])                               # 损失是个正常数
+    assert job.ref_model is None and reference() is None                 # 收尾后对象确实释放
 
 
 @pytest.mark.parametrize("task", ["grpo", "rloo", "ppo"])
@@ -416,6 +496,7 @@ def test_group_tasks_run(geo, tmp_path, task):
     net = model.Model(geo)
     job = trainer.Trainer(net, geo, short(geo, _groups(tmp_path), tmp_path / "run", task=task, steps=1, group=4))
     assert job.run() == 1  # 组相对这一路能走完
+    assert job.ref_model is None  # 收尾不留参考模型，RLOO 本来就没有
 
 
 def test_distill_needs_teacher(geo, files, tmp_path):
@@ -424,11 +505,20 @@ def test_distill_needs_teacher(geo, files, tmp_path):
         trainer.Trainer(net, geo, short(geo, files, tmp_path / "run", task="distill", steps=1))
 
 
+# --- 教师载入、训练与释放 ---
+
 def test_distill_runs_with_teacher(geo, files, tmp_path):
-    teacher_dir = tmp_path / "teacher"
-    teacher_dir.mkdir()
-    model.Model(geo).save(teacher_dir)  # 拿一份权重当教师
-    net = model.Model(geo)
-    job = trainer.Trainer(net, geo, short(geo, files, tmp_path / "run", task="distill", steps=1, teacher=teacher_dir))
-    assert job.run() == 1  # 蒸馏能跑
-    assert job.teacher is not None  # 教师建起来了
+    teacher_dir = tmp_path / "teacher"                                  # 教师给产物根目录，继续支持 latest
+    model.Model(geo).save(teacher_dir / "step-000001")                    # 拿一份独立权重当教师
+    (teacher_dir / "latest").write_text("step-000001", encoding="utf-8")   # 指向实际权重所在的档
+    here = torch.device("cuda" if torch.cuda.is_available() else "cpu")   # 有卡时也要能跨设备蒸馏
+    net = model.Model(geo).to(here)                                       # 学生放到实际训练设备
+    choice = short(geo, files, tmp_path / "run", task="distill", steps=1, teacher=teacher_dir)  # 教师路径单独传入
+    job = trainer.Trainer(net, geo, choice)                               # 载入教师并冻结
+    teacher = weakref.ref(job.teacher)                                   # 只观察存续，不额外持有模型
+    assert job.teacher is not net and not job.teacher.training           # 教师是独立的 eval 模型
+    assert all(one.device.type == "cpu" and not one.requires_grad for one in job.teacher.parameters())  # 全部教师参数在 CPU 且冻结
+    assert all(left.data_ptr() != right.data_ptr() for left, right in zip(net.parameters(), job.teacher.parameters()))  # 参数内存没有共用
+    assert job.run() == 1                                                # 蒸馏能跑
+    assert math.isfinite(job.history[-1])                                # CPU 教师给出了有效损失
+    assert job.teacher is None and teacher() is None                     # 任务结束后教师也释放
