@@ -158,7 +158,7 @@ def test_image_batch_shape_and_label_prefix(geo, tmp_path, monkeypatch):        
     job = trainer.Trainer(model.Model(pictured), pictured, short(pictured, [path], tmp_path / "run", batch_size=2, steps=1))  # 真建训练任务
     samples = iter(job.samples)                                                         # 文件顺序就是本次批次顺序
     monkeypatch.setattr(job, "_next", lambda: next(samples))                            # 跳过随机洗牌，只考拼批
-    ids, labels, patches = job._batch()                                                 # 取出图片微批
+    ids, labels, patches, block_mask, patch_at = job._batch()                           # 取出图片微批及真实块范围
     assert ids.shape == (2, 7)                                                         # 最长八个号，输入留下前七个
     assert patches.shape == (2, 8, 2, 2, 3)                                           # 两张图决定批内最多八块
     assert labels.shape == (2, 15)                                                     # 八个图片位加七个文本位
@@ -167,7 +167,48 @@ def test_image_batch_shape_and_label_prefix(geo, tmp_path, monkeypatch):        
     assert torch.all(labels[0, 13:] == -100)                                            # 短文本右侧仍是忽略位
     assert torch.all(patches[0, :4] == 1) and torch.all(patches[0, 4:] == 0)             # 单图样本只在右侧补零块
     assert torch.all(patches[1, :4] == 2) and torch.all(patches[1, 4:] == 3)             # 多图按路径次序首尾拼接
+    assert torch.equal(block_mask.cpu(), torch.tensor([[1, 1, 1, 1, 0, 0, 0, 0], [1, 1, 1, 1, 1, 1, 1, 1]], dtype=torch.bool))  # 一图样本后四块无效
+    assert patch_at is None                                                              # 没有 image_at 时仍走整段图片前缀
     job.close()                                                                         # 只验批次，不运行的任务显式释放
+
+
+def test_image_batch_interleaves_at_sample_positions(geo, tmp_path, monkeypatch):       # image_at 展开到每块并同步重排标签
+    path = tmp_path / "interleaved.jsonl"                                               # 两条样本同批，顺便覆盖右补零
+    rows = [                                                                            # 第一条一图，第二条两图
+        {"text": "abcdef", "images": ["one.png"], "image_at": [1]},               # 图跟在 ids[1] 后
+        {"text": "abcdefgh", "images": ["two.png", "three.png"], "image_at": [0, 4]},  # 两图分处不同位置
+    ]
+    path.write_text("\n".join(json.dumps(one) for one in rows), encoding="utf-8")      # 写成训练器实际读取的 JSONL
+    pictured = replace(geo, image_side=4, patch=2)                                      # 每张图固定四块
+    values = {"one.png": 1.0, "two.png": 2.0, "three.png": 3.0}                     # 块值标出所属图片
+
+    def prepare(path, side, patch):                                                     # 图片解码不属于本测试目标
+        blocks = np.full((4, patch, patch, 3), values[Path(path).name], dtype=np.float32)  # 每图交四个同值块
+        return blocks, len(blocks)                                                      # 使用真实 prepare 契约
+
+    monkeypatch.setattr(image, "prepare", prepare)                                     # 只考训练批次的布局
+    job = trainer.Trainer(model.Model(pictured), pictured, short(pictured, [path], tmp_path / "run", batch_size=2, steps=1))  # 真读样本并建任务
+    assert job.samples[0][2] == [1] and job.samples[1][2] == [0, 4]                    # ASCII 字符下标换成同值 token 下标
+    samples = iter(job.samples)                                                        # 固定为文件顺序，便于手算
+    monkeypatch.setattr(job, "_next", lambda: next(samples))                           # 跳过随机洗牌
+    ids, labels, patches, block_mask, patch_at = job._batch()                          # 取得完整五项模型输入
+    expected_at = torch.tensor([                                                       # 第一条四个补位块放到文本末尾
+        [1, 1, 1, 1, 7, 7, 7, 7],
+        [0, 0, 0, 0, 4, 4, 4, 4],
+    ])
+    assert torch.equal(patch_at.cpu(), expected_at)                                    # 每张图的位置按块数展开，次序不变
+    assert torch.equal(block_mask.cpu(), torch.tensor([                                # 真实块与补位块分开
+        [1, 1, 1, 1, 0, 0, 0, 0],
+        [1, 1, 1, 1, 1, 1, 1, 1],
+    ], dtype=torch.bool))
+    text_at, block_at = model.sequence_positions(ids.shape[1], patch_at)               # 与模型共用布局算法核对标签
+    for at, (tokens, _, _) in enumerate(job.samples):                                  # 两条逐项确认文本答案位置
+        assert torch.equal(labels[at, text_at[at, : len(tokens) - 1]].cpu(), torch.tensor(tokens[1:]))  # 答案随文字移动
+        assert torch.all(labels[at, block_at[at]] == -100)                             # 每个图片位都不算语言损失
+    assert torch.all(patches[0, :4] == 1) and torch.all(patches[0, 4:] == 0)            # 补位内容仍在右侧，位置由 patch_at 决定
+    scores = job.model(ids, patches=patches, block_mask=block_mask, patch_at=patch_at)  # 五项直接接真实模型前向
+    assert scores.shape[:2] == labels.shape                                            # 模型交错序列与训练标签逐位对齐
+    job.close()                                                                        # 本测试不跑优化步骤，显式释放
 
 
 def test_text_batch_keeps_original_forward(geo, files, tmp_path, monkeypatch):           # 没有 image_side 时接口和前向都不带图片参数

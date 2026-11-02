@@ -1,12 +1,13 @@
 """样本：从一条原始记录里认出正文和图片路径，按规矩收净、脱敏、评分并决定是否收下。
 
 调用方式：read(record, policy) 返回规范样本；images 可写一个路径或路径数组，默认最多四张。
-拒收是正常业务分支，每条原因码会进入 rejects.jsonl；正文和图片只在这个入口检查一次。
+image_at 可给每张图在清理后正文里的插入下标，数量要与 images 相同，下标严格递增且不超过正文长度。
+拒收是正常业务分支，每条原因码会进入 rejects.jsonl；正文、图片和插入位置只在这个入口检查一次。
 
 调用示例：
   from features import sample
   policy = sample.Policy()                                                        # 默认脱敏，最多收四张图
-  clean = sample.read({"text": " 一段话 ", "images": ["photo.png"]}, policy)    # 正文收净，图片路径保留
+  clean = sample.read({"text": " 一段话 ", "images": ["photo.png"], "image_at": [1]}, policy)  # 图片跟在正文下标 1 后
   sample.read({"text": ""}, policy)                                               # 抛 Refused("too_short")
 """
 
@@ -99,11 +100,23 @@ def read(record: dict, policy: Policy) -> dict:
     for path in images:                                                        # 每个路径只在样本入口检查一次
         if not Path(path).is_file():                                            # 找不到文件就不能留给训练阶段
             raise Refused("no_image", str(path))                               # 明说是哪张图不存在
+    image_at = record.get("image_at")                                          # 不给位置就是旧的整段图片前缀
+    if "image_at" in record:                                                   # 显式给了就必须是一图一个递增下标
+        if not isinstance(image_at, list) or len(image_at) != len(images):      # 数量不齐时训练器无法知道哪张图放哪
+            raise Refused("bad_image_at", "image_at 要与 images 等长")         # 在样本边界直接说明格式
+        if any(type(at) is not int or at < 0 for at in image_at):               # bool 也不能冒充整数下标
+            raise Refused("bad_image_at", "image_at 只能是非负整数下标")       # 不把坏值留到张量 scatter 时才炸
+        if any(left >= right for left, right in zip(image_at, image_at[1:])):    # 每张图要沿正文方向依次出现
+            raise Refused("bad_image_at", "image_at 必须严格递增")             # 相同或倒序都拒收
+        if image_at and image_at[-1] > len(text):                               # 等于正文长度表示放到正文末尾
+            raise Refused("bad_image_at", f"{image_at[-1]} > {len(text)}")      # 留下实际越界值和正文长度
 
     out = {"text": text, "chars": len(text)}                                  # 正文和长度交给下游
     out["source"] = record.get("source") or "unknown"                         # 记来源，混配时按来源称重
     if "images" in record:                                                     # 原记录带图时保留规范后的路径列表
         out["images"] = images                                                 # 训练器按原顺序准备每张图片
+    if "image_at" in record:                                                   # 只给新样本增加字段，旧 bolt 结构不变
+        out["image_at"] = image_at                                             # 训练器按同一顺序展开到每个图片块
     if isinstance(record.get("messages"), list):                               # 对话样本仍保留结构化轮次
         messages = record["messages"]                                         # 关闭脱敏时保持原来的对象与内容
         if policy.scrub:                                                       # 开启后不能让原文从旁路漏进产物

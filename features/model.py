@@ -3,11 +3,12 @@
 
 调用方式：Model(Geometry.from_recipe(recipe)) 建模；load 灌权重，save 存 model.safetensors，config 描述几何。
 image_side=0 不建图片参数，旧文本存档照常载入；非零时按原图边长预留 ceil(image_side/patch)² 个位置。
-max_seq_len 仍是文本长度预算，图片前缀额外占位置；实际图片尺寸和同批块数由下游统一，本层不缩放图片。
-forward(ids, patches=None) 接收 (批, 文本长)；可选 patches 是归一后的 RGB，形状 (批, 块数, patch, patch, 3)，
-也可预先展平成 (批, 块数, patch*patch*3)，张量的设备、精度与模型一致。图片先经 image_proj、image_align，
-再作为前缀进入主体；图片与文字共用 RoPE，图片从 0 开始，文字接着编号。align_weight 默认 0，此时仍只返回
-(批, 块数+文本长, 词表)；权重大于 0 时返回 (logits, 对齐损失)，供调用方与语言损失相加。
+max_seq_len 仍是文本长度预算，图片块额外占位置；实际图片尺寸和同批块数由下游统一，本层不缩放图片。
+forward(ids, patches=None, block_mask=None, patch_at=None) 接收 (批, 文本长)；可选 patches 是归一后的 RGB，
+形状 (批, 块数, patch, patch, 3)，也可预先展平成 (批, 块数, patch*patch*3)。block_mask 以 1/0 标出
+真实块和批内补位块；patch_at 给每块所跟随的文本下标，不给时仍把整段图片放在文本前。图片与文字共用 RoPE，
+按拼好后的序列从 0 连续编号。align_weight 默认 0，此时只返回 (批, 块数+文本长, 词表)；权重大于 0 时
+返回 (logits, 对齐损失)，供调用方与语言损失相加。
 量化顺序仍是 load → quantize → 建优化器；无卡时保持 fp32，压过后可训的只剩 LoRA 的 A/B。
 文本权重沿用 HF 名字，tie 为真时只存一份词表；图片投影和 image_align.linear_1/linear_2 随完整权重保存、载入。
 
@@ -19,7 +20,8 @@ forward(ids, patches=None) 接收 (批, 文本长)；可选 patches 是归一后
   model = Model(geo)                                                          # 按几何搭架子，权重随机起
   ids = torch.tensor([[1, 2]])                                                # 两个文本位置
   patches = torch.zeros(1, 4, 16, 16, 3)                                      # 已归一的 RGB 图片块
-  logits = model(ids, patches=patches)                                        # 形状 (1, 6, 512)
+  mask = torch.tensor([[1, 1, 1, 0]])                                         # 最后一块只是批内补位
+  logits = model(ids, patches=patches, block_mask=mask)                       # 形状 (1, 6, 512)
   text_logits = logits[:, patches.shape[1]:]                                  # 两个文本位置的打分
   model.save(Path("out/1"))                                                   # 存成 model.safetensors
   model.load(Path("out/1"))                                                   # 几何一致就能完整灌回
@@ -55,7 +57,7 @@ class Geometry:                   # 文本和图片共用一份几何
     heads: int = 4                 # 注意力头数
     d_head: int = 32               # 每个头的宽度，heads × d_head 要等于 d_model
     vocab: int = 512               # 词表大小
-    max_seq_len: int = 128         # 最长文本序列，图片前缀额外预留位置
+    max_seq_len: int = 128         # 最长文本序列，图片块额外预留位置
     rope_base: float = 10000.0     # RoPE 的底数
     tie: bool = True              # 输出层是否复用词表权重
     image_side: int = 0           # 原图边长，0 表示不接图
@@ -132,6 +134,17 @@ def rotate(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tenso
     return (pairs * cos.unsqueeze(-1) + turned * sin.unsqueeze(-1)).flatten(-2)  # 按角度加权后拼回头宽
 
 
+def sequence_positions(text_steps: int, patch_at: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """算出交错序列里文字与图片块各自落在哪；patch_at 已按块顺序非递减。"""
+    anchors = patch_at.clamp(min=-1, max=text_steps)                           # -1 是内部使用的前缀位，文本长度及以后都是后缀位
+    text = torch.arange(text_steps, device=patch_at.device)                    # 原文本位置 0 到 text_steps-1
+    before = (anchors.unsqueeze(-1) < text).sum(dim=1)                         # 每个文本位置之前已经插入了多少块
+    text_at = text.unsqueeze(0) + before                                      # 原文本位置加上前面的块数就是新位置
+    order = torch.arange(patch_at.shape[1], device=patch_at.device)            # 同一锚点的块仍按原顺序首尾相接
+    block_at = (anchors + 1).clamp(min=0, max=text_steps) + order.unsqueeze(0)  # 图片紧跟锚点，前面已有的块也要让位
+    return text_at.long(), block_at.long()                                    # scatter / gather 的下标统一用 long
+
+
 class Attention(nn.Module):
     """多头因果注意力，权重名照 q_proj / k_proj / v_proj / o_proj 起。"""
 
@@ -144,13 +157,17 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(geo.d_model, geo.heads * geo.d_head, bias=False)  # 值
         self.o_proj = nn.Linear(geo.heads * geo.d_head, geo.d_model, bias=False)  # 拼回隐藏维
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
         """前向：投影 → 分头 → 转位置 → 因果注意力 → 合头 → 投影回。"""
         batch, steps, _ = x.shape  # 批、序列、隐藏维
         split = lambda part: part.view(batch, steps, self.heads, self.d_head).transpose(1, 2)  # 拆成 (批, 头, 序列, 头宽)
         query, key, value = split(self.q_proj(x)), split(self.k_proj(x)), split(self.v_proj(x))  # 三路投影后分头
         query, key = rotate(query, cos, sin), rotate(key, cos, sin)  # 只转查询和键，值不动
-        out = F.scaled_dot_product_attention(query, key, value, is_causal=True)  # 因果遮罩里的缩放点积
+        out = F.scaled_dot_product_attention(                                  # 缩放点积在分数上同时执行因果与补位遮罩
+            query, key, value,                                                  # 查询、键和值已经分头并带上位置
+            attn_mask=attention_mask,                                           # 有补位块时，假值表示这个键不能被任何查询看到
+            is_causal=attention_mask is None,                                   # 没补位时保留原来的高效因果路径和数值行为
+        )
         return self.o_proj(out.transpose(1, 2).reshape(batch, steps, -1))  # 头拼回去再投影
 
 
@@ -179,9 +196,9 @@ class Block(nn.Module):
         self.post_attention_layernorm = RMSNorm(geo.d_model)  # 进前馈前再归一
         self.mlp = Feed(geo)  # 前馈
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
         """残差两跳，平铺直叙。"""
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin)  # 注意力这一跳
+        x = x + self.self_attn(self.input_layernorm(x), cos, sin, attention_mask)  # 注意力这一跳，补位键在分数里被挡住
         return x + self.mlp(self.post_attention_layernorm(x))  # 前馈这一跳
 
 
@@ -202,17 +219,44 @@ class Core(nn.Module):
         self.register_buffer("rope_cos", cos, persistent=False)                          # 不存盘，载入时重建
         self.register_buffer("rope_sin", sin, persistent=False)                          # 同一位置的正弦分量
 
-    # ---------- 图片前缀与文本一起过各层 ----------
+    # ---------- 图片块与文本一起过各层 ----------
 
-    def forward(self, ids: torch.Tensor, prefix: torch.Tensor = None) -> torch.Tensor:    # prefix 已投影到隐藏维
-        """查词表 → 拼可选图片前缀 → 共用 RoPE 逐层计算 → 收尾归一，保留全部位置。"""
-        x = self.embed_tokens(ids)                                                      # 文本仍从同一张词表取嵌入
-        if prefix is not None:                                                          # 有图片才增加前缀位置
-            x = torch.cat((prefix, x), dim=1)                                            # 图片在前，所有文本都能看见图片
-        steps = x.shape[1]                                                              # 实际总长度包括图片块
-        cos, sin = self.rope_cos[:, :, :steps], self.rope_sin[:, :, :steps]                # 从 0 连续编号，文字接在图片后
+    def forward(
+        self,
+        ids: torch.Tensor,
+        image_hidden: torch.Tensor = None,
+        block_mask: torch.Tensor = None,
+        patch_at: torch.Tensor = None,
+    ) -> torch.Tensor:                                                                  # image_hidden 已投影并对齐到隐藏维
+        """查词表 → 拼图片块 → 合成因果/补位遮罩 → 共用 RoPE 逐层计算 → 收尾归一。"""
+        text = self.embed_tokens(ids)                                                   # 文本仍从同一张词表取嵌入
+        x = text                                                                        # 没图时就是原来的纯文本序列
+        key_mask = None                                                                 # 不给块遮罩时，所有键都按原行为有效
+        if image_hidden is not None and patch_at is None:                               # 旧样本仍把所有图片块放在文本之前
+            x = torch.cat((image_hidden, text), dim=1)                                  # 图片在前，所有文本都能看见图片
+            if block_mask is not None:                                                 # 只在调用方明确给出真实块范围时造遮罩
+                text_mask = torch.ones(ids.shape, dtype=torch.bool, device=ids.device)  # 每个文本键都有效
+                key_mask = torch.cat((block_mask.bool(), text_mask), dim=1)             # 图片键按 1/0，文本键全放行
+        elif image_hidden is not None:                                                  # patch_at 把每块放到指定文本位置之后
+            text_at, block_at = sequence_positions(text.shape[1], patch_at)             # 两类位置共用唯一的布局算法
+            steps = text.shape[1] + image_hidden.shape[1]                               # 拼完仍是文本数加块数
+            x = text.new_empty((text.shape[0], steps, text.shape[2]))                   # 先留出完整交错序列
+            x.scatter_(1, text_at.unsqueeze(-1).expand_as(text), text)                  # 文本逐项放回自己的新位置
+            x.scatter_(1, block_at.unsqueeze(-1).expand_as(image_hidden), image_hidden) # 图片块紧跟各自锚点
+            if block_mask is not None:                                                 # 交错位置下同样只遮图片补位键
+                key_mask = torch.ones((text.shape[0], steps), dtype=torch.bool, device=text.device)  # 文本键先全放行
+                key_mask.scatter_(1, block_at, block_mask.bool())                       # 图片位置写入真实块标记
+        steps = x.shape[1]                                                              # 实际总长度包括全部图片位
+        attention_mask = None                                                           # 无补位块时继续使用 SDPA 自带因果遮罩
+        if key_mask is not None:                                                       # 有补位块时把两种限制合成一张分数遮罩
+            causal = torch.ones((steps, steps), dtype=torch.bool, device=x.device).tril()  # 每个查询只能看自己和过去
+            attention_mask = causal[None, None] & key_mask[:, None, None, :]            # 补位图片不能作为任何查询的键
+        cos, sin = self.rope_cos[:, :, :steps], self.rope_sin[:, :, :steps]            # 按拼好后的顺序从 0 连续编号
         for block in self.layers:                                                       # 一层一层往下走
-            x = block(x, cos, sin)                                                      # 同一因果注意力处理全部位置
+            if attention_mask is None:                                                 # 保留旧调用形状，观察钩子也不多一个空参数
+                x = block(x, cos, sin)                                                 # 原来的纯因果注意力路径
+            else:                                                                      # 有图片补位才传合成遮罩
+                x = block(x, cos, sin, attention_mask)                                 # 每层都挡住同一批补位键
         return self.norm(x)                                                             # 收尾归一
 
 
@@ -230,12 +274,20 @@ class ImageAlign(nn.Module):
         return self.linear_2(self.act(self.linear_1(image_hidden)))  # 图片块逐个映到文本隐藏空间
 
 
-def align_loss(image_hidden: torch.Tensor, text_hidden: torch.Tensor) -> torch.Tensor:
-    """返回同批图文表示的 1 - 平均余弦；两个序列先各自在位置维做均值池化。"""
-    image_mean = image_hidden.float().mean(dim=1)                        # 每张图的全部块合成一个 fp32 表示
+def align_loss(image_hidden: torch.Tensor, text_hidden: torch.Tensor, block_mask: torch.Tensor = None) -> torch.Tensor:
+    """返回同批图文表示的 1 - 平均余弦；补位块和整条无图样本都不进入平均。"""
+    if block_mask is None:                                               # 旧调用没有补位概念，全部块照常取均值
+        image_mean = image_hidden.float().mean(dim=1)                    # 每张图的全部块合成一个 fp32 表示
+        samples = torch.ones(image_hidden.shape[0], device=image_hidden.device)  # 批内每条都有有效图片
+    else:                                                               # 批次补齐后只汇总 mask 为 1 的真实块
+        valid = block_mask.to(dtype=torch.float32).unsqueeze(-1)         # 变成 (批, 块, 1)，逐隐藏维广播
+        counts = valid.sum(dim=1)                                       # 每条样本自己的真实块数
+        image_mean = (image_hidden.float() * valid).sum(dim=1) / counts.clamp_min(1)  # 补位值完全不进图片均值
+        samples = (counts.squeeze(-1) > 0).float()                       # 整条没有图片时也不制造一份虚假对齐损失
     text_mean = text_hidden.float().mean(dim=1)                          # 同批每段文本也合成一个表示
     similarity = F.cosine_similarity(image_mean, text_mean, dim=-1)      # 批内按样本一一配对，不跨样本混合
-    return 1 - similarity.mean()                                         # 越接近同一方向，损失越靠近零
+    losses = (1 - similarity) * samples                                 # 只留下至少有一个真实块的样本
+    return losses.sum() / samples.sum().clamp_min(1)                     # 全批无图时返回可反传的标量零
 
 
 class Model(nn.Module):
@@ -261,16 +313,27 @@ class Model(nn.Module):
 
     # ---------- 前向打分 ----------
 
-    def forward(self, ids: torch.Tensor, patches: torch.Tensor = None) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:  # 下游显式传入图片块
+    def forward(
+        self,
+        ids: torch.Tensor,
+        patches: torch.Tensor = None,
+        block_mask: torch.Tensor = None,
+        patch_at: torch.Tensor = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:                              # 下游显式传入图片块及其布局
         """返回 logits；align_weight 为正时再返回一个加权标量对齐损失。"""
         image_hidden = None                                                                          # 无图前向不增加前缀，也没有图文损失
         if patches is not None:                                                                      # 有图片才走两段图片映射
-            image_hidden = self.image_proj(patches.flatten(2))                                       # 每块展平后先投到 d_model
+            pixels = patches.flatten(2)                                                              # 每块先展平成一行 RGB
+            if block_mask is not None:                                                               # 补位像素不必进入线层，极端伪值也不会先溢出
+                pixels = pixels * block_mask.unsqueeze(-1).to(pixels.dtype)                           # 无效块在图片通路入口就是零
+            image_hidden = self.image_proj(pixels)                                                   # 真实块先投到 d_model
             image_hidden = self.image_align(image_hidden)                                            # 再对齐到文本隐藏空间后进入 Block
-        if self.grad_checkpoint and self.training:                                                    # 重算时也把图片前缀带上
-            x = checkpoint(self.model, ids, image_hidden, use_reentrant=False)                        # 保留图片投影与对齐层的梯度链
+            if block_mask is not None:                                                               # 补位块自身也归零，连它自己的输出都不依赖补位像素
+                image_hidden = image_hidden * block_mask.unsqueeze(-1).to(image_hidden.dtype)         # 再消掉对齐层偏置产生的补位表示
+        if self.grad_checkpoint and self.training:                                                    # 重算时也把图片布局和遮罩带上
+            x = checkpoint(self.model, ids, image_hidden, block_mask, patch_at, use_reentrant=False)  # 保留图片投影与对齐层的梯度链
         else:                                                                                        # 常规一次过
-            x = self.model(ids, image_hidden)                                                        # 图片和文字走完整摞
+            x = self.model(ids, image_hidden, block_mask, patch_at)                                  # 图片和文字按同一布局走完整摞
         if self.lm_head is None:                                                                      # 共用词表就直接拿词表权重做输出
             logits = x @ self.model.embed_tokens.weight.T                                            # 图片与文字位置都返回词表打分
         else:                                                                                        # 不共用词表时走独立输出层
@@ -279,8 +342,12 @@ class Model(nn.Module):
             return logits                                                                            # 旧调用方不需要拆元组
         if image_hidden is None:                                                                     # 这一批没有图片就没有可对齐的表示
             return logits, x.float().sum() * 0.0                                                     # 仍交回可反传的标量零，返回结构不变
-        text_hidden = x[:, image_hidden.shape[1]:]                                                   # 图片位置之后就是同批文本隐状态
-        alignment = align_loss(image_hidden, text_hidden) * self.align_weight                         # 权重在模型边界统一乘一次
+        if patch_at is None:                                                                         # 前缀布局的文本仍是一段连续后缀
+            text_hidden = x[:, image_hidden.shape[1]:]                                               # 跳过开头图片位即可取回文本
+        else:                                                                                        # 交错布局要按同一张位置表取回文本
+            text_at, _ = sequence_positions(ids.shape[1], patch_at)                                  # 不重新猜图片插入位置
+            text_hidden = x.gather(1, text_at.unsqueeze(-1).expand(-1, -1, x.shape[-1]))             # 恢复成 (批, 文本长, 隐藏维)
+        alignment = align_loss(image_hidden, text_hidden, block_mask) * self.align_weight             # 权重在模型边界统一乘一次
         return logits, alignment                                                                     # 调用方可把第二项加入语言损失
 
     def count(self) -> int:
@@ -350,7 +417,7 @@ class Model(nn.Module):
             "num_attention_heads": self.geo.heads,                # 头数
             "head_dim": self.geo.d_head,                          # 头宽
             "vocab_size": self.geo.vocab,                         # 词表
-            "max_position_embeddings": self.model.rope_cos.shape[2],  # 文本预算加图片前缀的总位置数
+            "max_position_embeddings": self.model.rope_cos.shape[2],  # 文本预算加图片块的总位置数
             "rope_theta": self.geo.rope_base,                     # RoPE 底数
             "tie_word_embeddings": self.geo.tie,                  # 输出层是否共用词表
             "image_side": self.geo.image_side,                   # 原图边长，0 表示不接图

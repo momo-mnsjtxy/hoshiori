@@ -26,6 +26,7 @@ COMMANDS = {
     "vocab": "commands.vocab",
     "spin": "commands.spin",
     "judge": "commands.judge",
+    "board": "commands.board",
     "forge": "commands.forge",
     "serve": "commands.serve",
     "loom": "commands.loom",
@@ -100,6 +101,12 @@ def parser() -> argparse.ArgumentParser:
     judge.add_argument("--out", default="out/judge", help="报告目录，默认 out/judge")
     judge.add_argument("--submit", help="跑完把公开字段 POST 到这个榜单 URL；断网就留待补文件")
     judge.add_argument("--import-lm-eval", action="append", help="导入 lm-eval 任务成套件，给了就只导入")
+
+    board = below.add_parser("board", help="把收到的评测提交发布成静态公开榜")
+    board_actions = board.add_subparsers(dest="action", required=True)
+    board_collect = board_actions.add_parser("collect", help="收齐 board-*.json 并发布")
+    board_collect.add_argument("folder", metavar="目录", help="收到 board-*.json 的目录")
+    board_collect.add_argument("--out", required=True, help="index.html 与 board.json 的输出目录")
 
     forge = below.add_parser("forge", help="导出")
     forge.add_argument("recipe")

@@ -4,6 +4,7 @@
 字段白名单集中在 FIELDS，拼错会报最近似的候选。train.reward 可指向定义 reward(payload) 的
 Python 文件；命令层会按配方所在目录解析并检查它。model.geometry.image_side 是原图边长，0 表示
 不接图；patch 是块边长，默认 16；接图时必须为正数并整除 image_side，训练器据此准备固定大小的图片块。
+data.files 里的图片样本可带 image_at；它是一图一个的递增正文下标，由样本入口按正文实际长度校验。
 
 调用示例：
   from pathlib import Path                      # 配方文件的位置
@@ -43,7 +44,7 @@ FIELDS = {
             "heads": int,               # 注意力头数
             "d_head": int,              # 每头宽度，heads × d_head 要等于 d_model
             "vocab": int,               # 词表大小
-            "max_seq_len": int,         # 最长文本序列，图片前缀额外预留位置
+            "max_seq_len": int,         # 最长文本序列，图片块额外预留位置
             "rope_base": (int, float),  # RoPE 底数，写 10000 或 10000.0 都行
             "tie": bool,                # 输出层是否复用词表权重
             "image_side": int,          # 原图边长，0 表示不接图
@@ -53,7 +54,7 @@ FIELDS = {
         "teacher": str,  # distill 的教师权重
     },
     "data": {
-        "files": list,  # 训练数据，weave 出来的 bolt.jsonl
+        "files": list,  # 训练数据，weave 出来的 bolt.jsonl；图片记录可带已在样本入口校验的 image_at
         "warp": str,  # 混配配方，多来源时才给
         "fingerprint": str,  # 数据的指纹，跑之前拿来比对不对
         "fields": list,  # 正文优先取的字段名

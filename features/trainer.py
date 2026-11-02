@@ -1,7 +1,8 @@
 """训练：读取文本与可选图片，拼批、前向、反向，并管理存档和本次任务的冻结模型。
 
 调用方式：Trainer(model, geo, choice).run() 跑完整趟；image_side 大于零时，bolt 样本的 images
-会缩放切块并作为文本前缀，图片位置不计损失。组相对任务给 Choice.reward 时，每条候选会在
+会缩放切块，image_at 可把各图插进正文；没给位置仍作为文本前缀，图片位置不计语言损失。
+同批补出的零块由 block_mask 标出并随前向传递。组相对任务给 Choice.reward 时，每条候选会在
 沙箱里调用 reward({prompt, response, ...元数据})，结果覆盖数据里的 rewards。
 多卡、续训、健康检查和参考模型仍由同一实例管理。
 
@@ -29,6 +30,7 @@ from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from features import alignment, image, lora, sandbox
+from features.model import sequence_positions
 from utils import logs
 from utils.fail import fail
 
@@ -148,22 +150,43 @@ class Trainer:
             return self.choice.vocab.ids_of(text, self.geo.max_seq_len)
         return [byte % self.geo.vocab for byte in text.encode("utf-8")[: self.geo.max_seq_len]]  # 兜底：字节取模
 
+    def _image_positions(self, text: str, positions: list) -> list:
+        """把正文字符下标换成 ids 下标；真词表的 ids_of 会补齐，位置计算不能直接取它的长度。"""
+        out = []                                                                  # 依图片顺序攒分词后的锚点
+        for at in positions:                                                      # 样本入口已经保证字符下标严格递增
+            prefix = text[: at + 1]                                               # image_at 表示跟在这个字符之后
+            if self.choice.vocab is not None:                                     # 真词表先编码内容，不带 </s> 与 pad
+                tokens = self.choice.vocab.encode(prefix)                         # ids_of 总是补到 max_seq_len，不能用于定位
+                anchor = min(len(tokens) - 1, self.geo.max_seq_len - 2)           # 给 </s> 留出的最后一格不算正文位置
+            else:                                                                # 无词表时一个 UTF-8 字节就是一个兜底 token
+                size = min(len(prefix.encode("utf-8")), self.geo.max_seq_len)     # 与 _ids 的截断规则一致
+                anchor = size - 1                                                 # 最后一个前缀 token 的下标
+            if out:                                                              # BPE 加长前缀后可能重新合并成更少 token
+                anchor = max(anchor, out[-1])                                     # 图片顺序仍按递增字符位置保持非递减
+            out.append(anchor)                                                   # 同一 token 边界允许承载相邻两张图
+        return out                                                               # _pictures 再按每图块数展开
+
     def _read_text(self) -> list:
-        """把正文编码成编号；图片几何开启时，同条保存最多 max_images 个路径。"""
+        """把正文编码成编号；图片几何开启时，同条保存图片路径及可选的交错位置。"""
         out = []                                                                  # 攒起来的样本
         for one in self.choice.files:                                             # 一个文件一趟
             for line in Path(one).read_text(encoding="utf-8").splitlines():       # 一行一条样本
                 if not line.strip():                                              # 空行没有训练内容
                     continue
                 item = json.loads(line)                                           # bolt 里正文和图片同属一条记录
-                ids = self._ids(item.get("text") or "")                          # 正文沿用唯一的编码入口
+                text = item.get("text") or ""                                    # 图片字符位置与正文使用同一份来源
+                ids = self._ids(text)                                             # 正文沿用唯一的编码入口
                 if len(ids) <= 1:                                                 # 至少要有输入和答案
                     continue
                 if self.geo.image_side:                                           # 图片模型还要留住对应路径
                     here = Path(one).parent                                          # 相对图片路径按数据文件旁边算
                     raw = (item.get("images") or [])[: self.choice.max_images]        # 上限之外的不拿
-                    paths = [str(here / one) if not Path(one).is_absolute() else one for one in raw]  # 补齐成能直接打开的路径
-                    out.append((ids, paths))                                      # 编号和图片仍保持同条关系
+                    paths = [str(here / path) if not Path(path).is_absolute() else path for path in raw]  # 补齐成能直接打开的路径
+                    image_at = None                                               # 没给位置时保留旧的整段图片前缀
+                    if "image_at" in item:                                       # 样本入口已经保证一张图对应一个递增字符下标
+                        chars = item["image_at"][: len(raw)]                     # 与 max_images 一起截，图片和位置不拆对
+                        image_at = self._image_positions(text, chars)             # 字符下标换成实际分词后的 ids 下标
+                    out.append((ids, paths, image_at))                            # 编号、路径和位置仍保持同条关系
                 else:                                                            # 纯文本配方沿用原来的样本结构
                     out.append(ids)                                               # 下游继续拿一串编号
         return out                                                               # 一次读完，训练时不再碰数据文件
@@ -216,7 +239,7 @@ class Trainer:
             return max(len(one) for one in sample)                       # 较长一边代表这对的训练开销
         if self.choice.task in {"grpo", "rloo", "ppo"}:               # 一组候选一起参与相对目标
             return max(len(one) for one in sample[0])                    # 最长候选决定补齐宽度
-        if self.geo.image_side:                                          # 图片样本是（文本编号，图片路径）
+        if self.geo.image_side:                                          # 图片样本是（文本编号，图片路径，交错位置）
             return len(sample[0])                                        # 分档只看正文序列长度
         return len(sample)                                                # 普通正文就是一串编号
 
@@ -275,7 +298,7 @@ class Trainer:
         return self.samples[index]                                       # 交出原样本
 
     def _batch(self) -> tuple:
-        """凑一批；纯文本返回 ids/labels，图片批次再返回右侧补零的 patches。"""
+        """凑一批；图片批次再返回 patches、真实块 mask 与可选交错位置。"""
         rows = [self._next() for _ in range(self.choice.batch_size)]              # 取够一个微批
         if not self.geo.image_side:                                               # 没开图片几何就走原来的两张量路径
             widest = max(len(one) for one in rows) - 1                            # 最长的输入长度
@@ -288,38 +311,56 @@ class Trainer:
             return ids.to(here), labels.to(here)                                  # 保留旧接口的两个返回值
 
         widest = max(len(one[0]) for one in rows) - 1                              # 图片样本里最长的文本输入
-        patches, image_steps = self._pictures(rows)                               # 图片按批内最多块数补齐
+        patches, block_mask, patch_at = self._pictures(rows, widest)              # 图片按批内最多块数补齐，并留下真实块范围
+        image_steps = 0 if patches is None else patches.shape[1]                  # 整批无图时不增加任何图片位
         ids = torch.full((len(rows), widest), self.pad_id, dtype=torch.long)        # 文本输入仍只补文本位
-        labels = torch.full((len(rows), image_steps + widest), -100, dtype=torch.long)  # 图片前缀整段不算损失
-        for at, (tokens, _) in enumerate(rows):                                    # 图片路径已经交给上一步处理
+        labels = torch.full((len(rows), image_steps + widest), -100, dtype=torch.long)  # 图片位无论前缀或交错都不算损失
+        text_at = None if patch_at is None else sequence_positions(widest, patch_at)[0]  # 交错标签复用模型的唯一布局算法
+        for at, (tokens, _, _) in enumerate(rows):                                 # 图片路径和位置已经交给上一步处理
             ids[at, : len(tokens) - 1] = torch.tensor(tokens[:-1])                 # 前 n-1 个文本号当输入
-            labels[at, image_steps : image_steps + len(tokens) - 1] = torch.tensor(tokens[1:])  # 答案接在图片位后面
+            start = image_steps if text_at is None else 0                          # 前缀标签是一段连续后缀，交错标签按位置散放
+            places = slice(start, start + len(tokens) - 1) if text_at is None else text_at[at, : len(tokens) - 1]  # 当前文本各答案位
+            labels[at, places] = torch.tensor(tokens[1:])                          # 图片位置保持 -100，文本答案顺序不变
         here = _device_of(self.model)                                              # 文本和标签跟随学生模型
-        return ids.to(here), labels.to(here), patches                             # 图片张量已经对齐设备和精度
+        block_mask = None if block_mask is None else block_mask.to(here)            # 注意力遮罩跟图片放到同一设备
+        patch_at = None if patch_at is None else patch_at.to(here)                  # 交错下标也跟随模型设备
+        return ids.to(here), labels.to(here), patches, block_mask, patch_at          # 五项直接交给模型前向
 
-    def _pictures(self, rows: list) -> tuple:
-        """把一批样本的图片依路径顺序切块，再按批内最大块数从右侧补零。"""
+    def _pictures(self, rows: list, text_steps: int) -> tuple:
+        """切好一批图片，右补零块，并给出真实块 mask 与按块展开的插入位置。"""
         prepared = []                                                              # 每条样本各自串好的图片块
         counts = []                                                                # 每条实际有多少块
-        for _, paths in rows:                                                      # 文本已在同条里，此处只管图片
+        positions = []                                                             # 每张图的位置按它的块数展开
+        interleaved = False                                                        # 整批都没 image_at 时保留旧前缀路径
+        for _, paths, image_at in rows:                                            # 文本已在同条里，此处只管图片
             pieces = []                                                            # 一条样本可能带多张图片
+            block_at = []                                                          # 同一张图的全部块共享一个文本锚点
             count = 0                                                              # 多张图的块数累加
-            for path in paths:                                                     # 路径顺序就是图片前缀顺序
+            interleaved = interleaved or image_at is not None                      # 混合批次也要为带位置的样本启用交错
+            for index, path in enumerate(paths):                                   # 路径顺序就是图片顺序
                 blocks, size = image.prepare(path, self.geo.image_side, self.geo.patch)  # 一张图缩放、归一、切块
                 pieces.append(torch.from_numpy(blocks))                            # float32 数组先转 CPU 张量
                 count += size                                                      # 记下该样本的真实图片位
+                anchor = -1 if image_at is None else image_at[index]               # 旧图片用内部 -1 表示仍在文本前
+                block_at.extend([anchor] * size)                                   # 每块都带着所属图片的同一位置
             joined = torch.cat(pieces) if pieces else torch.empty((0, self.geo.patch, self.geo.patch, 3))  # 多图首尾相接
             prepared.append(joined)                                                # 留待按批内最大值补齐
             counts.append(count)                                                   # 右侧补多少由这个数决定
+            positions.append(block_at)                                             # 与 joined 的块顺序逐项对应
         widest = max(counts)                                                       # 同批模型前缀必须等长
         if widest == 0:                                                            # 整批都没图片时不增加任何前缀
-            return None, 0                                                        # 模型仍走无图前向
+            return None, None, None                                                # 模型仍走无图前向
         batch = torch.zeros((len(rows), widest, self.geo.patch, self.geo.patch, 3), dtype=torch.float32)  # 零块铺底
+        block_mask = torch.zeros((len(rows), widest), dtype=torch.bool)             # 1 是真实块，0 是右侧补位块
+        patch_at = torch.full((len(rows), widest), text_steps, dtype=torch.long) if interleaved else None  # 补位块放到文本后，不挪动文本位置
         for at, blocks in enumerate(prepared):                                     # 每条从左边放真实图片块
             batch[at, : counts[at]] = blocks                                      # 剩下的右侧保持零块
+            block_mask[at, : counts[at]] = True                                   # 同一段标成可参与注意力和对齐的真实块
+            if patch_at is not None and counts[at]:                               # 交错批次把每个真实块放回样本指定位置
+                patch_at[at, : counts[at]] = torch.tensor(positions[at])           # 旧前缀样本的真实块在这里写成 -1
         here = _device_of(self.model)                                              # 图片跟学生模型放在同一设备
         dtype = self.geo.dtype(self.choice.precision)                              # 图片投影使用模型精度
-        return batch.to(device=here, dtype=dtype), widest                          # 交出固定五维形状和前缀长度
+        return batch.to(device=here, dtype=dtype), block_mask, patch_at             # mask 和位置由 _batch 随文本一起搬设备
 
     # --- 训练 ---
 
@@ -418,25 +459,27 @@ class Trainer:
         tokens = 0  # 这一步过了多少真 token，算吞吐用
         for _ in range(self.choice.grad_accum):  # 一个一个微批
             if self.geo.image_side:                                               # 图片几何的批次还带五维图片块
-                ids, labels, patches = self._batch()                              # 图片前缀长度已经反映在 labels 里
+                ids, labels, patches, block_mask, patch_at = self._batch()         # 图片布局和真实块范围已经反映在 labels 里
             else:                                                                # 纯文本保留原来的两张量接口
                 ids, labels = self._batch()                                       # 取文本微批
             with self._context():  # 半精度上下文
                 if self.choice.task == "distill":  # 蒸馏换成交叉熵之外的目标
                     with torch.no_grad():  # 教师不建图
-                        if self.geo.image_side:                                   # 教师也要看到同一段图片前缀
+                        if self.geo.image_side:                                   # 教师也要看到同一批图片及其布局
                             teacher_patches = None if patches is None else patches.float().cpu()  # CPU 教师使用 fp32 图片
-                            teach = self.teacher(ids.cpu(), patches=teacher_patches).to(ids.device)  # 打分送回学生设备
+                            teacher_mask = None if block_mask is None else block_mask.cpu()  # 补位范围原样搬到 CPU
+                            teacher_at = None if patch_at is None else patch_at.cpu()         # 交错位置也与学生完全相同
+                            teach = self.teacher(ids.cpu(), patches=teacher_patches, block_mask=teacher_mask, patch_at=teacher_at).to(ids.device)  # 打分送回学生设备
                         else:                                                    # 纯文本蒸馏保持原来的调用
                             teach = self.teacher(ids.cpu()).to(ids.device)         # 教师只在 CPU 前向
                     if self.geo.image_side:                                       # 学生的图片块已经对齐设备和精度
-                        scores = self.model(ids, patches=patches)                  # 图片与文本共同产生蒸馏打分
+                        scores = self.model(ids, patches=patches, block_mask=block_mask, patch_at=patch_at)  # 图片与文本按同一布局产生蒸馏打分
                     else:                                                        # 没有图片几何不传新增参数
                         scores = self.model(ids)                                  # 保留纯文本前向
                     loss = alignment.distill(scores, teach, self.choice.temperature).mean() / self.choice.grad_accum  # 按累积数缩放
                 else:  # 普通语言模型目标
-                    if self.geo.image_side:                                       # 图片块作为文本之前的前缀
-                        scores = self.model(ids, patches=patches)                  # 返回图片位和文本位的全部打分
+                    if self.geo.image_side:                                       # 图片块可作前缀，也可按样本位置交错
+                        scores = self.model(ids, patches=patches, block_mask=block_mask, patch_at=patch_at)  # 返回图片位和文本位的全部打分
                     else:                                                        # 纯文本仍调用原接口
                         scores = self.model(ids)                                  # 输出长度与 ids 相同
                     aux = 0.0                                                     # 图文对齐那一路，不开就是 0

@@ -15,7 +15,7 @@ import pytest                                    # 临时目录、参数组合�
 import torch                                     # 跑真实模型前向和反向
 from PIL import Image                            # 写出 PNG/JPEG 测试文件
 
-from features import image, model, recipe         # 图片、模型和配方的实际接口
+from features import image, model, recipe, sample # 图片、模型、配方和样本的实际接口
 from utils.fail import Failure                   # 核对缺包与配方错误的统一类型
 
 
@@ -173,6 +173,52 @@ def test_one_patch_changes_text_logits(geo):                                    
     assert torch.equal(before[:, :4], after[:, :4])                                    # 更早的前缀不受未来块影响，因果性仍在
 
 
+def test_padding_block_is_not_an_attention_key(geo):                                  # 改补位内容不能污染任何有效位置
+    torch.manual_seed(7)                                                              # 固定权重与图片投影
+    net = model.Model(geo, align_weight=0.25).eval()                                   # 同时观察主输出和模型边界的对齐损失
+    ids = torch.tensor([[1, 2, 3]])                                                   # 三个文本位置
+    blocks = torch.linspace(-1, 1, 36).reshape(1, 3, 2, 2, 3)                         # 三块里最后一块当批内补位
+    block_mask = torch.tensor([[1, 1, 0]])                                             # 前两块有效，最后一块无效
+    changed = blocks.clone()                                                          # 只改 mask 为 0 的那一块
+    changed[:, 2] = 999                                                              # 若它进入键或残差，输出会明显变化
+    before, before_loss = net(ids, patches=blocks, block_mask=block_mask)              # 补位块在入口归零且注意力键被遮
+    after, after_loss = net(ids, patches=changed, block_mask=block_mask)                # 同一布局再次前向
+    assert torch.equal(before, after)                                                  # 连补位位置自己的输出也不依赖伪像素
+    assert torch.equal(before_loss, after_loss)                                        # 模型交回的对齐损失也完全忽略补位块
+
+
+def test_alignment_loss_ignores_padding_blocks(geo):                                  # 对齐均值只能汇总真实图片块
+    image_hidden = torch.tensor([[[1.0, 0.0], [0.0, 1.0], [20.0, -30.0]]])             # 第三块故意与前两块差很远
+    text_hidden = torch.tensor([[[1.0, 1.0], [1.0, 1.0]]])                             # 文本均值方向固定
+    block_mask = torch.tensor([[1, 1, 0]])                                             # 最后一块只是补位
+    masked = model.align_loss(image_hidden, text_hidden, block_mask)                   # 走带 mask 的实际公式
+    expected = model.align_loss(image_hidden[:, :2], text_hidden)                      # 等价于根本没把补位块传进来
+    changed = image_hidden.clone()                                                     # 再把补位表示改成另一个极端值
+    changed[:, 2] = torch.tensor([-500.0, 800.0])                                     # 有效均值不应看见它
+    assert torch.equal(masked, expected)                                               # 公式只平均前两块
+    assert torch.equal(model.align_loss(changed, text_hidden, block_mask), masked)     # 补位值变化不影响损失
+
+
+def test_patch_at_interleaves_blocks_and_default_stays_prefix(geo):                    # 指定位置与旧前缀行为都看真实层输入
+    torch.manual_seed(7)                                                              # 固定嵌入和图片映射
+    net = model.Model(geo).eval()                                                      # 第一层前观察拼好的隐藏序列
+    ids = torch.tensor([[1, 2, 3, 4]])                                                # 四个文本位置
+    blocks = torch.linspace(-1, 1, 24).reshape(1, 2, 2, 2, 3)                         # 两块图片分别插到不同位置
+    patch_at = torch.tensor([[0, 2]])                                                  # 第一块跟在 ids[0] 后，第二块跟在 ids[2] 后
+    seen = []                                                                         # 收集第一层真正收到的序列
+    hook = net.model.layers[0].register_forward_pre_hook(lambda block, args: seen.append(args[0].detach().clone()))  # 只观察层输入
+    net(ids, patches=blocks, patch_at=patch_at)                                        # 走交错布局
+    net(ids, patches=blocks)                                                           # 不给位置走旧前缀布局
+    hook.remove()                                                                      # 两次观察已经完成
+    with torch.no_grad():                                                             # 手工只算拼接两边的原始表示
+        text = net.model.embed_tokens(ids)                                             # 四个文字嵌入
+        pictures = net.image_align(net.image_proj(blocks.flatten(2)))                  # 两个图片块表示
+        interleaved = torch.stack((text[:, 0], pictures[:, 0], text[:, 1], text[:, 2], pictures[:, 1], text[:, 3]), dim=1)  # 指定次序
+        prefixed = torch.cat((pictures, text), dim=1)                                  # 旧行为是整段图片在前
+    torch.testing.assert_close(seen[0], interleaved)                                   # 两块准确落在各自指定文本之后
+    torch.testing.assert_close(seen[1], prefixed)                                      # patch_at 缺省时行为不变
+
+
 def test_rope_positions_continue_after_image(geo):                                     # 图片不单独使用一套位置编码
     net = model.Model(geo)                                                            # 一张共享的 RoPE 表
     seen = []                                                                         # 记录第一层实际拿到的位置分量
@@ -208,6 +254,24 @@ def test_recipe_accepts_image_geometry():                                       
     geo = model.Geometry.from_recipe(data)                                           # 模型照收已检查的字段
     assert geo.image_side == 6 and geo.patch == 2                                     # 两个值没有丢失
     assert model.Geometry.from_recipe({}).image_side == 0                            # 旧配方默认不接图
+
+
+def test_sample_keeps_and_validates_image_at(tmp_path):                               # 样本边界一次验完图片位置
+    first = tmp_path / "first.png"                                                    # 样本入口只要求路径存在
+    second = tmp_path / "second.png"                                                  # 图片内容留给后面的 prepare
+    first.write_bytes(b"first")                                                      # 两张占位文件足够通过路径检查
+    second.write_bytes(b"second")                                                    # 顺序与 image_at 一一对应
+    record = {"text": "abcd", "images": [str(first), str(second)], "image_at": [1, 4]}  # 末尾下标允许等于文本长度
+    clean = sample.read(record, sample.Policy(scrub=False))                            # 不让脱敏改变本测试正文
+    assert clean["image_at"] == [1, 4]                                               # 规范样本原样保留合法位置
+    bad = ([2, 2], [3, 1], [1, 5], [-1, 2], [True, 2])                               # 重复、倒序、越界、负数和伪整数
+    for positions in bad:                                                             # 每一种都在样本入口拒收
+        with pytest.raises(sample.Refused) as caught:                                 # 不留到训练 scatter 才报错
+            sample.read({**record, "image_at": positions}, sample.Policy(scrub=False))  # 只替换待测位置
+        assert caught.value.code == "bad_image_at"                                    # 独立原因码方便 rejects 统计
+    with pytest.raises(sample.Refused) as caught:                                     # 数量也必须与图片一一对应
+        sample.read({**record, "image_at": [1]}, sample.Policy(scrub=False))          # 两图只给一个位置
+    assert caught.value.code == "bad_image_at"                                        # 同属位置格式错误
 
 
 @pytest.mark.parametrize("field", ["image_side", "patch"])                              # 新字段只收整数
