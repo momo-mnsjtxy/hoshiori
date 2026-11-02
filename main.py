@@ -31,6 +31,7 @@ COMMANDS = {
     "loom": "commands.loom",
     "doctor": "commands.doctor",
     "plugin": "commands.plugin",  # 单文件插件的清单与运行入口
+    "mcp": "commands.mcp",        # stdio MCP 服务器的工具清单与单次调用
 }
 
 
@@ -49,6 +50,12 @@ def parser() -> argparse.ArgumentParser:
     weave.add_argument("--fields", default="text,content,raw,body", help="正文字段优先序，逗号分")
     weave.add_argument("--min-chars", type=int, default=1, help="短于这个长度算空样本")
     weave.add_argument("--max-chars", type=int, default=0, help="长于这个长度拒收，0 不限")
+    weave.add_argument("--min-score", type=float, default=0.0, help="质量分低于此线拒收，默认 0 不筛")
+    privacy = weave.add_mutually_exclusive_group()
+    privacy.add_argument("--scrub", dest="scrub", action="store_true", default=True, help="替换敏感信息（默认）")
+    privacy.add_argument("--no-scrub", dest="scrub", action="store_false", help="保留正文里的敏感信息")
+    weave.add_argument("--fake", dest="fake_files", action="append", default=[], help="合成样本来源，可给多次")
+    weave.add_argument("--fake-ratio", type=float, default=0.1, help="混合结果里的合成样本占比，默认 0.1")
     weave.add_argument("--size", type=int, default=5, help="比对窗口几个字")
     weave.add_argument("--threshold", type=float, default=0.8, help="重合度到这条线算重复")
     weave.add_argument("--count", type=int, default=128, help="指纹长度")
@@ -86,10 +93,12 @@ def parser() -> argparse.ArgumentParser:
     judge.add_argument("recipe", nargs="?")
     judge.add_argument("--suite", action="append", help="评测套件，可给多次")
     judge.add_argument("--answer-cmd", help="拿答案的外部命令，{prompt} 换成题面；不给就回显")
+    judge.add_argument("--arena", help="另一个答题命令；与 --answer-cmd 乱序对打并算 Elo / BT")
     judge.add_argument("--baseline", help="基线 report.json，给了就走回归门")
     judge.add_argument("--min-delta", type=float, help="允许掉多少总分，缺省读配方 eval.gate")
     judge.add_argument("--limit", type=int, default=0, help="每套最多跑几题，0 不限")
     judge.add_argument("--out", default="out/judge", help="报告目录，默认 out/judge")
+    judge.add_argument("--submit", help="跑完把公开字段 POST 到这个榜单 URL；断网就留待补文件")
     judge.add_argument("--import-lm-eval", action="append", help="导入 lm-eval 任务成套件，给了就只导入")
 
     forge = below.add_parser("forge", help="导出")
@@ -97,6 +106,9 @@ def parser() -> argparse.ArgumentParser:
     forge.add_argument("--out", required=True, help="产物文件或目录，必填")
     forge.add_argument("--format", action="append", dest="formats", help="导出格式，可给多次")
     forge.add_argument("--quant", action="append", help="量化档，可给多次：f16 / q8_0 / q6_k / q5_k_s / q5_k_m")
+    forge.add_argument("--self-check", action="store_true", help="用 llama-cli 跑量化前后基准，写退化报告")
+    forge.add_argument("--suites", nargs="+", help="自评套件，空格或逗号分；默认 zh-lite,format-lite")
+    forge.add_argument("--self-check-threshold", type=float, help="允许的总分退化；默认读 eval.gate.min_delta，再默认 0.05")
     forge.add_argument("--no-tokenizer", action="store_true", help="不导词表，产物就不能独立跑")
     forge.add_argument("--verbose", action="store_true", help="把要执行的命令、参数、目录布局都打出来")
     forge.add_argument("--mlx-print-only", action="store_true", help="mlx 只打印命令和目录布局，不执行")
@@ -122,6 +134,15 @@ def parser() -> argparse.ArgumentParser:
     plugin_run.add_argument("kind", metavar="类", help="sources / rewards / metrics / exporters")    # 四类目录中的一类
     plugin_run.add_argument("name", metavar="名", help="插件的 NAME")                                 # 文件声明的插件名
     plugin_run.add_argument("--args", default="{}", help="传给 run 的 JSON 对象，默认 {}")             # 关键字参数对象
+    mcp = below.add_parser("mcp", help="连接 stdio MCP 服务器")                                         # MCP 命令入口
+    mcp_actions = mcp.add_subparsers(dest="action", required=True)                                      # list、tools、call 三个动作
+    mcp_actions.add_parser("list", help="列出 mcp.yaml 里的服务器")                                    # 只读配置，不起进程
+    mcp_tools = mcp_actions.add_parser("tools", help="列出一台服务器的工具")                            # 完成握手后展示 tools/list
+    mcp_tools.add_argument("name", metavar="名", help="mcp.yaml 里的服务器名")                         # 点名一台服务器
+    mcp_call = mcp_actions.add_parser("call", help="调用一台服务器的一个工具")                          # 一次 tools/call 后退出
+    mcp_call.add_argument("name", metavar="名", help="mcp.yaml 里的服务器名")                          # 点名一台服务器
+    mcp_call.add_argument("tool", metavar="工具", help="tools 列出的工具名")                           # 点名一个工具
+    mcp_call.add_argument("--args", default="{}", help="工具参数 JSON 对象，默认 {}")                  # MCP arguments 字段
     below.add_parser("doctor", help="看看这台机器缺什么")
     return top
 

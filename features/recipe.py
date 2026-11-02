@@ -1,8 +1,9 @@
 """配方：训练要什么全写在一份 yaml 里。这个文件负责读它、合并父配方、按白名单验它。
 
 调用方式：load 读配方并展开 extends，check 在命令开头验字段和类型，stamp 给完整配方算哈希。
-字段白名单集中在 FIELDS，拼错会报最近似的候选。model.geometry.image_side 是原图边长，0 表示不接图；
-patch 是块边长，默认 16；接图时必须为正数并整除 image_side，训练器据此准备固定大小的图片块。
+字段白名单集中在 FIELDS，拼错会报最近似的候选。train.reward 可指向定义 reward(payload) 的
+Python 文件；命令层会按配方所在目录解析并检查它。model.geometry.image_side 是原图边长，0 表示
+不接图；patch 是块边长，默认 16；接图时必须为正数并整除 image_side，训练器据此准备固定大小的图片块。
 
 调用示例：
   from pathlib import Path                      # 配方文件的位置
@@ -71,6 +72,7 @@ FIELDS = {
         "weight_decay": float,  # 权重衰减
         "max_grad_norm": float,  # 梯度裁剪阈值
         "seed": int,  # 随机种子，复现要用
+        "curriculum": bool,  # 先取短样本，再随训练进度放开中、长样本
         "grad_checkpoint": bool,  # 用时间换显存
         "health": (str, {"stop", "warn"}),  # 指标坏了怎么办：stop 存一档再退（退出码 1）/ warn 只喊一声
         "max_steps": int,  # 总步数，给了就不按 epochs 换算
@@ -81,6 +83,8 @@ FIELDS = {
         "clip_ratio": float,  # GRPO / PPO 的裁剪区间
         "kl_coef": float,  # GRPO 的 KL 罚系数
         "temperature": float,  # distill 的温度
+        "align_weight": float,  # 图文对齐损失的权重，0 就是关
+        "reward": str,  # 组相对任务的外部 reward(payload) Python 文件
         "lora": {
             "r": int,  # 低秩秩数，越大越占参数
             "alpha": int,  # 缩放分子，实际缩放是 alpha/r
@@ -148,6 +152,8 @@ def check(data: dict) -> None:
         fail("schema", "蒸馏要给 model.teacher 指教师权重", where="model.teacher")
     if data.get("task") in {"grpo", "rloo", "ppo"} and (data.get("train") or {}).get("group", 0) and (data.get("train") or {})["group"] < 2:
         fail("schema", "组相对任务一组至少要两条", where="train.group", hint="常见 4 到 8")
+    if train.get("reward") and Path(train["reward"]).suffix.lower() != ".py":
+        fail("schema", "外部奖励必须是 .py 文件", where="train.reward", hint="文件里定义 reward(payload) 并返回有限数字")
     if (data.get("forge") or {}).get("formats") and not (data.get("forge") or {}).get("out"):
         fail("schema", "给了导出格式就要给导出目录", where="forge.out", hint="例: out/gguf")
 

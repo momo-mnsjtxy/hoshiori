@@ -8,7 +8,9 @@ import json
 import pytest
 
 from features import dataset, duplicate, fingerprint, source, woof
+from features.clean import blend, score, scrub
 from features.sample import Policy, Refused, clean, read, text_of
+from main import parser as command_parser
 
 
 # ---------- 样本 ----------
@@ -53,6 +55,50 @@ def test_read_keeps_messages_and_meta():
     assert out["text"] == "正文"
     assert out["messages"]
     assert out["meta"]["k"] == 1
+
+
+@pytest.mark.parametrize(
+    ("raw", "safe"),
+    [
+        ("联系 fox+star@example.com", "联系 «邮箱»"),
+        ("电话 13812345678", "电话 «手机号»"),
+        ("证件 11010519491231002X", "证件 «身份证号»"),
+        ("令牌 sk-abcdefghijklmnopqrstuvwxyz0123456789", "令牌 «密钥»"),
+        ("节点 192.168.1.42", "节点 «IP»"),
+    ],
+)
+def test_scrub_replaces_each_sensitive_kind(raw, safe):
+    assert scrub(raw) == (safe, 1)
+
+
+def test_read_obeys_scrub_policy():
+    raw = "联系 fox@example.com"
+    record = {"text": raw, "messages": [{"role": "user", "content": raw}]}
+    safe = read(record, Policy())
+    kept = read(record, Policy(scrub=False))
+    assert safe["text"] == "联系 «邮箱»"
+    assert safe["messages"][0]["content"] == "联系 «邮箱»"
+    assert kept["text"] == raw
+    assert kept["messages"][0]["content"] == raw
+
+
+def test_score_stays_in_bounds_and_rewards_usable_text():
+    good = (
+        "星织沿着清楚的来源标记整理语料，每一条记录都能回到原文件。"
+        "清洗阶段保留正文含义，去除无效空白，再检查机械重复。"
+        "完整的句子以标点收尾，方便模型学到稳定的语言边界。"
+    )
+    repeated = "重复重复重复重复" * 100
+    assert score("") == 0.0
+    assert 0.0 <= score("短") <= 1.0
+    assert 0.0 <= score("很长。" * 10_000) <= 1.0
+    assert score(good) > score(repeated)
+
+
+def test_min_score_refuses_low_quality_text():
+    with pytest.raises(Refused) as bad:
+        read({"text": "重复重复重复重复" * 30}, Policy(min_score=0.9))
+    assert bad.value.code == "low_score"
 
 
 def test_read_keeps_images_and_refuses_bad_paths(tmp_path):                          # 单路径、路径数组和两种拒收一次覆盖
@@ -228,7 +274,64 @@ def test_dataset_records_refuse_reason(tmp_path):
     assert counts.refused == {"too_short": 1}
 
 
+def test_dataset_blends_fake_and_counts_kept_fake(tmp_path):
+    real = tmp_path / "real.jsonl"
+    fake = tmp_path / "fake.jsonl"
+    real_rows = ["春风越过青山。", "潮水拍打礁石。", "夜航灯照海面。", "松鼠藏起榛果。"]
+    fake_rows = ["纸鸢掠过城墙。", "细雨落入池塘。", "晨钟唤醒村庄。", "列车驶出隧道。"]
+    real.write_text("\n".join(real_rows), encoding="utf-8")
+    fake.write_text("\n".join(fake_rows), encoding="utf-8")
+    out = tmp_path / "mixed"
+    choice = dataset.Choice(out=out, fake_files=[str(fake)], fake_ratio=0.25)
+    counts = dataset.Dataset(choice).make([str(real)])
+
+    assert counts.read == 4
+    assert counts.kept == 4
+    assert counts.kept_fake == 1
+    assert counts.summary()["kept_fake"] == 1
+
+
+def test_weave_cli_collects_scrub_score_and_fake_choices():
+    args = command_parser().parse_args(
+        [
+            "weave",
+            "--in",
+            "real.jsonl",
+            "--no-scrub",
+            "--min-score",
+            "0.6",
+            "--fake",
+            "first.jsonl",
+            "--fake",
+            "second.jsonl",
+            "--fake-ratio",
+            "0.25",
+        ]
+    )
+    assert args.scrub is False
+    assert args.min_score == 0.6
+    assert args.fake_files == ["first.jsonl", "second.jsonl"]
+    assert args.fake_ratio == 0.25
+
+
 # ---------- 混配 ----------
+
+def test_blend_follows_fake_ratio():
+    real = [f"real-{number}" for number in range(8)]
+    fake = [f"fake-{number}" for number in range(8)]
+    mixed = blend(real, fake, 0.25)
+    assert len(mixed) == 8
+    assert sum(row.startswith("fake-") for row in mixed) == 2
+    assert sum(row.startswith("real-") for row in mixed) == 6
+
+
+def test_blend_keeps_the_nonempty_side():
+    real = ["real-a", "real-b"]
+    fake = ["fake-a", "fake-b"]
+    assert blend(real, [], 0.5) == real
+    assert blend([], fake, 0.5) == fake
+    assert blend([], [], 0.5) == []
+
 
 def test_woof_split_follows_weight():
     plan = woof.Woof(sources=[woof.Source("a", 1.0), woof.Source("b", 3.0)], target=100).split()

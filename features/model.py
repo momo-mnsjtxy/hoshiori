@@ -5,10 +5,11 @@
 image_side=0 不建图片参数，旧文本存档照常载入；非零时按原图边长预留 ceil(image_side/patch)² 个位置。
 max_seq_len 仍是文本长度预算，图片前缀额外占位置；实际图片尺寸和同批块数由下游统一，本层不缩放图片。
 forward(ids, patches=None) 接收 (批, 文本长)；可选 patches 是归一后的 RGB，形状 (批, 块数, patch, patch, 3)，
-也可预先展平成 (批, 块数, patch*patch*3)，张量的设备、精度与模型一致。返回 (批, 块数+文本长, 词表)，
-下游取 logits[:, 块数:] 后沿用文本标签和损失；图片与文字共用 RoPE，图片从 0 开始，文字接着编号。
+也可预先展平成 (批, 块数, patch*patch*3)，张量的设备、精度与模型一致。图片先经 image_proj、image_align，
+再作为前缀进入主体；图片与文字共用 RoPE，图片从 0 开始，文字接着编号。align_weight 默认 0，此时仍只返回
+(批, 块数+文本长, 词表)；权重大于 0 时返回 (logits, 对齐损失)，供调用方与语言损失相加。
 量化顺序仍是 load → quantize → 建优化器；无卡时保持 fp32，压过后可训的只剩 LoRA 的 A/B。
-文本权重沿用 HF 名字，tie 为真时只存一份词表；图片投影以 image_proj.weight 随完整权重保存、载入。
+文本权重沿用 HF 名字，tie 为真时只存一份词表；图片投影和 image_align.linear_1/linear_2 随完整权重保存、载入。
 
 调用示例：
   from pathlib import Path                                                    # 存档位置
@@ -215,15 +216,38 @@ class Core(nn.Module):
         return self.norm(x)                                                             # 收尾归一
 
 
+class ImageAlign(nn.Module):
+    """把图片投影映到文本隐藏空间；子层名沿用 HF 多模态投影器的 linear_1 / linear_2。"""
+
+    def __init__(self, size: int) -> None:
+        super().__init__()
+        self.linear_1 = nn.Linear(size, size)  # 第一层在 d_model 内学习图片特征组合
+        self.act = nn.GELU()                   # 平滑非线性让两层不退化成单次线性投影
+        self.linear_2 = nn.Linear(size, size)  # 输出仍是 d_model，可直接交给 Transformer
+
+    def forward(self, image_hidden: torch.Tensor) -> torch.Tensor:
+        """依次经过两层线性与中间 GELU，保持 (批, 块数, d_model)。"""
+        return self.linear_2(self.act(self.linear_1(image_hidden)))  # 图片块逐个映到文本隐藏空间
+
+
+def align_loss(image_hidden: torch.Tensor, text_hidden: torch.Tensor) -> torch.Tensor:
+    """返回同批图文表示的 1 - 平均余弦；两个序列先各自在位置维做均值池化。"""
+    image_mean = image_hidden.float().mean(dim=1)                        # 每张图的全部块合成一个 fp32 表示
+    text_mean = text_hidden.float().mean(dim=1)                          # 同批每段文本也合成一个表示
+    similarity = F.cosine_similarity(image_mean, text_mean, dim=-1)      # 批内按样本一一配对，不跨样本混合
+    return 1 - similarity.mean()                                         # 越接近同一方向，损失越靠近零
+
+
 class Model(nn.Module):
     """整摞模型：主体那摞加上输出层。"""
 
     # ---------- 建完整模型 ----------
 
-    def __init__(self, geo: Geometry, precision: str = "fp32") -> None:                                  # 默认仍是纯文本模型
+    def __init__(self, geo: Geometry, precision: str = "fp32", align_weight: float = 0.0) -> None:       # 默认仍只返回文本打分
         super().__init__()                                                                           # 注册模型模块
         self.geo = geo                                                                               # 几何留在身上，存盘和报数都要用
         self.dtype = geo.dtype(precision)                                                            # 权重类型
+        self.align_weight = align_weight                                                             # 正数时把加权图文损失随 logits 一起交回
         self.grad_checkpoint = False                                                                # 训练器可开启前向重算，节省显存
         self.quantized = False                                                                      # 记下量化层是否已替换
         self.model = Core(geo, self.dtype)                                                           # 主体
@@ -232,20 +256,32 @@ class Model(nn.Module):
             if name.endswith("o_proj.weight") or name.endswith("down_proj.weight"):                    # 注意力与前馈各自的出口
                 nn.init.normal_(one, std=0.02 / math.sqrt(2 * geo.layers))                             # 保持已有文本权重的初始化顺序
         self.image_proj = nn.Linear(geo.patch ** 2 * 3, geo.d_model, bias=False) if geo.image_side else None  # RGB 块投影；最后才建，不扰动文本初始化
+        self.image_align = ImageAlign(geo.d_model) if geo.image_side else None                         # 两层可训映射把图片送进文本隐藏空间
         self.to(self.dtype)                                                                          # 图片层也一起落到目标精度
 
     # ---------- 前向打分 ----------
 
-    def forward(self, ids: torch.Tensor, patches: torch.Tensor = None) -> torch.Tensor:                # 下游显式传入图片块
-        """返回 (批, 图片块数+文本长, 词表)；patches 为同设备、同精度的归一 RGB 块，可预先展平。"""
-        prefix = None if patches is None else self.image_proj(patches.flatten(2))                     # 每块展平后投到 d_model
+    def forward(self, ids: torch.Tensor, patches: torch.Tensor = None) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:  # 下游显式传入图片块
+        """返回 logits；align_weight 为正时再返回一个加权标量对齐损失。"""
+        image_hidden = None                                                                          # 无图前向不增加前缀，也没有图文损失
+        if patches is not None:                                                                      # 有图片才走两段图片映射
+            image_hidden = self.image_proj(patches.flatten(2))                                       # 每块展平后先投到 d_model
+            image_hidden = self.image_align(image_hidden)                                            # 再对齐到文本隐藏空间后进入 Block
         if self.grad_checkpoint and self.training:                                                    # 重算时也把图片前缀带上
-            x = checkpoint(self.model, ids, prefix, use_reentrant=False)                              # 保留图片投影的梯度链
+            x = checkpoint(self.model, ids, image_hidden, use_reentrant=False)                        # 保留图片投影与对齐层的梯度链
         else:                                                                                        # 常规一次过
-            x = self.model(ids, prefix)                                                              # 图片和文字走完整摞
+            x = self.model(ids, image_hidden)                                                        # 图片和文字走完整摞
         if self.lm_head is None:                                                                      # 共用词表就直接拿词表权重做输出
-            return x @ self.model.embed_tokens.weight.T                                              # 图片与文字位置都返回词表打分
-        return self.lm_head(x)                                                                       # 独立输出层
+            logits = x @ self.model.embed_tokens.weight.T                                            # 图片与文字位置都返回词表打分
+        else:                                                                                        # 不共用词表时走独立输出层
+            logits = self.lm_head(x)                                                                 # 同样保留全部图片与文本位置
+        if self.align_weight <= 0:                                                                   # 默认接口仍只交回 logits
+            return logits                                                                            # 旧调用方不需要拆元组
+        if image_hidden is None:                                                                     # 这一批没有图片就没有可对齐的表示
+            return logits, x.float().sum() * 0.0                                                     # 仍交回可反传的标量零，返回结构不变
+        text_hidden = x[:, image_hidden.shape[1]:]                                                   # 图片位置之后就是同批文本隐状态
+        alignment = align_loss(image_hidden, text_hidden) * self.align_weight                         # 权重在模型边界统一乘一次
+        return logits, alignment                                                                     # 调用方可把第二项加入语言损失
 
     def count(self) -> int:
         """参数量，只含真正占参数的张量。"""

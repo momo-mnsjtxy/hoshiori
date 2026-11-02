@@ -278,6 +278,16 @@ def test_report_written_next_to_suite(tmp_path):
     assert one.report.name == "lm-eval-demo.report.md"
 
 
+# ---------- 导入后真跑 ----------
+
+def test_run_backend_scores_imported_suite(tmp_path):
+    imported = lm_eval.import_file(_write(tmp_path, INLINE), tmp_path)
+    result = lm_eval.run_backend("printf 12", suite=suite.read(imported.path), limit=1)
+    assert result["count"] == 1
+    assert result["total"] == 1.0
+    assert result["tasks"][0]["answer"] == "12"
+
+
 # ---------- 命令接得上 ----------
 
 def test_judge_import_flag_writes_builtin_folder(tmp_path):

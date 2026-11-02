@@ -1,4 +1,4 @@
-"""面板的测试：五个页面能不能开，越界、转义、缺卡三件挡不挡得住。
+"""面板的测试：五个页面与指标流能不能开，越界、转义、缺卡三件挡不挡得住。
 
 约定：面板起在 0 端口由系统挑空口，每个用例一份临时产物目录，用完收摊。
 样本里固定放一段 <script>，用来验转义；根目录外固定放一份 jsonl，用来验 ../ 逃逸。
@@ -46,8 +46,14 @@ def _fill(root, outside) -> None:
     )
     reject = {"reason": "too_short", "detail": "1", "origin": "a.jsonl"}  # 一条拒收的
     (root / "rejects.jsonl").write_text(json.dumps(reject, ensure_ascii=False) + "\n", encoding="utf-8")
-    event = {"t": 1700000000.0, "stage": "weave", "text": "读完", "level": "info", "kept": 2}
-    (root / "loom.jsonl").write_text(json.dumps(event, ensure_ascii=False) + "\n", encoding="utf-8")
+    events = [
+        {"t": 1700000000.0, "stage": "spin", "text": "训练", "level": "info", "loss": 1.25, "step": 1},
+        {"t": 1700000001.0, "stage": "spin", "text": "训练", "level": "info", "loss": 0.75, "step": 2},
+        {"t": 1700000002.0, "stage": "weave", "text": "读完", "level": "info", "kept": 2},
+    ]
+    (root / "loom.jsonl").write_text(
+        "\n".join(json.dumps(one, ensure_ascii=False) for one in events) + "\n", encoding="utf-8"
+    )
     (outside / "逃出.jsonl").write_text(json.dumps({"text": "根外的正文"}, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
@@ -86,6 +92,48 @@ def test_five_pages_render(panel):
 
     code, compare = _get(panel["base"] + "/compare?other=" + urllib.parse.quote(panel["other"]))
     assert code == 200 and "测试集" in compare and "对照组" in compare         # 对比两张卡并排
+
+
+def test_metrics_json_returns_only_time_and_loss(panel):
+    """指标地址 200，并把普通事件字段剥掉，只留画图所需两项。"""
+    code, body = _get(panel["base"] + "/metrics.json")
+    points = json.loads(body)
+    assert code == 200
+    assert points == [
+        {"t": 1700000000.0, "loss": 1.25},
+        {"t": 1700000001.0, "loss": 0.75},
+    ]
+    assert all(set(point) == {"t", "loss"} for point in points)               # stage、step 等字段不外送
+
+
+def test_metrics_since_returns_only_newer_points(panel):
+    """since 是时间游标，只回严格晚于它的 loss 点。"""
+    code, body = _get(panel["base"] + "/metrics.json?since=1700000000.0")
+    assert code == 200
+    assert json.loads(body) == [{"t": 1700000001.0, "loss": 0.75}]
+
+
+def test_metrics_over_limit_merge_adjacent_points(panel):
+    """超过 2000 点后相邻 loss 取均值，奇数末点原样保留。"""
+    events = [{"t": float(index), "loss": float(index), "step": index} for index in range(2001)]
+    (panel["root"] / "loom.jsonl").write_text(
+        "\n".join(json.dumps(one) for one in events) + "\n", encoding="utf-8"
+    )
+    code, body = _get(panel["base"] + "/metrics.json")
+    points = json.loads(body)
+    assert code == 200 and len(points) == 1001
+    assert points[0] == {"t": 1.0, "loss": 0.5}                              # 前两个点合成一个
+    assert points[-1] == {"t": 2000.0, "loss": 2000.0}                      # 奇数尾点不丢
+
+
+def test_home_has_live_loss_svg_and_fetch_script(panel):
+    """首页内联 SVG，并按两秒、前台可见、增量三项约定自己刷新。"""
+    code, home = _get(panel["base"] + "/")
+    assert code == 200 and "<svg id='loss-chart'" in home and "id='loss-line'" in home
+    assert 'fetch("/metrics.json" + query' in home and '"?since="' in home     # 拉同源增量地址
+    assert "setTimeout(updateLoss, 2000)" in home                              # 每两秒排下一轮
+    assert '"visibilitychange"' in home and "document.hidden" in home          # 后台标签停拉
+    assert "while (points.length > 2000)" in home                              # 多轮增量累计也会抽稀
 
 
 def test_search_filters_samples(panel):

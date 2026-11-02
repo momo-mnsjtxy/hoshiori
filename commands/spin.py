@@ -7,8 +7,8 @@
   ori spin sft.warp.yaml --resume auto --out out/t  # 接 out/t 里最新一档
   ori spin sft.warp.yaml --launch torchrun --out out/t   # 多卡：按配方的 train.devices 起 torchrun
 
-检查只在开头这一遍：数据在不在、配方过没过、显存估不估得下、有没有 torch、要卡的精度有没有卡、
-要量化有没有 bitsandbytes、要 torchrun 有没有 torchrun。
+检查只在开头这一遍：数据和外部奖励在不在、配方过没过、显存估不估得下、有没有 torch、
+要卡的精度有没有卡、要量化有没有 bitsandbytes、要 torchrun 有没有 torchrun。
 过了这遍，后面一律信任入参，内部不查类型、不判空。
 配方里 model.path 指向带权重的目录就从那儿续训，指不到就从随机权重起，并在日志里说一声。
 """
@@ -35,6 +35,7 @@ def command(args) -> int:
     recipe.check(data)
 
     task = data.get("task") or "sft"  # 任务族
+    train = data.get("train") or {}  # 训练节只取一次，奖励路径和后面的参数共用
     vocab = None  # 词表，配方给了才载
     tok = (data.get("model") or {}).get("tokenizer")
     if tok:  # 给了词表就按配方旁边找，找不到再按当前目录
@@ -44,6 +45,12 @@ def command(args) -> int:
     if (data.get("model") or {}).get("teacher"):
         raw = Path(data["model"]["teacher"])  # 教师可能写在配方旁边
         teacher = raw if raw.exists() else Path(args.recipe).parent / raw
+    reward = None  # 外部奖励路径，组相对任务给了才用
+    if train.get("reward"):
+        raw = Path(train["reward"])  # 相对路径跟着配方走，换目录启动也不会指错
+        reward = raw if raw.is_absolute() else Path(args.recipe).parent / raw
+        if not reward.is_file():
+            fail("input", f"奖励文件不在: {train['reward']}", where="train.reward", hint=f"放到 {reward}，或改 train.reward")
 
     files = []  # 解析出来的数据路径
     for one in (data.get("data") or {}).get("files") or []:  # 数据不在就别开跑
@@ -88,7 +95,7 @@ def command(args) -> int:
 
     if not _has_cuda():  # 没卡就明说，跑到一半才发现更费劲
         logs.warn("spin", "没有可用的卡，按 CPU fp32 跑", precision=precision)
-    net = model.Model(geo, precision)  # 搭架子
+    net = model.Model(geo, precision, float((data.get("train") or {}).get("align_weight") or 0.0))  # 搭架子，顺手带上对齐权重
     base = (data.get("model") or {}).get("path")  # 基座权重
     loaded = None  # 真载进来的基座目录
     if base:
@@ -106,7 +113,6 @@ def command(args) -> int:
         logs.done("spin", "量化完成", precision=precision)
     print(f"模型  {net.count()} 参数 · {geo.layers} 层 · {geo.d_model} 维 · 词表 {geo.vocab}")
 
-    train = data.get("train") or {}  # 训练节
     low = train.get("lora") or None  # 挂件配置，没写 r 就是没挂
     if quant and not low:  # 量化层自己没梯度，全量训等于没东西可训
         fail("input", f"{precision} 只能训 LoRA，配方里要写 train.lora", where="train.lora", hint="例: lora: {r: 16, alpha: 32}")
@@ -134,6 +140,7 @@ def command(args) -> int:
         devices=train.get("devices"),  # 只记账，真分配在 torchrun
         grad_checkpoint=bool(train.get("grad_checkpoint")),  # 前向重算换显存
         health=train.get("health") or "stop",  # 指标坏了停还是喊
+        curriculum=bool(train.get("curriculum")),  # 先短后长地放进课程
         task=task,  # 任务族，决定读什么数据、算哪种损失
         vocab=vocab,  # 词表，给了就按它编
         group=int(train.get("group") or 4),  # 对齐任务一组几条
@@ -142,6 +149,7 @@ def command(args) -> int:
         kl_coef=float(train.get("kl_coef") or 0.01),  # KL 罚系数
         temperature=float(train.get("temperature") or 2.0),  # 蒸馏温度
         teacher=Path(teacher) if teacher else None,  # 教师权重
+        reward=reward,  # 外部奖励在 Trainer 读组数据时逐候选运行
     )
     if os.environ.get("RANK", "0") == "0":  # 多进程时只让 0 号往 loom.jsonl 写
         logs.begin(out)  # 之后的事件同时落 out/loom.jsonl

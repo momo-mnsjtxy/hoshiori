@@ -1,7 +1,9 @@
 """训练：读取文本与可选图片，拼批、前向、反向，并管理存档和本次任务的冻结模型。
 
 调用方式：Trainer(model, geo, choice).run() 跑完整趟；image_side 大于零时，bolt 样本的 images
-会缩放切块并作为文本前缀，图片位置不计损失。多卡、续训、健康检查和参考模型仍由同一实例管理。
+会缩放切块并作为文本前缀，图片位置不计损失。组相对任务给 Choice.reward 时，每条候选会在
+沙箱里调用 reward({prompt, response, ...元数据})，结果覆盖数据里的 rewards。
+多卡、续训、健康检查和参考模型仍由同一实例管理。
 
 调用示例：
   from features.trainer import Choice, Trainer                                  # 训练参数和主入口
@@ -26,7 +28,7 @@ from torch.distributed.fsdp import fully_shard
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from features import alignment, image, lora
+from features import alignment, image, lora, sandbox
 from utils import logs
 from utils.fail import fail
 
@@ -72,7 +74,9 @@ class Choice:
     kl_coef: float = 0.01  # GRPO 的 KL 罚系数
     temperature: float = 2.0  # distill 的温度
     teacher: Path = None  # distill 的教师权重，必填
-    max_images: int = 4  # 一条样本最多取几张图片；放末尾保留旧位置参数顺序
+    max_images: int = 4  # 一条样本最多取几张图片；位置不动以兼容旧的位置参数
+    reward: Path = None  # 组相对任务的外部奖励文件；给了就覆盖数据里的 rewards
+    curriculum: bool = False  # 先学短样本，再随训练进度放开中、长样本
 
 
 class Trainer:
@@ -114,6 +118,7 @@ class Trainer:
         self.cursor = 0  # 数据游标，全局第几条
         self.history = []  # 最近的 loss
         self._perm = []  # 当前这轮的取样顺序
+        self._buckets = []  # 课程采样的短、中、长三档；只活在内存，不进断点
         self.rng = torch.get_rng_state()  # 随机数状态，存盘要
         self.last_extra = {}  # 这一步的额外指标（准确率、平均奖励），只进日志
         self.reason = ""  # 健康检查叫停的原因，非空就是这一趟坏了
@@ -182,24 +187,92 @@ class Trainer:
                 item = json.loads(line)  # 题面、候选、分数
                 prompt = item.get("prompt") or ""  # 题面前缀，拼在每条候选前
                 answers = (item.get("responses") or [])[: self.choice.group]  # 候选，按组大小截
-                rewards = (item.get("rewards") or [])[: len(answers)]  # 分数要对得上候选
-                if len(answers) < 2 or len(rewards) != len(answers):  # 不足两条算不出组内优势
+                if len(answers) < 2:  # 不足两条算不出组内优势，也不用白跑外部奖励
+                    continue
+                rewards = self._rewards(item, answers)  # 外部奖励给了就覆盖原列，否则照读数据
+                if len(rewards) != len(answers):  # 数据自带奖励时，分数仍要与候选一一对应
                     continue
                 out.append(([self._ids(prompt + one) for one in answers], rewards))  # 编码后的候选与分数
         return out
 
+    def _rewards(self, item: dict, answers: list) -> list:
+        """取得一组分数；外部奖励逐候选运行，payload 含 prompt、response 与该行其余元数据。"""
+        if self.choice.reward is None:                                            # 没配外部代码就沿用数据里的奖励列
+            return (item.get("rewards") or [])[: len(answers)]                    # 分数数量稍后与候选统一核对
+        common = {key: value for key, value in item.items() if key not in {"responses", "rewards"}}  # 旧候选和旧分数不送入覆盖逻辑
+        common["prompt"] = item.get("prompt") or ""                              # 没写题面也给奖励函数稳定字段
+        scores = []                                                               # 按候选顺序攒新奖励
+        for answer in answers:                                                    # 一条候选一次隔离进程，彼此也不共享状态
+            payload = {**common, "response": answer}                              # 当前答案用单数字段交给 reward(payload)
+            score, error = sandbox.run(self.choice.reward, payload)               # 外部异常、超时、超内存都变成 error
+            if error:
+                fail("input", error, where=str(self.choice.reward), hint="修正 train.reward 指向的 reward(payload) 后重试")
+            scores.append(score)                                                  # 只有有限数字能走到这里
+        return scores                                                             # 完整覆盖这一行原有 rewards
+
+    def _length(self, sample) -> int:
+        """一条训练样本的序列长度；成对或成组任务取其中最长的候选。"""
+        if self.choice.task == "dpo":                                   # 偏好对的两边都要前向
+            return max(len(one) for one in sample)                       # 较长一边代表这对的训练开销
+        if self.choice.task in {"grpo", "rloo", "ppo"}:               # 一组候选一起参与相对目标
+            return max(len(one) for one in sample[0])                    # 最长候选决定补齐宽度
+        if self.geo.image_side:                                          # 图片样本是（文本编号，图片路径）
+            return len(sample[0])                                        # 分档只看正文序列长度
+        return len(sample)                                                # 普通正文就是一串编号
+
     def _shuffle(self, epoch: int) -> None:
-        """按 种子×轮次×进程号 生成这一轮的顺序，续训时同一轮能原样重来。"""
+        """生成一轮顺序；课程模式按长度的 1/3、2/3 经验分位分成短、中、长三档。
+
+        分位采用最近秩：排序后第 ceil(n/3) 与 ceil(2n/3) 条的长度是两道边界，
+        等于边界的样本归较短档。这样依据只来自本轮样本长度，同种子续训可原样重建。
+        """
         gen = torch.Generator().manual_seed(self.choice.seed * 100003 + epoch * 7 + self.rank)  # 种子掺进轮号和进程号，几路进程才取到不同的条
-        self._perm = torch.randperm(len(self.samples), generator=gen).tolist()  # 整轮打乱
+        if not self.choice.curriculum:                                    # 默认关闭时保留原来的整轮洗牌
+            self._perm = torch.randperm(len(self.samples), generator=gen).tolist()  # 整轮打乱
+            return                                                       # 不建立课程桶，旧顺序一位不变
+        lengths = [self._length(one) for one in self.samples]            # 每条样本只算一次长度
+        ordered = sorted(lengths)                                        # 经验分位按长度次序取最近秩
+        short = ordered[math.ceil(len(ordered) / 3) - 1]                 # 至少三分之一落在短档边界内
+        middle = ordered[math.ceil(len(ordered) * 2 / 3) - 1]            # 至少三分之二落在中档边界内
+        buckets = [[], [], []]                                           # 依次装短、中、长样本的下标
+        for index, length in enumerate(lengths):                         # 每条只进一个档，边界不会漏样本
+            level = 0 if length <= short else 1 if length <= middle else 2  # 等于分位边界归较短档
+            buckets[level].append(index)                                 # 留下原样本下标，不复制训练数据
+        for level, bucket in enumerate(buckets):                         # 三档各自打乱，档内不按长度排队
+            order = torch.randperm(len(bucket), generator=gen).tolist()  # 同一种子与轮次得到同一顺序
+            buckets[level] = [bucket[at] for at in reversed(order)]      # 反放后可从末尾常数时间取下一条
+        self._buckets = buckets                                          # 本轮消费状态只留在内存
+
+    @staticmethod
+    def _level(step: int, total: int) -> int:
+        """按 step / total 把训练进度分成等宽的短、中、长三段。"""
+        progress = step / max(1, total)                                  # 断点已有这两个数，不另存课程档位
+        if progress <= 1 / 3:                                            # 前三分之一只把短档当上限档
+            return 0                                                     # 短档
+        if progress <= 2 / 3:                                            # 中间三分之一放开到中档
+            return 1                                                     # 中档
+        return 2                                                         # 最后三分之一放开到长档
+
+    def _take(self, level: int) -> int:
+        """从当前上限档取下标；该档空了先往短档找，允许档全空才向长档补齐本轮。"""
+        levels = [*range(level, -1, -1), *range(level + 1, 3)]            # 上限内从长到短，再扫尚未开放的余档
+        for one in levels:                                               # 最多看短、中、长三档
+            if self._buckets[one]:                                       # 这一档还有本轮未取的样本
+                return self._buckets[one].pop()                          # 每个下标只弹出一次，不会重复
+        raise RuntimeError("课程采样桶提前耗尽")                         # cursor 未走满一轮时不该到这里
 
     def _next(self) -> list:
         """取下一批，取完一轮自动换顺序。"""
         pos = self.cursor % len(self.samples)  # 这一轮里的位置
         if pos == 0:  # 走到轮首就重排
             self._shuffle(self.cursor // len(self.samples))
-        self.cursor += 1  # 游标往后挪
-        return self.samples[self._perm[pos]]  # 按顺序取一条
+        if not self.choice.curriculum:  # 默认关闭时走原来的取样路径
+            self.cursor += 1  # 游标往后挪
+            return self.samples[self._perm[pos]]  # 按原来的整轮顺序取一条
+        level = self._level(self.step, self.total)                        # 档位只由当前进度推出来
+        index = self._take(level)                                        # 从当前可学的上限档开始找
+        self.cursor += 1                                                  # 成功取到以后再推进全局游标
+        return self.samples[index]                                       # 交出原样本
 
     def _batch(self) -> tuple:
         """凑一批；纯文本返回 ids/labels，图片批次再返回右侧补零的 patches。"""
@@ -366,7 +439,10 @@ class Trainer:
                         scores = self.model(ids, patches=patches)                  # 返回图片位和文本位的全部打分
                     else:                                                        # 纯文本仍调用原接口
                         scores = self.model(ids)                                  # 输出长度与 ids 相同
-                    loss = cross_entropy(scores, labels) / self.choice.grad_accum  # -100 图片位和补位都会跳过
+                    aux = 0.0                                                     # 图文对齐那一路，不开就是 0
+                    if isinstance(scores, tuple):                                 # align_weight 大于 0 时模型多交回一项
+                        scores, aux = scores                                      # 拆开：打分与对齐损失
+                    loss = (cross_entropy(scores, labels) + aux) / self.choice.grad_accum  # -100 图片位和补位都会跳过
             loss.backward()  # 反向
             total += float(loss.detach())  # 累进账
             tokens += int((labels != -100).sum())  # 记下这块有多少真 token
@@ -536,10 +612,19 @@ class Trainer:
         self.optim.load_state_dict(torch.load(folder / "optimizer.pt", map_location="cpu", weights_only=False)["optim"])  # 优化器态
         self.step = state["step"]  # 从断点接着数
         self.cursor = state["cursor"]  # 从断点接着取数据
-        self._shuffle(self.cursor // len(self.samples))  # 这一轮的顺序按轮号原样重放
         self.history = state["history"]  # 曲线接上
         self.total = self.step + self.choice.steps if self.choice.steps else state["total"]  # 给了 5 步就是再跑 5 步，没给就照旧档的总数
         self.total = max(self.total, self.step)  # 别把总步数改到断点之前
+        self._shuffle(self.cursor // len(self.samples))                    # 这一轮的随机顺序按轮号原样重建
+        used = self.cursor % len(self.samples)                             # 只需重放当前轮已经取过的部分
+        if self.choice.curriculum and used:                               # 课程桶还要恢复各档消费到哪里
+            per_step = self.choice.grad_accum                             # 对齐任务每个累积块取一组
+            if self.choice.task not in {"dpo", "grpo", "rloo", "ppo"}:  # 语言模型每个累积块还含一个微批
+                per_step *= self.choice.batch_size                        # 一步实际取 batch_size × grad_accum 条
+            first = self.cursor - used                                    # 当前轮第一条的全局游标
+            for at in range(first, self.cursor):                          # 用旧总步数重演断点前的课程选择
+                old_step = at // per_step + 1                             # 第 at 条属于哪一个已完成训练步
+                self._take(self._level(old_step, state["total"]))        # 只弹下标，不重复读取或训练
         self.rng = torch.frombuffer(bytearray.fromhex(state["rng"]), dtype=torch.uint8).clone()  # 随机数状态还原
         torch.set_rng_state(self.rng)
         if state["cuda_rng"]:  # 卡上跑的还要把卡上的状态放回去
@@ -551,7 +636,7 @@ class Trainer:
         """把这一趟的设定写进 out/run.json。"""
         meta = {
             "geometry": self.geo.as_dict(),  # 几何
-            "train": {"steps": self.total, "batch_size": self.choice.batch_size, "grad_accum": self.choice.grad_accum, "lr": self.choice.lr, "seed": self.choice.seed, "precision": self.choice.precision, "strategy": self.choice.strategy, "devices": self.choice.devices, "grad_checkpoint": self.choice.grad_checkpoint, "health": self.choice.health},  # 训练超参
+            "train": {"steps": self.total, "batch_size": self.choice.batch_size, "grad_accum": self.choice.grad_accum, "lr": self.choice.lr, "seed": self.choice.seed, "precision": self.choice.precision, "strategy": self.choice.strategy, "devices": self.choice.devices, "grad_checkpoint": self.choice.grad_checkpoint, "health": self.choice.health, "curriculum": self.choice.curriculum},  # 训练超参
             "lora": self.choice.lora,  # 挂件配置，没挂是 null
             "files": [str(one) for one in self.choice.files],  # 数据来源
         }

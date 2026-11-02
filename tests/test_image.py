@@ -1,4 +1,4 @@
-"""图片的测试：读图、补边切块、归一，以及图片前缀进入模型后的形状、位置和影响。
+"""图片的测试：读图、补边切块、归一，以及图片前缀进入模型后的形状、位置、对齐和影响。
 
 约定：图片都在 tmp_path 现造；模型用 2 层 32 维、64 词表，5×5 原图按 2×2 切成 9 块。
 纯文本与图片模型用相同种子起权重，逐值比较无图输出；改图只看文本打分，避免只改到前缀就算通过。
@@ -123,7 +123,42 @@ def test_no_patches_keeps_text_forward(geo, tie, recompute):                    
     expected = plain(ids)                                                             # 纯文本几何的实际结果
     assert torch.equal(pictured(ids), expected)                                        # 开图片能力不会改变无图结果
     assert torch.equal(pictured(ids, patches=None), expected)                          # 显式不给图也逐值相同
-    assert plain.image_proj is None and "image_proj.weight" not in plain.state_dict()   # 旧文本存档无需新增权重
+    assert isinstance(pictured(ids), torch.Tensor)                                     # align_weight 默认零，接口仍只是 logits
+    assert plain.image_proj is None and plain.image_align is None                      # 纯文本几何不建任何图片层
+    assert not any(name.startswith(("image_proj.", "image_align.")) for name in plain.state_dict())  # 旧文本存档无需新增权重
+
+
+def test_image_alignment_state_and_loss(geo):                                          # 对齐层名字、结构、公式和返回接口一起核对
+    net = model.Model(geo, align_weight=0.25).eval()                                   # 正权重开启二元组返回
+    ids = torch.tensor([[1, 2, 3], [4, 5, 6]])                                        # 两条文本与两张图片一一配对
+    blocks = torch.linspace(-1, 1, 216).reshape(2, 9, 2, 2, 3)                         # 每张图片九块，内容彼此不同
+    logits, loss = net(ids, patches=blocks)                                            # 真走投影、对齐层和主体
+    names = set(net.state_dict())                                                      # HF 风格名字由注册模块自动给出
+    expected_names = {                                                                # GELU 没参数，只有两层线性各自的权重和偏置
+        "image_align.linear_1.weight", "image_align.linear_1.bias",
+        "image_align.linear_2.weight", "image_align.linear_2.bias",
+    }
+    assert expected_names <= names                                                    # 对齐张量会跟随完整 state_dict 保存
+    assert logits.shape == (2, 12, geo.vocab) and loss.ndim == 0                       # 二元组第二项必须是标量张量
+    assert torch.isfinite(loss) and loss.requires_grad                                # 对齐目标可以直接参与反向
+    with torch.no_grad():                                                             # 手算同一次确定性前向的损失
+        image_hidden = net.image_align(net.image_proj(blocks.flatten(2)))              # 图片先投影再过两层对齐
+        hidden = net.model(ids, image_hidden)                                          # 主体给出同批文本隐状态
+        expected = model.align_loss(image_hidden, hidden[:, image_hidden.shape[1]:]) * net.align_weight  # 公式只缩放一次
+    torch.testing.assert_close(loss, expected)                                         # forward 交回的就是约定公式
+
+
+def test_changing_image_alignment_changes_text_logits(geo):                            # 对齐层不能只是挂名保存却绕过前向
+    torch.manual_seed(7)                                                              # 固定模型与输入便于复现
+    net = model.Model(geo).eval()                                                      # 默认返回单个 logits 张量
+    ids = torch.tensor([[1, 2, 3]])                                                   # 文本保持不变
+    blocks = torch.linspace(-1, 1, 108).reshape(1, 9, 2, 2, 3)                        # 给对齐层非零图片输入
+    before = net(ids, patches=blocks)[:, 9:].clone()                                  # 只比较真正使用图片的文本位置
+    with torch.no_grad():                                                             # 把对齐层改成恒为零的映射
+        for parameter in net.image_align.parameters():                                # 两层权重和偏置都属于这层
+            parameter.zero_()                                                         # 图片前缀随之全部归零
+    after = net(ids, patches=blocks)[:, 9:]                                           # 用同一图文再次前向
+    assert not torch.allclose(before, after)                                           # 文本打分改变，证明对齐层位于有效路径上
 
 
 def test_one_patch_changes_text_logits(geo):                                           # 真正验图片影响了文本计算
@@ -192,6 +227,10 @@ def test_image_model_save_load_and_config(geo, tmp_path, tie):                  
     state = net.save(tmp_path)                                                       # 用既有完整权重保存接口
     net.write_config(tmp_path, "fp32")                                               # 几何也照常落盘
     assert "image_proj.weight" in state                                              # 图片投影跟随模型保存
+    assert all(name in state for name in (                                            # 两层对齐张量也走同一保存路径
+        "image_align.linear_1.weight", "image_align.linear_1.bias",
+        "image_align.linear_2.weight", "image_align.linear_2.bias",
+    ))
     config = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))        # 核对磁盘里的实际内容
     assert config["image_side"] == 6 and config["patch"] == 2                         # 重建图片层所需的两个字段在
     assert config["max_position_embeddings"] == 33                                   # 位置预算含九块图片和二十四个词

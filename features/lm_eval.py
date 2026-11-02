@@ -1,4 +1,4 @@
-"""lm-eval 导入器：把 lm-evaluation-harness 的任务定义读成我们自己的套件文件。
+"""lm-eval 适配：把任务定义导成自己的套件，也能让答题后端把导入套件真跑一遍。
 
 调用示例：
   from pathlib import Path
@@ -7,6 +7,8 @@
   one.tasks      # 导了几题
   one.dropped    # 认不出的指标名，进报告，不静默丢
   one.report     # 报告文件在哪
+  scored = lm_eval.run_backend("printf 12", suite.read(one.path), limit=1)
+  scored["total"]  # 后端在第一题上的平均分
 
 认两种题库来源：
   1. yaml 里的 dataset_path（或 dataset_kwargs.data_files）指到本地 jsonl
@@ -23,10 +25,11 @@ metric_list 只认三种：exact_match → exact、contains → contains、regex
 
 import json
 import re
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from features import suite
+from features import scorer, suite
 from utils import yaml_io
 from utils.fail import fail
 
@@ -39,6 +42,7 @@ FILTERS = {"lower": str.lower, "upper": str.upper, "strip": str.strip}        # 
 PLACE = re.compile(r"\{\{\s*([^{}]*?)\s*\}\}")                                   # 整个 {{...}} 段
 SAMPLE_KEYS = ("samples", "fewshot", "fewshot_samples")                       # 内联示例可能用的键名
 SPLIT = ";"                                                                   # contains 的多个答案按分号分
+TIMEOUT = 300                                                                 # 单题最多等五分钟，坏后端不能把整批题拖死
 
 
 @dataclass
@@ -59,6 +63,55 @@ class Import:
         if self.dropped:                                                      # 丢弃的规则名摆在明处
             line += "（" + " / ".join(self.dropped) + "）"
         return line + f"；报告 {self.report.name}"
+
+
+# --- 跑分 ---
+
+def run_backend(backend_cmd: str, suite, limit: int) -> dict:
+    """拿一个答题命令跑一整套题，返回总分和逐题判定。
+
+    backend_cmd 里的 ``{prompt}`` 会换成题面；空命令按回显题面处理。
+    limit 为 0 时跑完整套件，正整数只跑开头几题。
+    """
+    if limit < 0:                                                            # 这是公开边界，负数没有可解释的跑法
+        fail("input", "limit 不能是负数", hint="给 0 或正整数，0 表示不限")
+    tasks = suite.tasks[:limit] if limit else suite.tasks                    # 先定下本次实际跑的题
+    rows = []                                                                # 一题一行，交给 judge 拼完整报告
+    for task in tasks:                                                       # 同一后端依次答完选中的题
+        text = answer(backend_cmd, task.prompt)                              # 把题面交给外部答题命令
+        verdict = scorer.grade(task, text)                                  # 用套件自带规则判这份答案
+        rows.append({                                                        # 留下逐题分数与可追溯答案
+            "suite": suite.name,                                           # 题来自哪一套
+            "id": task.id,                                                 # 题号供基线逐题对齐
+            "score": verdict.score,                                        # 这题的 0~1 分
+            "reason": verdict.reason,                                      # 为什么得这分
+            "answer": text.strip(),                                        # 后端实际答了什么
+        })
+    total = round(sum(row["score"] for row in rows) / len(rows), 4) if rows else 0.0  # 平均分就是套件分
+    return {                                                                 # 这是一份可直接检查的分数报告
+        "backend": backend_cmd or "echo",                                 # 空命令的真实行为是回显
+        "suite": suite.name,                                               # 跑的是哪一套
+        "count": len(rows),                                                # 实际答了几题
+        "total": total,                                                    # 这一套的平均分
+        "tasks": rows,                                                     # 每题的答案与判定
+    }
+
+
+def answer(backend_cmd: str, prompt: str) -> str:
+    """把一道题交给答题命令；命令失败或超时就指出是哪条命令。"""
+    if not backend_cmd:                                                      # 没接模型时保留原来的回显占位行为
+        return prompt                                                        # 题面本身就是占位答案
+    command = backend_cmd.replace("{prompt}", prompt)                       # 用户明确指定题面放进命令的位置
+    try:
+        done = subprocess.run(                                               # shell 让 ollama、管道等现成命令能直接接入
+            command, shell=True, capture_output=True, text=True, timeout=TIMEOUT
+        )
+    except subprocess.TimeoutExpired:                                        # 卡死的后端要让整批评测能退出
+        fail("input", f"答案命令 {TIMEOUT} 秒没跑完", where=command[:100])
+    if done.returncode:                                                      # 进程失败不能伪装成一份空答案
+        fail("input", f"答案命令退出码 {done.returncode}", where=command[:100],
+             hint=done.stderr.strip()[:300])
+    return done.stdout                                                       # 原样交给判分器，清理规则由题型决定
 
 
 def import_all(paths: list, out_dir: Path) -> list:

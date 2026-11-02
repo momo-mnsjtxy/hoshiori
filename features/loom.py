@@ -1,4 +1,4 @@
-"""面板：把产物目录摊成五个只读页面，起在本机给人看。
+"""面板：把产物目录摊成五个只读页面和一份指标流，起在本机给人看。
 
 调用示例：
   from pathlib import Path
@@ -13,6 +13,7 @@
   /rejects    拒收档    rejects.jsonl 按原因码分组，点开看样本
   /progress   进度      loom.jsonl 时间线
   /compare    对比      两份 card.json 并排
+  /metrics.json         loom.jsonl 里的 loss 与时间，供首页增量拉取
 
 安全面就三条，都只在这个文件里：
   1. 只读：一个 GET 路由，不写盘，不收表单。
@@ -33,6 +34,7 @@ import urllib.parse
 from pathlib import Path
 
 PAGE = 20  # 一页几条样本。20 条差不多一屏，再多就得滚很久
+METRIC_LIMIT = 2000  # 曲线点太多会拖慢 SVG；超过后相邻两点合成一点
 
 STYLE = """
 :root { color-scheme: dark; --bg:#14161a; --panel:#1c1f26; --line:#2c313b; --text:#e6e8ec;
@@ -66,6 +68,10 @@ button, .page a { padding:7px 12px; border-radius:6px; border:1px solid var(--li
 .tl time { color:var(--text); margin-right:8px; }
 .note { color:var(--dim); }
 .warn { color:var(--gone); }
+.metrics { margin:0 0 18px; padding:12px; border:1px solid var(--line); border-radius:8px; background:var(--panel); }
+.metrics header { display:flex; align-items:baseline; justify-content:space-between; gap:12px; }
+.metrics header h1 { margin:0; }
+.loss-chart { display:block; width:100%; height:auto; margin-top:8px; background:#0f1115; border-radius:6px; }
 """
 
 LINKS = (("/", "首页"), ("/samples", "样本"), ("/rejects", "拒收档"), ("/progress", "进度"), ("/compare", "对比"))
@@ -136,6 +142,100 @@ def _card_html(card: dict, title: str) -> str:
     return f"<div class='card'><h1>{_esc(title)}</h1><table>{body}</table></div>"
 
 
+def _loss_chart() -> str:
+    """首页的实时 loss 图。浏览器只改 SVG 折线，不引入前端库。"""
+    return """
+<section class='metrics'>
+  <header><h1>Loss</h1><span id='loss-note' class='note'>等候 loss 数据…</span></header>
+  <svg id='loss-chart' class='loss-chart' viewBox='0 0 920 260' role='img' aria-label='loss 曲线'>
+    <line x1='36' y1='230' x2='904' y2='230' stroke='#2c313b'/>
+    <line x1='36' y1='16' x2='36' y2='230' stroke='#2c313b'/>
+    <polyline id='loss-line' fill='none' stroke='#8fb6e0' stroke-width='2' points=''/>
+  </svg>
+</section>
+<script>
+(() => {
+  let points = [];                                           // 页面当前留着的曲线点
+  let since = null;                                          // 上次收到的最晚时间
+  let timer = null;                                          // 下一次拉取的计时器
+  let loading = false;                                       // 慢请求没结束时不叠第二个请求
+  const line = document.getElementById("loss-line");         // SVG 里真正画线的节点
+  const note = document.getElementById("loss-note");         // 曲线右上角的点数与最新值
+
+  function thinPoints() {
+    while (points.length > 2000) {                           // 超过上限就整批抽稀，直到装得下
+      const merged = [];                                     // 这一轮合并后的点
+      for (let index = 0; index < points.length; index += 2) {
+        const first = points[index];                          // 相邻两点里的前一点
+        const second = points[index + 1];                     // 相邻两点里的后一点，奇数尾部没有它
+        if (!second) { merged.push(first); continue; }        // 奇数末点没有配对，原样留下
+        merged.push({
+          t: second.t,                                       // 留较晚时间，增量游标才不会倒退
+          loss: (Number(first.loss) + Number(second.loss)) / 2,
+        });                                                  // 两个 loss 取均值，削掉一半点数
+      }
+      points = merged;                                       // 下一轮和绘图都改用抽稀结果
+    }
+  }
+
+  function drawLoss() {
+    if (!points.length) {                                    // 训练还没报 loss 时画一张空图
+      line.setAttribute("points", "");
+      note.textContent = "还没有 loss 数据";
+      return;
+    }
+    const times = points.map(point => Number(point.t));       // 横轴用事件时间
+    const losses = points.map(point => Number(point.loss));   // 纵轴用训练 loss
+    const firstTime = Math.min(...times);                     // 当前可见范围的最早时间
+    const lastTime = Math.max(...times);                      // 当前可见范围的最晚时间
+    const low = Math.min(...losses);                          // 当前曲线的最低 loss
+    const high = Math.max(...losses);                         // 当前曲线的最高 loss
+    const width = lastTime - firstTime || 1;                  // 只有一个点时避免除以 0
+    const height = high - low || 1;                           // loss 全相同时仍能画水平线
+    const path = points.map(point => {
+      const x = 36 + (Number(point.t) - firstTime) / width * 868;
+      const y = 230 - (Number(point.loss) - low) / height * 214;
+      return `${x.toFixed(2)},${y.toFixed(2)}`;               // polyline 要的 x,y 文本
+    }).join(" ");
+    line.setAttribute("points", path);                       // 只改一处 DOM 就刷新折线
+    note.textContent = `共 ${points.length} 点 · 最新 loss ${Number(points.at(-1).loss).toFixed(4)}`;
+  }
+
+  function planUpdate() {
+    clearTimeout(timer);                                     // 始终只留一个下一轮计时器
+    if (!document.hidden) timer = setTimeout(updateLoss, 2000); // 前台标签每 2 秒拉一次
+  }
+
+  async function updateLoss() {
+    if (document.hidden || loading) return;                   // 后台标签和未完成请求都不继续拉
+    loading = true;
+    const query = since === null ? "" : "?since=" + encodeURIComponent(since);
+    try {
+      const reply = await fetch("/metrics.json" + query, { cache: "no-store" });
+      if (!reply.ok) throw new Error(`HTTP ${reply.status}`); // 读不到产物时在图上直说
+      const fresh = await reply.json();                       // 每项只有 t 与 loss
+      if (fresh.length) since = Math.max(...fresh.map(point => Number(point.t)));
+      points.push(...fresh);                                  // 把这两秒的新点接到旧曲线后面
+      thinPoints();                                           // 长时间开着也不让 DOM 越积越重
+      drawLoss();                                             // 用全部留存点重画一条折线
+    } catch (error) {
+      note.textContent = `指标暂时读不到：${error.message}`;   // 下轮仍会重试，不打断页面
+    } finally {
+      loading = false;
+      planUpdate();                                          // 本轮结束后再等两秒，不重叠请求
+    }
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    clearTimeout(timer);                                     // 切到后台立刻取消下一轮
+    if (!document.hidden) updateLoss();                       // 回到前台马上补齐这段增量
+  });
+  updateLoss();                                              // 首页打开时先取已有曲线
+})();
+</script>
+"""
+
+
 # --- 找产物 ---
 
 def _at(root: Path, rel: str):
@@ -165,6 +265,37 @@ def _num(params: dict, key: str) -> int:
     return int(raw) if raw.isdigit() and int(raw) > 0 else 1  # 非数字退回第 1 页
 
 
+def _thin_metrics(points: list) -> list:
+    """把超过 2000 个的指标点相邻合并；奇数末点保留。"""
+    while len(points) > METRIC_LIMIT:                    # 大批量初次加载可能需要抽稀不止一轮
+        merged = []                                      # 这一轮合并后的点
+        for index in range(0, len(points), 2):           # 每两个相邻点组成一组
+            first = points[index]                        # 这一组的前一点
+            if index + 1 == len(points):                 # 奇数末点没有搭档
+                merged.append(first)                     # 原样留下末点
+                continue
+            second = points[index + 1]                   # 这一组的后一点
+            merged.append({
+                "t": second["t"],                       # 留较晚时间，since 游标不会重复取数
+                "loss": (first["loss"] + second["loss"]) / 2,
+            })                                           # loss 取均值，点数约减半
+        points = merged                                  # 仍超上限就拿合并结果再来一轮
+    return points
+
+
+def _metrics(root: Path, since):
+    """从固定的 loom.jsonl 取 loss 点，只留下时间与 loss 两项。"""
+    rows = _load(root, {}, "loom.jsonl")                 # 指标地址固定，不能由查询参数换文件
+    if rows is None:                                     # 还没有训练日志
+        return None
+    points = [
+        {"t": row["t"], "loss": row["loss"]}
+        for row in rows
+        if "t" in row and "loss" in row and (since is None or row["t"] > since)
+    ]                                                    # 普通进度事件没有 loss，不属于曲线
+    return _thin_metrics(points)                         # 单次响应也不超过 SVG 能承受的点数
+
+
 # --- 服务本体 ---
 
 class Panel(http.server.BaseHTTPRequestHandler):
@@ -178,6 +309,10 @@ class Panel(http.server.BaseHTTPRequestHandler):
         """一个 GET 进来，按路径找页面；没登记的路径就是 404。"""
         url = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(url.query)
+        if url.path == "/metrics.json":                 # 指标流是 JSON，不套五个页面的 HTML 壳
+            code, rows = self.metrics(params)
+            self.reply_json(code, rows)
+            return
         route = ROUTES.get(url.path)                      # 路径 → 页面函数
         if route is None:                                 # 没有这一页
             self.reply(404, _page("没有这一页", f"<h1>没有这一页</h1><p class='note'>{_esc(url.path)}</p>"))
@@ -194,6 +329,16 @@ class Panel(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def reply_json(self, code: int, rows: list) -> None:
+        """发指标 JSON；禁用缓存，轮询才能立刻看到新点。"""
+        raw = json.dumps(rows, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(raw)))  # 浏览器按准确长度收完整批增量
+        self.end_headers()
+        self.wfile.write(raw)
+
     def gone(self, note: str):
         """一页读不到数据的提示，统一回 404。"""
         return 404, _page("读不到", f"<h1>读不到</h1><p class='warn'>{_esc(note)}</p>")
@@ -201,7 +346,7 @@ class Panel(http.server.BaseHTTPRequestHandler):
     # --- 五个页面 ---
 
     def index(self, params):
-        """首页：数据集卡摘要，加一条收下 / 重复 / 拒收的比例条。"""
+        """首页：实时 loss、数据集卡摘要和收下 / 重复 / 拒收比例条。"""
         card = _at(self.root, "card.json")
         if card is None or not card.is_file():            # 没有卡就别装了，先跑 weave
             return self.gone("这个目录里没有 card.json，先跑一趟 ori weave")
@@ -211,7 +356,8 @@ class Panel(http.server.BaseHTTPRequestHandler):
         kept, dup = counts.get("kept", 0), counts.get("duplicated", 0)  # 收下的和重复的
         gone = sum(counts.get("refused", {}).values())    # 拒收原因码加起来
         body = (
-            f"<div class='bars'><span class='kept' style='width:{kept / total * 100:.1f}%'></span>"
+            _loss_chart()
+            + f"<div class='bars'><span class='kept' style='width:{kept / total * 100:.1f}%'></span>"
             f"<span class='dup' style='width:{dup / total * 100:.1f}%'></span>"
             f"<span class='gone' style='width:{gone / total * 100:.1f}%'></span></div>"
             f"<div class='legend'><span>收下 {kept}</span><span>重复 {dup}</span><span>拒收 {gone}</span></div>"
@@ -219,6 +365,18 @@ class Panel(http.server.BaseHTTPRequestHandler):
             + _card_html(data, f"{data.get('name', '无名数据集')} · 数据集卡")
         )
         return 200, _page("首页", body, "/")
+
+    def metrics(self, params):
+        """指标流：按可选的时间游标只回新增 loss 点。"""
+        raw = (params.get("since") or [None])[0]         # 没有游标就是首页第一次加载
+        try:
+            since = float(raw) if raw is not None else None  # 查询串只在边界转一次数字
+        except ValueError:
+            return 400, []                               # 非数字游标是用户输入错误
+        points = _metrics(self.root, since)              # 固定读根目录里的 loom.jsonl
+        if points is None:
+            return 404, []                               # 还没产生日志时明确说读不到
+        return 200, points
 
     def samples(self, params):
         """样本浏览器：bolt.jsonl 分页，一页 20 条，可按关键词过滤。"""

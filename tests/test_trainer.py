@@ -53,6 +53,15 @@ def short(geo, files, out, **over):
     return trainer.Choice(**base)
 
 
+@pytest.fixture
+def varied_files(tmp_path):
+    """10 条长度各异且内容不重复的正文，覆盖不能整除三档的边界。"""
+    texts = [chr(65 + at) + "x" * size for at, size in enumerate(range(2, 12))]  # 编码后长度从 3 到 12
+    path = tmp_path / "varied.jsonl"                                            # 单独一份变长训练集
+    path.write_text("\n".join(json.dumps({"text": one}) for one in texts), encoding="utf-8")  # 一行一条
+    return [path]                                                               # 与 Choice.files 的接口一致
+
+
 # ---------- 训练本身 ----------
 
 def test_loss_falls(geo, files, tmp_path):
@@ -91,6 +100,42 @@ def test_resume_keeps_cursor(geo, files, tmp_path):
     job = trainer.Trainer(model.Model(geo), geo, short(geo, files, out, steps=5, save_every=5, resume=out / "step-000004"))  # 从断点接
     job.run()
     assert job.history and json.loads((out / "step-000005" / "state.json").read_text(encoding="utf-8"))["cursor"] == 10  # 接着往后取
+
+
+# ---------- 课程采样 ----------
+
+def test_curriculum_early_batch_is_shorter(geo, varied_files, tmp_path):
+    job = trainer.Trainer(model.Model(geo), geo, short(geo, varied_files, tmp_path / "run", batch_size=2, steps=5, curriculum=True))  # 五步正好覆盖三段进度
+    job.step = 1                                                               # 第一步仍在短样本段
+    early = job._batch()[1]                                                    # 标签里的非忽略位就是每条真实长度减一
+    job.step = job.total                                                       # 收尾一步已经放开长样本
+    late = job._batch()[1]                                                     # 同样取一个两条的微批
+    early_mean = (early != -100).sum(dim=1).float().mean()                     # 早期批的平均答案长度
+    late_mean = (late != -100).sum(dim=1).float().mean()                       # 后期批的平均答案长度
+    assert late_mean > early_mean                                              # 课程确实从短到长
+    job.close()                                                                # 本测试不跑完整训练，显式收尾
+
+
+def test_curriculum_boundaries_keep_every_sample(geo, varied_files, tmp_path):
+    job = trainer.Trainer(model.Model(geo), geo, short(geo, varied_files, tmp_path / "run", batch_size=1, steps=10, curriculum=True))  # 十条不能被三档整除
+    taken = []                                                                 # 收集一整轮实际取到的样本
+    for step in range(1, len(job.samples) + 1):                                # 依次跨过 1/3、2/3 两道进度边界
+        job.step = step                                                        # 档位由 step / total 当场推算
+        taken.append(tuple(job._next()))                                       # 每次只取一条，方便核对身份
+    assert len(taken) == len(job.samples)                                      # 跑完一轮，取到条数就是总条数
+    assert sorted(taken) == sorted(tuple(one) for one in job.samples)           # 边界处没有重复，也没有漏掉任何样本
+    job.close()                                                                # 显式释放任务资源
+
+
+def test_curriculum_off_keeps_original_next_order(geo, files, tmp_path):
+    job = trainer.Trainer(model.Model(geo), geo, short(geo, files, tmp_path / "run", batch_size=1, steps=10))  # 不写开关就是默认关闭
+    gen = torch.Generator().manual_seed(job.choice.seed * 100003 + job.rank)    # 原实现首轮使用的同一颗种子
+    order = torch.randperm(len(job.samples), generator=gen).tolist()            # 原实现整轮 randperm 的顺序
+    expected = [job.samples[at] for at in order]                               # 旧版 _next 应逐条交出的样本
+    job.step = job.total                                                       # 关闭时训练进度不应影响顺序
+    taken = [job._next() for _ in job.samples]                                 # 真走一整轮
+    assert job.choice.curriculum is False and taken == expected                # 默认值与逐条顺序都和原来一致
+    job.close()                                                                # 显式释放任务资源
 
 
 # ---------- 图片批次 ----------

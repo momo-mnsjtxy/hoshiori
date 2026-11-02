@@ -2,9 +2,10 @@
 
 调用示例：
   from features.dataset import Dataset, Choice
-  job = Dataset(Choice(out=Path("bolt"), name="zh-mix", license="cc0"))
+  choice = Choice(out=Path("bolt"), name="zh-mix", license="cc0", fake_files=["made.jsonl"])
+  job = Dataset(choice)
   counts = job.make(["data/a.jsonl", "data/b.jsonl"])
-  counts.summary()      # {"read": 207, "kept": 182, "duplicated": 24, …}
+  counts.summary()      # {"read": 207, "kept": 182, "kept_fake": 18, …}
 
 产物固定四样，全在 out 目录里：
   bolt.jsonl       收下的正文，一行一条，训练只吃这个
@@ -19,7 +20,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from features import duplicate, fingerprint, source
+from features import clean, duplicate, fingerprint, source
 from features.sample import Policy, Refused, read as read_sample
 from utils import logs
 
@@ -37,6 +38,8 @@ class Choice:
     keep_duplicates: bool = False  # 判掉的要不要也留进 bolt
     dry_run: bool = False  # 只跑流程，产物照样写，卡片里标注
     store_dir: Path = None  # 去重索引落盘的目录，给了就落在 <store_dir>/index；None 只在内存
+    fake_files: list = field(default_factory=list)  # 合成样本来源；不给就保持原来的流式路径
+    fake_ratio: float = 0.1  # 混合结果里合成样本的目标占比
 
 
 @dataclass
@@ -45,6 +48,7 @@ class Counts:
 
     read: int = 0
     kept: int = 0
+    kept_fake: int = 0
     duplicated: int = 0
     refused: dict = field(default_factory=dict)  # 原因码 → 条数
 
@@ -56,6 +60,7 @@ class Counts:
         return {
             "read": self.read,
             "kept": self.kept,
+            "kept_fake": self.kept_fake,
             "duplicated": self.duplicated,
             "refused": dict(self.refused),
             "keep_rate": round(self.kept / total, 4),
@@ -77,18 +82,31 @@ class Dataset:
 
     def make(self, specs: list) -> Counts:
         """主流程：逐个来源读 → 收样本 → 判重 → 写盘 → 出指纹和卡。"""
-        self._specs = specs  # 卡片要列来源，先存住
+        real_files = list(specs)                                                # 真实来源既要读取也要写进卡片
+        fake_files = list(self.choice.fake_files)                              # 合成来源单独留着，统计才能分开
+        self._specs = real_files + fake_files                                  # 卡片列出进入混配的全部来源
         self.choice.out.mkdir(parents=True, exist_ok=True)  # 产物目录先建好，后面只管写
         with self._kept_path.open("w", encoding="utf-8") as kept, self._refused_path.open("w", encoding="utf-8") as refused:
-            for spec in specs:  # 一个来源一趟，来源之间互不影响
-                logs.step("weave", "开始读", source=spec)
-                for record, where in source.read(spec):  # 一条条来
-                    self._one(record, where, kept, refused)
-                logs.done("weave", "读完", source=spec)
+            if fake_files:                                                     # 只有给了 --fake 才把两边装进内存抽样
+                real = list(self._records(real_files, is_fake=False))           # 真实池保留来源与类别
+                fake = list(self._records(fake_files, is_fake=True))            # 合成池走同一套来源读取
+                records = clean.blend(real, fake, self.choice.fake_ratio)       # 无放回抽成目标比例
+            else:
+                records = self._records(real_files, is_fake=False)              # 常规路径继续逐条流式处理
+            for record, where, is_fake in records:                              # 混配后仍统一清洗、评分与判重
+                self._one(record, where, kept, refused, is_fake)                # 一条入口负责全部拒收原因
         self._finish()
         return self.counts
 
-    def _one(self, record: dict, where: str, kept, refused) -> None:
+    def _records(self, specs: list, is_fake: bool):
+        """依次读取一组来源，并给每条记录带上真实/合成类别。"""
+        for spec in specs:                                                      # 一个来源一趟，来源之间互不影响
+            logs.step("weave", "开始读", source=spec)                           # 面板显示当前读到哪里
+            for record, where in source.read(spec):                             # 来源层统一处理文件、目录和链接
+                yield record, where, is_fake                                    # 类别只在数据集内部随记录走
+            logs.done("weave", "读完", source=spec)                            # 一份来源完整读完才报完成
+
+    def _one(self, record: dict, where: str, kept, refused, is_fake: bool) -> None:
         """处理一条：收不下的进拒收档，收得下但重复的按开关处理。"""
         self.counts.read += 1
         try:
@@ -108,6 +126,8 @@ class Dataset:
         self._stamp.feed(sample["text"])  # 只有真正收下的才进指纹
         _put(kept, sample)
         self.counts.kept += 1
+        if is_fake:  # 合成样本是总收下数的子集，单列给数据卡看
+            self.counts.kept_fake += 1
         if self.counts.kept % 1000 == 0:  # 每千条报一次进度，别静默太久
             logs.step("weave", "已收", kept=self.counts.kept, read=self.counts.read)
 

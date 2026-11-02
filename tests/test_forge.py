@@ -198,6 +198,16 @@ def run_forge(tmp_path, *extra):
     return main.run(["forge", str(warp(tmp_path)), *extra])
 
 
+def judge_report(path, model, total, scores):
+    """写一份 self_check 能吃的 judge 形报告；scores 是（套件, 题号, 分数）。"""
+    tasks = [
+        {"suite": suite, "id": ident, "score": score, "reason": "测试", "answer": ""}
+        for suite, ident, score in scores
+    ]
+    path.write_text(json.dumps({"model": model, "total": total, "tasks": tasks}), encoding="utf-8")
+    return path
+
+
 def decode_q6(data: bytes, rows: int) -> np.ndarray:
     """按 q6_k 的字节布局解开，返回 (行, 256) 的还原值。低 4 位、高 2 位、子块比例三处都要拼回来。"""
     out = np.zeros((rows, 256))
@@ -579,6 +589,83 @@ def test_command_merges_adapter(tmp_path):
 
 
 # ---------- 命令层 ----------
+
+def test_self_check_writes_degradation_table(tmp_path):
+    """两份 judge 报告要汇成同源 JSON 与 Markdown，含总分差和逐项退化。"""
+    baseline = judge_report(
+        tmp_path / "baseline.json",
+        "f16",
+        0.8,
+        [("zh-lite", "units", 1.0), ("format-lite", "json", 0.6)],
+    )
+    quantized = judge_report(
+        tmp_path / "quantized.json",
+        "q8_0",
+        0.65,
+        [("zh-lite", "units", 0.5), ("format-lite", "json", 0.8)],
+    )
+
+    result = forge.self_check(baseline, quantized)
+
+    assert result["total_delta"] == -0.15  # 量化减基线，负数是退化
+    assert result["degradation"] == 0.15  # 门用正的退化幅度
+    assert result["items"][0] == {  # 掉最多的排第一
+        "suite": "zh-lite",
+        "id": "units",
+        "baseline": 1.0,
+        "quantized": 0.5,
+        "delta": -0.5,
+        "degradation": 0.5,
+    }
+    saved = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    markdown = (tmp_path / "report.md").read_text(encoding="utf-8")
+    assert saved["items"] == result["items"]  # JSON 和返回值同源
+    assert "| 套件 | 项目 | 基线 | 量化 |" in markdown  # Markdown 有退化表
+    assert "| zh-lite | units | 1.0000 | 0.5000 | -0.5000 | +0.5000 |" in markdown
+
+
+def test_self_check_over_threshold_returns_one_and_lists_top_three(tmp_path, monkeypatch, capsys):
+    """总分掉过默认 0.05 就退 1，终端只点名退化最大的三项。"""
+    scores = [("zh-lite", f"drop-{index}", 1.0) for index in range(1, 5)]
+    reports = iter(
+        [
+            {"model": "f16", "total": 1.0, "tasks": [
+                {"suite": suite, "id": ident, "score": score, "reason": "", "answer": ""}
+                for suite, ident, score in scores
+            ]},
+            {"model": "q8_0", "total": 0.3, "tasks": [
+                {"suite": "zh-lite", "id": f"drop-{index}", "score": score, "reason": "", "answer": ""}
+                for index, score in enumerate((0.0, 0.2, 0.4, 0.6), 1)
+            ]},
+        ]
+    )
+    monkeypatch.setattr(forge, "benchmark", lambda model, suites, label: next(reports))  # 不要求测试机装 llama-cli
+    out = tmp_path / "checked.gguf"
+
+    code = run_forge(tmp_path, "--out", str(out), "--format", "gguf", "--quant", "q8_0", "--self-check")
+
+    printed = capsys.readouterr().out
+    assert code == 1  # 0.7 的总退化超过默认 0.05
+    assert all(f"drop-{index}" in printed for index in (1, 2, 3))  # 最大三项都点名
+    assert "drop-4" not in printed  # 第四项不把命令输出刷长
+    assert "自评门：不过" in printed
+    assert (tmp_path / "report.md").is_file() and (tmp_path / "report.json").is_file()
+    assert not list(tmp_path.glob(".forge-*.json"))  # 两份原始分只做中间输入，不留隐藏垃圾
+
+
+def test_without_self_check_keeps_current_behavior(tmp_path, monkeypatch):
+    """没给 --self-check 时不跑基准、不写报告，原来的导出与退出码都不变。"""
+    def unexpected(*args, **kwargs):
+        raise AssertionError("普通导出不该跑 benchmark")
+
+    monkeypatch.setattr(forge, "benchmark", unexpected)
+    out = tmp_path / "plain.gguf"
+
+    assert run_forge(tmp_path, "--out", str(out), "--format", "gguf", "--quant", "q8_0") == 0
+    assert out.is_file()  # 原产物照常落盘
+    assert not (tmp_path / "report.md").exists()  # 没有额外副作用
+    assert not (tmp_path / "report.json").exists()
+
 
 def test_missing_out_is_usage_error(tmp_path):
     with pytest.raises(SystemExit) as stop:

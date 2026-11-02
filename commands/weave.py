@@ -2,6 +2,7 @@
 
 调用示例：
   ori weave --in data/raw.jsonl --out bolt --name zh-mix --license cc0
+  ori weave --in real.jsonl --fake made.jsonl --fake-ratio 0.1 --min-score 0.55
   ori weave --in a.jsonl --in b.jsonl --threshold 0.9
   ori weave --in data/raw.jsonl --out bolt --store bolt     # 索引落到 bolt/index，百万级语料用
   cat a.jsonl | ori weave --in - --out bolt
@@ -35,18 +36,30 @@ def command(args) -> int:
         fail("input", "max-chars 比 min-chars 还小，一条都过不了", hint="把两个数对调")
     if not 0 < args.threshold <= 1:  # 阈值超出 0~1
         fail("input", "threshold 落在 0 到 1 之间", hint="常规用 0.8，严一点 0.9")
+    if not 0 <= args.min_score <= 1:  # 质量分自身只会落在 0~1
+        fail("input", "min-score 要落在 0 到 1 之间", hint="0 不筛，常规可从 0.5 试起")
+    if not 0 <= args.fake_ratio <= 1:  # 合成占比也用 0~1 表示
+        fail("input", "fake-ratio 要落在 0 到 1 之间", hint="例: 0.1 表示约一成合成样本")
 
     out = Path(args.out)  # 产物目录
     job = Choice(  # 把命令行参数原样搬成一份选择，规矩都在这里定死
         out=out,
         name=args.name,
         license=args.license,
-        policy=Policy(fields=tuple(args.fields.split(",")), min_chars=args.min_chars, max_chars=args.max_chars),
+        policy=Policy(
+            fields=tuple(args.fields.split(",")),
+            min_chars=args.min_chars,
+            max_chars=args.max_chars,
+            min_score=args.min_score,
+            scrub=args.scrub,
+        ),
         rule=duplicate.Rule(threshold=args.threshold, size=args.size, count=args.count, exact=not args.no_exact),
         algo=args.algo,
         keep_duplicates=args.keep_duplicates,
         dry_run=args.dry_run,
         store_dir=store,
+        fake_files=list(args.fake_files or []),
+        fake_ratio=args.fake_ratio,
     )
 
     logs.begin(out)  # 面板侧的记录进 out/loom.jsonl
@@ -58,7 +71,11 @@ def command(args) -> int:
     summary = counts.summary()  # 这一趟的账
     print(json.dumps(summary, ensure_ascii=False, indent=2))  # 机器能直接读
     print(f"\n产物 {out}/bolt.jsonl · {out}/card.json · {out}/fingerprint.json")
-    print(f"收下 {summary['kept']} 条（{summary['keep_rate']:.1%}），重复 {counts.duplicated} 条，拒收 {sum(counts.refused.values())} 条")
+    print(
+        f"收下 {summary['kept']} 条（{summary['keep_rate']:.1%}），"
+        f"其中合成 {summary['kept_fake']} 条，重复 {counts.duplicated} 条，"
+        f"拒收 {sum(counts.refused.values())} 条"
+    )
     return 0
 
 

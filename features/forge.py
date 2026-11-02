@@ -6,6 +6,12 @@
   report = job.run()          # {"tensors": 12, "bytes": 8123, "dropped": ["tokenizer"]}
   read(Path("m.gguf"))        # 自带的极简 reader，回读断言和自检都用它
 
+  checked = Export(Choice(     # 量化前后跑同一批内置套件
+      source=Path("ckpt"), out=Path("m.gguf"), quant="q8_0",
+      self_check=True, suites=["zh-lite", "format-lite"],
+  )).run()
+  checked["self_check"]["degradation"]  # 正数表示量化后掉分
+
 命令行那一层是这样调的：
   ori forge sft.warp.yaml --out out/gguf --format gguf --quant q8_0
 
@@ -129,6 +135,8 @@ ONNX_LAYER_NAMES = {
 }
 ONNX_SEQ = 8  # 导出用的序列长度：图按这个长度固定下来，跑的时候也要喂同样长
 ONNX_RELATIVE_MAX = 1e-4  # 自检的 logits 相对误差上限，差过线就是图导坏了
+SELF_CHECK_TOKENS = 64  # 每道内置题最多生成 64 token，短答案够用，也避免坏模型一直吐
+SELF_CHECK_TIMEOUT = 300  # 一道题最多跑五分钟，和 judge 的答案命令上限一致
 
 Q6_UNITS = (1.0, 0.125, 0.03125)  # 迭代的轮数与每轮候选的步长单位，一条一轮，先粗后细，照 make_qx_quants 的 3 轮
 Q6_STEPS = (-3, -2, -1, 1, 2, 3)  # 每轮的候选偏移，正负都有，避开 0（比例不动就白量一次）
@@ -150,6 +158,8 @@ class Choice:
     tensors: dict = None  # 外面已经读过（比如合并完）就直接给数组，不再读盘
     verbose: bool = False  # 把要执行的命令、参数、目录布局都打出来
     mlx_print_only: bool = False  # mlx 只打印不执行，方便在 macOS 上照抄
+    self_check: bool = False  # 量化前后跑同一批套件并写退化报告
+    suites: list = field(default_factory=lambda: ["zh-lite", "format-lite"])  # 自评要跑的内置套件或文件
 
 
 class Export:
@@ -159,7 +169,7 @@ class Export:
         self.choice = choice
 
     def run(self) -> dict:
-        """主流程：读权重 → 改名 → 收元数据 → 按格式写盘 → 出账。"""
+        """主流程：读权重 → 改名 → 可选基线 → 按格式写盘 → 可选量化评测 → 出账。"""
         tensors = self.choice.tensors or load(self.choice.source)  # 读进来就是 np 数组，坏文件当场报错
         named = rename(tensors, self.choice.dropped)  # 换成 ggml 的名字，没映射的照原名留着
         if self.choice.format == "safetensors":  # 安全格式就是原样另存
@@ -171,10 +181,39 @@ class Export:
         kv = metadata(self.choice.config, self.choice.name, self.choice.quant, self.choice.dropped)  # 元数据转 kv
         if self.choice.with_tokenizer:  # 不导词表就不塞这些 kv
             kv.update(tokenizer(self._token_dir(), self.choice.dropped))  # 词表照着基座目录读，缺了记进 dropped
+        baseline = self._baseline(named, kv) if self.choice.self_check else None  # 先跑 f16，量化产物还没写
         blob = gguf_bytes(named, kv, self.choice.quant, self.choice.dropped)  # 拼整个文件，一回写出去
         self.choice.out.parent.mkdir(parents=True, exist_ok=True)
         self.choice.out.write_bytes(blob)  # 数据段一次性落盘
-        return {"tensors": len(named), "bytes": len(blob), "dropped": self.choice.dropped}
+        summary = {"tensors": len(named), "bytes": len(blob), "dropped": self.choice.dropped}  # 本次导出的账
+        if baseline is not None:  # 基线跑过才评量化产物
+            summary["self_check"] = self._finish_check(baseline)  # 量化分与基线分落成旁边两份报告
+        return summary
+
+    def _baseline(self, tensors: dict, kv: dict) -> dict:
+        """临时写一份 f16 GGUF 并先跑基准；临时模型在评完后立刻清掉。"""
+        base_kv = dict(kv)  # 结构、词表与目标产物完全相同
+        base_kv["general.file_type"] = (K_U32, FILE_TYPE["f16"])  # 只有权重档位换回 f16
+        with tempfile.TemporaryDirectory(prefix="hoshiori-forge-base-") as scratch:  # 基线不留成第三份产物
+            model = Path(scratch) / "baseline.f16.gguf"  # llama-cli 要吃一个真实文件
+            model.write_bytes(gguf_bytes(tensors, base_kv, "f16", []))  # 当前权重原精度写成可运行的 GGUF
+            return benchmark(model, self.choice.suites, "f16")  # 必须在临时目录收掉前跑完
+
+    def _finish_check(self, baseline: dict) -> dict:
+        """跑量化产物，把两份原始分数交给 self_check，并只留下最终比较报告。"""
+        quantized = benchmark(self.choice.out, self.choice.suites, self.choice.quant)  # 同一套题、同一推理参数
+        folder = self.choice.out.parent  # 最终 report.md / report.json 就放在产物旁边
+        base_file = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=folder, prefix=".forge-base-", suffix=".json", delete=False)  # 不覆盖已有隐藏文件
+        quant_file = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=folder, prefix=".forge-quant-", suffix=".json", delete=False)  # 同目录让最终报告落在产物旁
+        base_path, quant_path = Path(base_file.name), Path(quant_file.name)  # self_check 的两份输入
+        try:
+            with base_file, quant_file:  # 中间报告写完先关，Windows 上也能马上重读
+                json.dump(baseline, base_file, ensure_ascii=False, indent=2)  # 基线原始分
+                json.dump(quantized, quant_file, ensure_ascii=False, indent=2)  # 量化原始分
+            return self_check(base_path, quant_path)  # 汇总总分差与逐项差
+        finally:
+            base_path.unlink(missing_ok=True)  # 只保留用户要的两份比较报告
+            quant_path.unlink(missing_ok=True)  # 原始答案可能很大，不在产物旁重复堆
 
     def _token_dir(self) -> Path:
         """词表在哪个目录。显式给了就用它，否则按权重路径推。"""
@@ -275,6 +314,148 @@ class Export:
             fail("error", f"mlx 转换失败: {run.stderr.strip()[-400:]}", hint="单独跑一次 mlx_lm.convert 看完整输出")
         written = sum(one.stat().st_size for one in folder.rglob("*") if one.is_file())  # 目录里写出来的全部字节
         return {"tensors": len(tensors), "bytes": written, "dropped": self.choice.dropped}
+
+
+# --- 量化自评 ---
+
+def benchmark(model: Path, suites: list, label: str) -> dict:
+    """用 llama-cli 跑套件并按 scorer 的规则出一份 judge 同形报告。
+
+    model 是 f16 基线或刚写出的量化 GGUF；suites 可给内置名，也可给套件文件路径。
+    固定 seed、temperature 与生成上限，避免采样抖动被误认成量化退化。
+    """
+    from features import report, scorer, suite  # 自评才需要套件与报告，普通导出不多载模块
+
+    program = shutil.which("llama-cli")  # GGUF 两边都交给同一个运行时，后端差异不会混进分差
+    if program is None:  # 没运行时就不能声称跑过模型
+        fail("missing", "量化自评要 llama-cli", hint="安装 llama.cpp 并把 llama-cli 放进 PATH，或先不加 --self-check")
+
+    found = []  # 已装载的套件，命令层验过后这里直接读
+    for given in suites:  # 内置名和显式文件都收
+        path = Path(given)  # 先按文件看
+        path = path if path.is_file() else suite.locate(suite.folder(), str(given))  # 否则回内置目录按名找
+        found.append(suite.read(path))  # 坏套件在第一次答题前停
+
+    rows = []  # judge 报告同形的逐题结果
+    for one in found:  # 一套一套跑，输出顺序可复现
+        for task in one.tasks:  # 每题单起一次，失败能准确点到题号
+            command = [
+                program,  # llama.cpp 的非交互命令
+                "-m", str(model),  # 当前要评的 GGUF
+                "-p", task.prompt,  # 原样题面
+                "-n", str(SELF_CHECK_TOKENS),  # 短答案的生成上限
+                "--seed", "1",  # 两边固定同一随机种子
+                "--temp", "0",  # 贪心解码，去掉采样噪声
+                "--no-display-prompt",  # stdout 只留模型答案
+                "--no-show-timings",  # 计时不混进答案
+                "--simple-io",  # 子进程管道下不用终端控制符
+                "--log-disable",  # 模型装载日志也不混进输出
+                "--single-turn",  # 一题答完就退，不等下一轮输入
+            ]
+            try:
+                done = subprocess.run(command, capture_output=True, text=True, timeout=SELF_CHECK_TIMEOUT)  # 真跑模型
+            except subprocess.TimeoutExpired:  # 卡死不能让整次导出永远挂着
+                fail("input", f"自评题 {one.name}/{task.id} 超过 {SELF_CHECK_TIMEOUT} 秒", where=str(model))
+            if done.returncode:  # 运行时拒绝模型或执行失败都不能当零分吞掉
+                detail = done.stderr.strip()[-400:] or done.stdout.strip()[-400:]  # 最后一段通常就是根因
+                fail("input", f"自评题 {one.name}/{task.id} 跑失败（退出码 {done.returncode}）", where=str(model), hint=detail)
+            answer = done.stdout.strip()  # stdout 已靠上面的静默参数收成纯答案
+            verdict = scorer.grade(task, answer)  # 与 ori judge 共用同一套判分
+            rows.append({
+                "suite": one.name,  # 哪套题
+                "id": task.id,  # 哪一题
+                "score": verdict.score,  # 0~1 分
+                "reason": verdict.reason,  # 为什么得这个分
+                "answer": answer,  # 原始答案留在中间报告供比较
+            })
+
+    return report.make(  # 字段与 judge/report.json 一致，self_check 只认这一种形状
+        model=label,  # f16 或具体量化档
+        backend="llama-cli",  # 两边用同一个本地运行时
+        suite=", ".join(one.name for one in found),  # 实际跑过的套件
+        recipe="forge:self-check",  # 这不是另一次训练配方
+        rows=rows,  # 全部逐题结果
+    )
+
+
+def self_check(baseline_report, quant_report) -> dict:
+    """读两份 judge 形报告，计算量化减基线的总分差与逐项差，落 report.md / report.json。
+
+    两份原始报告应放在量化产物所在目录；最终报告写到 quant_report 的同一目录。
+    delta 为「量化 - 基线」，负数是掉分；degradation 为相反数，正数是退化幅度。
+    """
+    paths = [Path(baseline_report), Path(quant_report)]  # 统一成路径，字符串调用也收
+    reports = []  # 基线、量化各一份
+    for path in paths:  # 外部报告只在这个边界读和验一次
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))  # 报告是 UTF-8 JSON
+        except (OSError, json.JSONDecodeError) as bad:  # 文件缺失或 JSON 写坏都说清位置
+            fail("input", f"自评报告读不出来: {bad}", where=str(path))
+        if "total" not in data or not isinstance(data.get("tasks"), list):  # 比较至少要总分与逐题分
+            fail("input", "不像 judge 的 report.json", where=str(path), hint="报告要有 total 和 tasks")
+        reports.append(data)  # 过边界后内部直接信任字段
+    baseline, quantized = reports  # 名字固定，后面不再靠下标猜
+
+    before = {(row.get("suite") or "", row["id"]): row for row in baseline["tasks"]}  # 基线逐项索引
+    after = {(row.get("suite") or "", row["id"]): row for row in quantized["tasks"]}  # 量化逐项索引
+    keys = list(before) + [key for key in after if key not in before]  # 基线顺序为主，新项目接在末尾
+    items = []  # 每项的两边分数、差值与退化
+    for key in keys:  # 同一套里的同一题才互相比
+        base_score = float(before[key]["score"]) if key in before else 0.0  # 量化多出的题以 0 为基线
+        quant_score = float(after[key]["score"]) if key in after else 0.0  # 量化漏题按 0 分，不能悄悄消失
+        delta = round(quant_score - base_score, 4)  # 量化减基线，负数是掉分
+        degradation = round(base_score - quant_score, 4)  # 直接相减，持平时写 0.0 而不是 -0.0
+        items.append({
+            "suite": key[0],  # 套件名参与唯一定位
+            "id": key[1],  # 题号
+            "baseline": base_score,  # 原权重得分
+            "quantized": quant_score,  # 量化权重得分
+            "delta": delta,  # 量化减基线
+            "degradation": degradation,  # 正数更适合拿来跟阈值比较
+        })
+    items.sort(key=lambda one: (-one["degradation"], one["suite"], one["id"]))  # 掉最多的排最前，命令直接取前三
+
+    baseline_total, quantized_total = float(baseline["total"]), float(quantized["total"])  # 两边总分只取一次
+    total_delta = round(quantized_total - baseline_total, 4)  # 总分同样是量化减基线
+    degradation = round(baseline_total - quantized_total, 4)  # 持平明确写 0.0
+    data = {
+        "schema": "hoshiori/forge-self-check/1",  # 机器读时先认版本
+        "baseline": {"model": baseline.get("model", "f16"), "total": baseline_total},  # 基线摘要
+        "quantized": {"model": quantized.get("model", "quantized"), "total": quantized_total},  # 量化摘要
+        "total_delta": total_delta,  # 负数表示总分退化
+        "degradation": degradation,  # 正数表示退化幅度
+        "count": len(items),  # 比了多少项
+        "items": items,  # 逐项差，按退化从大到小
+    }
+    folder = paths[1].parent  # 量化报告在哪，最终比较报告就落在哪
+    markdown_path, json_path = folder / "report.md", folder / "report.json"  # 用户约定的固定文件名
+    data["files"] = {"markdown": str(markdown_path), "json": str(json_path)}  # 命令层打印时不用再猜路径
+    markdown_path.write_text(self_check_markdown(data), encoding="utf-8")  # 给人看的退化表
+    json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")  # 给机器与 CI 的同源数据
+    return data  # Export 与命令层继续用同一份数据做门控
+
+
+def self_check_markdown(data: dict) -> str:
+    """把自评差值排成一张 Markdown 表；项目已经按退化从大到小排好。"""
+    lines = [
+        "# 量化自评报告",  # 报告标题
+        "",  # 标题与摘要分开
+        f"- 基线: {data['baseline']['model']}，总分 {data['baseline']['total']}",  # 原权重摘要
+        f"- 量化: {data['quantized']['model']}，总分 {data['quantized']['total']}",  # 量化权重摘要
+        f"- 总分差（量化 - 基线）: {data['total_delta']:+.4f}",  # 符号方向写进标题，免得猜
+        f"- 退化幅度: {data['degradation']:+.4f}",  # 命令门控使用的数
+        "",  # 摘要与表格分开
+        "| 套件 | 项目 | 基线 | 量化 | 差值（量化 - 基线） | 退化 |",  # 逐项表头
+        "|---|---|---:|---:|---:|---:|",  # 数字列右对齐
+    ]
+    for one in data["items"]:  # 掉分最多的先列，打开报告先看到风险
+        suite_name = str(one["suite"]).replace("|", "\\|").replace("\n", " ")  # 不让名字撑破 Markdown 表
+        item_name = str(one["id"]).replace("|", "\\|").replace("\n", " ")  # 题号同样收成单元格
+        lines.append(
+            f"| {suite_name} | {item_name} | {one['baseline']:.4f} | {one['quantized']:.4f} | "
+            f"{one['delta']:+.4f} | {one['degradation']:+.4f} |"
+        )
+    return "\n".join(lines) + "\n"  # 文本文件用换行收尾
 
 
 # --- onnx 整图 ---

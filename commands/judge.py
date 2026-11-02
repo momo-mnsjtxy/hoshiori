@@ -4,60 +4,55 @@
   ori judge sft.warp.yaml --suite zh-lite --answer-cmd 'echo {prompt}'
   ori judge sft.warp.yaml --suite format-lite --limit 3 --out out/r
   ori judge sft.warp.yaml --suite zh-lite --baseline out/base/report.json
+  ori judge sft.warp.yaml --suite zh-lite --answer-cmd 'a {prompt}' --arena 'b {prompt}'
+  ori judge sft.warp.yaml --suite zh-lite --answer-cmd 'a {prompt}' --submit https://example/board
   ori judge --import-lm-eval tasks/demo.yaml     # 只导题库，不跑评测
 
 --answer-cmd 里的 {prompt} 会换成题面，所以不绑死任何模型后端；
 不给就退回回显占位，把题面当答案，报告里标 backend: echo。
-给了 --import-lm-eval 就只跑导入：把 lm-eval 任务导成 features/suites 下的套件文件，
-打印每份的题数与丢弃规则数，不读配方、不评测。
-检查只在这里做一次：配方在不在、--limit 是不是负数、套件认不认得出、基线在不在。
+--arena 把 --answer-cmd 当 A 方、另一个命令当 B 方，逐题乱序对打并把排名写进 JSON；
+--submit 在报告落盘后提交公开字段，断网时在报告旁留下 board-pending.json。
+给了 --import-lm-eval 就只跑导入，不读配方、不评测。
+检查只在这里开头做一次：选项能否同用、配方与套件能否读、基线是否有效。
 """
 
-import subprocess
 from pathlib import Path
 
-from features import gate, lm_eval, recipe, report, scorer, suite
+from features import arena, board, gate, lm_eval, recipe, report, suite
 from utils.fail import fail
-
-TIMEOUT = 300  # 一道题的答案命令最多等几秒，卡死要能自己出来
 
 
 def command(args) -> int:
     """跑套件、判分、落报告；给了基线就比完返回门的退出码。"""
     if args.import_lm_eval:                                                   # 给了就只导题
+        if args.arena is not None or args.submit is not None:                 # 导入没有报告，也没有后端可供这两项使用
+            fail("input", "--import-lm-eval 不能和 --arena / --submit 同用")
         return run_import(args.import_lm_eval)
     if not args.recipe:                                                       # 没给配方
         fail("input", "要给一份配方", hint="例: ori judge sft.warp.yaml --suite zh-lite")
     if args.limit < 0:                                                        # 限题数写负了
         fail("input", "--limit 不能是负数", hint="给 0 或正整数，0 表示不限")
+    if args.arena is not None and not args.arena.strip():                     # 参数给了但命令是空白
+        fail("input", "--arena 后面要给另一个答题命令")
+    if args.arena is not None and not (args.answer_cmd or "").strip():        # A 方必须明确，避免拿回显误当模型
+        fail("input", "--arena 要和 --answer-cmd 一起用", hint="--answer-cmd 是 A 方，--arena 是 B 方")
 
     data = recipe.load(Path(args.recipe))                                     # 读配方，坏 yaml 在这里停
     recipe.check(data)                                                        # 先过校验
     names = args.suite or (data.get("eval") or {}).get("suites") or []        # 命令行优先，配方兜底
     if not names:                                                             # 两头都没给
         fail("input", "没给套件，配方里也没有 eval.suites", hint="例: --suite zh-lite")
-    found = [(name, suite.locate(suite.folder(), name)) for name in names]    # 先全部找到，缺一套当场停
+    found = [(name, suite.read(suite.locate(suite.folder(), name))) for name in names]  # 全部读好再启动后端
     baseline = Path(args.baseline) if args.baseline else None                 # 给没给基线
     if baseline:                                                              # 给了就先确认在不在
         gate.load(baseline)                                                   # 顺便验一下这份基线能不能读
     min_delta = gate_allowed(data, args.min_delta)                            # 允许掉多少分
 
-    rows = []                                                                 # 逐题结果
-    for _, path in found:                                                     # 一套一套跑
-        one = suite.read(path)                                                # 坏套件在这里停
-        tasks = one.tasks[: args.limit] if args.limit else one.tasks          # 只跑前 limit 题
-        print(f"套件 {one.name}（{len(tasks)} 题）：{one.desc}")
-        for task in tasks:                                                    # 一题一题来
-            text = answer(task.prompt, args.answer_cmd or "")                 # 拿答案
-            verdict = scorer.grade(task, text)                                # 判分
-            rows.append({                                                     # 这一题的结果
-                "suite": one.name,                                            # 哪一套
-                "id": task.id,                                                # 哪一题
-                "score": verdict.score,                                       # 得分
-                "reason": verdict.reason,                                     # 为什么得这个分
-                "answer": text.strip(),                                       # 答的是什么
-            })
-            print(f"  {task.id}  {verdict.score:.2f}  {verdict.reason}")
+    contest = None                                                            # 普通评测没有擂台附表
+    if args.arena is not None:                                                # 两个后端走同一批题的成对擂台
+        rows, contest = fight(found, args.answer_cmd, args.arena, args.limit)
+    else:                                                                     # 一个后端走普通逐题评测
+        rows = score(found, args.answer_cmd or "", args.limit)
 
     payload = report.make(                                                    # 一份报告的数据，三份产物都由它派生
         model=data.get("name") or Path(args.recipe).stem,                     # 被评的名字
@@ -66,15 +61,61 @@ def command(args) -> int:
         recipe=recipe.stamp(data),                                            # 配方哈希
         rows=rows,                                                            # 逐题结果
     )
+    if contest:                                                               # 擂台明细只在走擂台时追加
+        payload["arena"] = contest                                           # JSON 保留两方答案、赛果与排名
     paths = report.save(payload, Path(args.out))                              # 落 markdown、json、csv
     print(f"\n总分 {payload['total']}（{payload['count']} 题）")
     print(f"报告 {paths['markdown']} · {paths['json']} · {paths['csv']}")
+    if args.submit is not None:                                               # 用户明确要求才碰公开榜
+        submitted = board.submit(paths["json"], args.submit)                  # 发不出会自动落待补文件
+        if submitted["submitted"]:                                           # 服务已经接收
+            print(f"公开榜 已提交 {args.submit}")
+        else:                                                                 # 没网或没 URL，告诉用户去哪补
+            print(f"公开榜 待补 {submitted['pending']}")
     if not baseline:                                                          # 没基线就到此为止
         return 0
 
     outcome = gate.check(payload, gate.load(baseline), min_delta)             # 跟基线比
     print(outcome.say())
     return outcome.exit_code                                                  # 掉了就非零
+
+
+def score(found: list, backend_cmd: str, limit: int) -> list:
+    """让一个后端依次跑完已装载套件，并把逐题结果打印出来。"""
+    rows = []                                                                 # 所有套件最后合成一份报告
+    for _, one in found:                                                      # 一套一套跑，顺序跟命令行一致
+        result = lm_eval.run_backend(backend_cmd, one, limit)                 # 真调用后端并判完整套题
+        print(f"套件 {one.name}（{result['count']} 题）：{one.desc}")
+        for row in result["tasks"]:                                          # 一题一行即时给人看
+            print(f"  {row['id']}  {row['score']:.2f}  {row['reason']}")
+        rows.extend(result["tasks"])                                         # 汇进最终三格式报告
+    return rows                                                              # 已按套件、题目顺序排好
+
+
+def fight(found: list, first_backend: str, second_backend: str, limit: int) -> tuple:
+    """让两个后端对打，打印逐题比分和最终排名，并返回 A 方报告行与擂台附表。"""
+    suites = [one for _, one in found]                                        # 路径名已经完成检查，擂台只需套件对象
+    contest = arena.run(first_backend, second_backend, suites, limit)         # 两方乱序答同一批题
+    rows = []                                                                 # 普通报告主体沿用 A 方结果，保持旧格式可读
+    current = None                                                           # 打印时套件切换才出一次标题
+    for match in contest["matches"]:                                         # 每道题就是一场对局
+        if match["suite"] != current:                                        # 进入下一套题
+            current = match["suite"]                                        # 记下正在打印哪套
+            count = sum(one["suite"] == current for one in contest["matches"])  # 这一套实际打几场
+            print(f"擂台 {current}（{count} 题）")
+        first, second = match["players"]                                     # players 固定是 A、B，不受调用顺序影响
+        print(f"  {match['id']}  A {first['score']:.2f} · B {second['score']:.2f}  顺序 {'→'.join(match['order'])}")
+        rows.append({                                                         # A 方仍可走原有报告与回归门
+            "suite": match["suite"],                                        # 哪一套
+            "id": match["id"],                                              # 哪一题
+            "score": first["score"],                                        # A 方得分
+            "reason": first["reason"],                                      # A 方判分理由
+            "answer": first["answer"],                                      # A 方实际答案
+        })
+    print("\n擂台排名（Elo / BT）")                                          # 两套强弱指标并排给人核对
+    for row in contest["ranking"]:                                           # 已按 Elo、BT 从强到弱排好
+        print(f"  {row['rank']}. {row['side']} {row['elo']:.2f} / {row['bt']:.4f}  {row['backend']}")
+    return rows, contest                                                     # 主报告与擂台附表同源
 
 
 def run_import(paths: list) -> int:
@@ -94,17 +135,3 @@ def gate_allowed(data: dict, given: float) -> float:
     if given is not None:  # 命令行优先
         return given
     return float(((data.get("eval") or {}).get("gate") or {}).get("min_delta", 0.0))
-
-
-def answer(question: str, cmd: str) -> str:
-    """拿一份答案。没给命令就把题面原样回显。"""
-    if not cmd:                                                                                    # 没有后端，回显占位
-        return question
-    run = cmd.replace("{prompt}", question)                                                        # 占位换成题面
-    try:
-        done = subprocess.run(run, shell=True, capture_output=True, text=True, timeout=TIMEOUT)    # 走 shell，好拼管道
-    except subprocess.TimeoutExpired:                                                              # 后端卡住了
-        fail("input", f"答案命令 {TIMEOUT} 秒没跑完", where=run[:100])
-    if done.returncode:                                                                            # 命令自己失败，别把空答案当成模型答错
-        fail("input", f"答案命令退出码 {done.returncode}", where=run[:100], hint=done.stderr.strip()[:300])
-    return done.stdout

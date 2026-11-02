@@ -1,11 +1,11 @@
-"""样本：从一条原始记录里认出正文和图片路径，按规矩收干净，不合格就拒收并说明原因。
+"""样本：从一条原始记录里认出正文和图片路径，按规矩收净、脱敏、评分并决定是否收下。
 
 调用方式：read(record, policy) 返回规范样本；images 可写一个路径或路径数组，默认最多四张。
 拒收是正常业务分支，每条原因码会进入 rejects.jsonl；正文和图片只在这个入口检查一次。
 
 调用示例：
   from features import sample
-  policy = sample.Policy()                                                        # 默认收最多四张图
+  policy = sample.Policy()                                                        # 默认脱敏，最多收四张图
   clean = sample.read({"text": " 一段话 ", "images": ["photo.png"]}, policy)    # 正文收净，图片路径保留
   sample.read({"text": ""}, policy)                                               # 抛 Refused("too_short")
 """
@@ -14,6 +14,8 @@ import re                                  # 清理控制符和多余空白
 import unicodedata                         # 统一字符的 Unicode 表示
 from dataclasses import dataclass          # 把样本规矩集中成一份数据
 from pathlib import Path                   # 检查图片路径是否真有文件
+
+from features import clean as text_clean   # 正文脱敏和质量评分共用一份规则
 
 CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")  # 不可见控制符，粘着会污染分词
 WS = re.compile(r"[ \t\u00a0\u3000]+")  # 各种空白，含全角空格
@@ -39,6 +41,8 @@ class Policy:
     min_chars: int = 1  # 短于此数算空样本
     max_chars: int = 0  # 0 表示不限长
     max_images: int = 4  # 一条样本最多带几张图片
+    min_score: float = 0.0  # 质量分低于此线拒收；0 表示不筛
+    scrub: bool = True  # 默认替换邮箱、手机号、身份证号、密钥和 IP
 
 
 def text_of(record: dict, policy: Policy) -> str:
@@ -82,7 +86,12 @@ def clean(text: str, policy: Policy) -> str:
 
 def read(record: dict, policy: Policy) -> dict:
     """主入口：一条原始记录进，一条规范样本出。"""
-    text = clean(text_of(record, policy), policy)                              # 认正文再收干净，不合规就拒收
+    text = clean(text_of(record, policy), policy)                              # 认正文再统一字符与空白
+    if policy.scrub:                                                           # 命令行可以明确关闭脱敏
+        text, _ = text_clean.scrub(text)                                       # 命中数由公开 scrub 接口按需取用
+    quality = text_clean.score(text)                                           # 对最终会训练的正文打分
+    if quality < policy.min_score:                                             # 低质量样本和其他拒收走同一条路
+        raise Refused("low_score", f"{quality:.4f} < {policy.min_score:.4f}")  # 拒收档留下实际分数与门槛
     given = record.get("images")                                               # 图片在正文之外单独读取
     images = [given] if isinstance(given, str) else list(given or [])           # 单路径和路径数组统一成列表
     if len(images) > policy.max_images:                                         # 超出单条样本的图片预算
@@ -95,8 +104,16 @@ def read(record: dict, policy: Policy) -> dict:
     out["source"] = record.get("source") or "unknown"                         # 记来源，混配时按来源称重
     if "images" in record:                                                     # 原记录带图时保留规范后的路径列表
         out["images"] = images                                                 # 训练器按原顺序准备每张图片
-    if isinstance(record.get("messages"), list):                               # 对话样本原样留一份
-        out["messages"] = record["messages"]                                  # 训练仍可使用结构化轮次
+    if isinstance(record.get("messages"), list):                               # 对话样本仍保留结构化轮次
+        messages = record["messages"]                                         # 关闭脱敏时保持原来的对象与内容
+        if policy.scrub:                                                       # 开启后不能让原文从旁路漏进产物
+            messages = []                                                     # 每轮复制一份，不修改调用方的原记录
+            for turn in record["messages"]:                                  # 角色和其他字段都原样保留
+                safe = dict(turn)                                              # 只改这一轮自己的正文
+                if isinstance(safe.get("content"), str):                       # 外部记录的 content 可能不是字符串
+                    safe["content"], _ = text_clean.scrub(safe["content"])     # 使用正文同一套规则
+                messages.append(safe)                                         # 脱敏后的轮次按原顺序收回
+        out["messages"] = messages                                            # 训练或导出不会再看到敏感原文
     for key, value in (record.get("meta") or {}).items():                       # 上游附加信息逐项搬过来
         out.setdefault("meta", {})[key] = value                                # 第一个字段到来时再建 meta
     return out                                                                  # 交出一条可写入 bolt 的样本
