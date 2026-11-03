@@ -13,7 +13,7 @@ GIF=0                                       # 默认只留 typescript
 
 cd "$HERE"
 # -q 不写头部信息，-f 实时刷盘（不刷就整段留空），-e 透出子命令退出码，-c 是要录的命令
-script -q -f -e -c "scripts/cleanroom.sh ${DEMO_DIR}/work" "$OUT.typescript"
+script -q -f -e -c "scripts/cleanroom.sh ${HOME}/hoshiori-cleanroom" "$OUT.typescript"
 echo "录像在 $OUT.typescript"
 
 if [ "$GIF" = 1 ]; then
