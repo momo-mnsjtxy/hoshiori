@@ -112,6 +112,13 @@ class Trainer:
             lora.attach(model, choice.lora.get("target") or list(lora.TARGETS)[:4], choice.lora["r"], choice.lora["alpha"], choice.lora["dropout"], variant=choice.lora.get("variant", "lora"))  # 挂件以外全冻上
         if choice.lora:  # 挂件是新建的层，建在 CPU，得跟基座放一起
             model.to(_device_of(model))
+        if choice.lora and choice.base is None:                           # 随机起又挂了挂件：先把这份随机权重存成基座
+            baseline = Path(self.out) / "base"                            # 落进产物目录，导出时合并要用
+            if self.lead:
+                baseline.mkdir(parents=True, exist_ok=True)
+                model.save(baseline)                                      # 存的是挂件之外的原始权重
+            _barrier()
+            choice.base = baseline                                        # 后面存档会把它写进 adapter 配置
         if choice.task in {"dpo", "grpo", "ppo"}:                         # 这三类要一份不动的参考模型
             if choice.base is None:                                    # 命令层没载入基座，这一趟从随机权重起
                 self.ref_model = copy.deepcopy(_unwrap(model)).cpu()    # 只在随机起步时拷贝学生，随后搬到 CPU

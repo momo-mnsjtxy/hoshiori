@@ -11,10 +11,11 @@ license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
 dependencies = [
     "pyyaml>=6.0",
+    "numpy>=1.26",  # 词表、导出、判重都直接用它，缺了连 --help 之外的命令都跑不动
 ]
 
 [project.optional-dependencies]
-speed = ["numpy>=1.26"]
+speed = ["numpy>=1.26"]  # 老配置留名，numpy 已在基础依赖里
 dedup = ["numpy>=1.26", "blake3>=0.3"]
 full = ["numpy>=1.26", "blake3>=0.3", "torch>=2.4", "safetensors>=0.4", "pillow>=10", "tokenizers>=0.20"]
 eval = ["datasets>=3"]  # HF Hub 远端评测题库；本地 JSONL 无需这一组

@@ -32,11 +32,20 @@
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
-pip install -e .
+pip install -e ".[full]"     # 只跑 weave / validate / import 用 pip install -e .
 ori doctor
 ```
 
+`numpy` 在基础依赖里；`torch`、`safetensors`、`pillow` 这些要训练、导出、看图才用得上，都在 `[full]` 里。
+
 只用标准库也能跑，`numpy` 让去重快一档，`blake3` 换指纹算法时再装。
+
+## 干净环境复现与录像
+
+```bash
+scripts/cleanroom.sh                  # 空白 venv 里从零走到导出，全程断言产物，约六分钟
+scripts/record-demo.sh /tmp/demo      # 同一条路录成终端录像
+```
 
 ## 八分钟跑通第一条数据
 

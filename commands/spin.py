@@ -23,7 +23,6 @@ import time
 from pathlib import Path
 
 import main
-import torch
 from features import model, plan, recipe, tokenizer
 from utils import logs
 from utils.fail import fail
@@ -92,6 +91,8 @@ def command(args) -> int:
     if os.environ.get("RANK", "0") == "0" and out.exists() and any(out.iterdir()) and not args.resume:  # 目录里有东西又不续训，别混着写；只让 0 号查，免得别的进程被它刚写的文件绊住
         fail("input", f"产物目录不是空的: {out}", hint="换一个 --out，或加 --resume 接着写")
     out.mkdir(parents=True, exist_ok=True)  # 目录先建
+
+    import torch  # 到这里才真需要它，--dry-run 与没装 torch 的环境都能先出账
 
     if not _has_cuda():  # 没卡就明说，跑到一半才发现更费劲
         logs.warn("spin", "没有可用的卡，按 CPU fp32 跑", precision=precision)
