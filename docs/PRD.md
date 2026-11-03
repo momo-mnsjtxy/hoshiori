@@ -3,7 +3,7 @@
 | 项 | 值 |
 | --- | --- |
 | 产品名 | 星织 / Hoshiori |
-| 代号 | Project OR I（Repository: `hoshiori/hoshiori`） |
+| 代号 | Project OR I（Repository: `momo-mnsjtxy/hoshiori`，组织化时转 `hoshiori-labs`，见部署文档） |
 | 版本 | PRD v0.1（首个可执行草案） |
 | 目标版本 | v0.1.0「藤」 |
 | 许可证 | Apache-2.0（代码） / CC-BY-4.0（文档） / 数据集卡按来源 |

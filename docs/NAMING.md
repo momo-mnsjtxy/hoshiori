@@ -51,7 +51,9 @@
 - `hoshiori.dev` → 文档站
 - `hoshiori.ai` → 落地页 + Elo 擂台
 - `get.hoshiori.dev/install.sh` → 安装器
-- PyPI `hoshiori`、npm `@hoshiori/loom`（前端包）、GitHub `hoshiori/hoshiori`
+- PyPI `hoshiori`（可用，先占位）
+- npm `@hoshiori/loom`（scope 可用，先占位）
+- GitHub 仓库 `momo-mnsjtxy/hoshiori`（已建，私有待发布）；`github.com/hoshiori` 已被一个零仓库个人号占据，故组织名改走 `hoshiori-labs`
 - 名称撞车备选（真被占了就换，机制不变）：`tsumugi`（紡ぎ，纺）、`shizuku`（雫）、`kagari`（篝）
 - `ori` 若撞系统命令，退 `hshi` 或 `ori-cli`；别名永远保留 `ori`
 
