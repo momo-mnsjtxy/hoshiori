@@ -7,31 +7,40 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"      # 仓库根，跑之前先记住
 WORK="${1:-$HOME/hoshiori-cleanroom}"          # 默认放仓库外：这台机器 /tmp 会被清，放那儿复用不了 venv
 SAMPLES="$WORK/samples.jsonl"                 # 自造的语料，不依赖仓库里的示例
+REAL_HOME="$HOME"                              # 真 HOME 留着：ORI_USE_SYSTEM 时用户级包装在那儿
 export HOME="$WORK/home"                      # 空 HOME，别读到本机配置
-export PATH="/usr/local/bin:/usr/bin:/bin"     # 只留系统路径，收紧一点
+if [ "${ORI_USE_SYSTEM:-0}" = 1 ]; then        # 用系统环境就把用户级 site 挂回 PYTHONPATH
+    export PYTHONPATH="${REAL_HOME}/.local/lib/python$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])')/site-packages:${PYTHONPATH:-}"
+fi
+export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"  # 系统路径优先，后面兜住只有 python3 或 conda 的机器
+PY_BIN="$(command -v python3 || command -v python || true)"  # 有的机器只有 python3
+[ -n "$PY_BIN" ] || { echo "✗ 找不到 python3/python"; exit 1; }
 mkdir -p "$HOME" "$WORK"
 
 step() { echo; echo "=== $1 ==="; }            # 打步骤名，录像里看得出走到哪
 fail() { echo "✗ $1"; exit "$2"; }             # 断了就带步号退出
+ori() { "$PY_BIN" "$HERE/main.py" "$@"; }      # 直接用仓库里的入口，不依赖安装位置与 PATH
 
 step "1/9 建 venv 装依赖"
 cd "$WORK"
-if [ "${ORI_REUSE_VENV:-0}" = 1 ] && [ -x .venv/bin/ori ]; then  # 重录时复用已装好的环境，省掉几分钟网络
+if [ "${ORI_USE_SYSTEM:-0}" = 1 ]; then  # 机器上已经装好了本项目，直接用它的 python，连 venv 都省
+    echo "（用当前环境，不建 venv）"
+elif [ "${ORI_REUSE_VENV:-0}" = 1 ] && [ -x .venv/bin/ori ]; then  # 重录时复用已装好的环境，省掉几分钟网络
     echo "（复用已装好的 venv）"
 else
-    python -m venv .venv || fail "venv 建不起来" 1
+    "$PY_BIN" -m venv .venv || fail "venv 建不起来" 1
     . .venv/bin/activate
     python -m pip install -q --upgrade pip || fail "pip 升级失败" 1
     python -m pip install -q -e "$HERE[full]" || fail "项目装不起来" 1
 fi
-. .venv/bin/activate
+[ "${ORI_USE_SYSTEM:-0}" = 1 ] || . .venv/bin/activate
 ori --version || fail "装完没有 ori" 1
 
 step "2/9 自检"
 ori doctor || echo "（doctor 报缺是可选项，继续）"
 
 step "3/9 造 40 条语料"
-python - <<'PY' || fail "造语料失败" 3
+"$PY_BIN" - <<'PY' || fail "造语料失败" 3
 import json, random
 random.seed(3)
 words = "断线 张力 校准 布面 打纬 综框 真布 毛边 纱支 捻度".split()

@@ -32,6 +32,13 @@
 
 `ori weave --in raw.jsonl --quality-profile quality.json --min-score 0.5` 使用该档案。没有档案时继续使用明确的启发式默认值。姓名和地址规则依赖「姓名：」「联系人：」「地址：」等字段标签；银行卡采用13–19位长度和Luhn校验。它们不能保证自由文本里所有人名地址都被识别，也不验证卡号是否真实存在。
 
+## 干净环境复现与录像
+
+- 复现脚本 `scripts/cleanroom.sh`：九步（建 venv 装依赖 → 自检 → 造语料 → 学词表 → 收数据 → 配方校验 → 训练二十步 → 评测 → 导出 GGUF），每步都断言产物，断在哪就退哪一步。
+- 本机首次完整跑通三次：5 分 26 秒、5 分 56 秒、全通各一次（八分钟目标内）。干净环境当场暴露三个真 bug 并已修：numpy 未进基础依赖、`spin` 顶层 `import torch`、随机起权重挂 LoRA 时没有基座可合并。
+- 录像 `scripts/record-demo.sh`：`script -f` 实时刷盘，输出放在仓库外（本机 `/tmp` 会被清）。GPU 机（5090 D）上跑通一遍完整九步，证据 `docs/evidence/cleanroom/run-demo.typescript.gz`，用 `ORI_USE_SYSTEM=1` 复用已装环境，故这一段不含拉依赖的耗时。
+- 本机 pypi 拉 torch 很慢（多次超过十分钟），"含安装的完整首录"仍没录成；换网络或在 GPU 机上先 `pip install -e ".[full]"` 再录可解。
+
 ## 当前资源
 
 用户提供的 `python ~/rd.py '<命令>'` 可用。远端实际探测为1张 RTX 5090 D、PyTorch 2.8.0+cu128。本机解除沙箱后也可读到RTX5060 Laptop（sm120），但本地torch是CPU构建，公开榜使用CPU-only llama.cpp。系统 ssh 的密码认证失败不能据此断言服务器不可用；已按用户提供的 Paramiko 通道连接。凭据不进入仓库、日志和产物。
