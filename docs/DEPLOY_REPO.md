@@ -1,6 +1,8 @@
 # 仓库落位与名称占位
 
-2026-11-03 查过一次占用：`github.com/hoshiori` 是个零仓库的个人号（login `HoshiOri`，2026-03 建），GitHub 用户名不分大小写，那条路径拿不回来了。PyPI 的 `hoshiori` 与 npm 的 `@hoshiori` scope 都还空着。
+2026-11-03 查过一次占用：`github.com/hoshiori` 是个零仓库的个人号（login `HoshiOri`，2026-03 建），GitHub 用户名不分大小写，那条路径拿不回来了。
+
+PyPI 的 `hoshiori` 与 npm 的 `@hoshiori` scope 当时都空着，但 **npm 用户名同样被那个 `hoshiori` 占了**，组织只能带后缀，实际用 `hoshiori-ai`。PyPI 已占位成功。
 
 落位因此拆成两层：**仓库先挂个人账号，组织等有第二个维护者再转**。
 
@@ -33,7 +35,9 @@ gh api -X POST repos/momo-mnsjtxy/hoshiori/transfer -f new_owner=hoshiori-labs
 
 名字空着就有人抢。两个都先传空壳，等 0.1.0 再覆盖。
 
-### PyPI
+### PyPI（已完成 2026-11-24）
+
+占位包已传，https://pypi.org/project/hoshiori/ 在线。token 在 `~/.config/hoshiori/pypi-token`。留档当时的做法：
 
 ```bash
 mkdir -p /tmp/squat && cd /tmp/squat
@@ -51,14 +55,13 @@ twine upload dist/*        # 需要先在 pypi.org 建 API token
 
 上传完到 https://pypi.org/project/hoshiori/ 确认，顺手把 description 改成正经的一句话。
 
-### npm scope
+### npm（组织已建 `hoshiori-ai`，包名随组织改成 `@hoshiori-ai/loom`）
 
 ```bash
-npm login                                  # 用要占名的账号
-npm org create hoshiori                    # 已存在会报错，那就直接发包占住
-mkdir -p /tmp/npm-squat && cd /tmp/npm-squat
-npm init -y --scope=@hoshiori -w loom      # 造 @hoshiori/loom 的空包
-npm publish --access public -w @hoshiori/loom
+# 令牌用 Classic / Automation，绕过 2FA
+printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > .npmrc
+npm publish --access public
+rm -f .npmrc
 ```
 
 ## 已经踩过的坑
