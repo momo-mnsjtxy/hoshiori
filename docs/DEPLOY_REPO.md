@@ -55,9 +55,10 @@ twine upload dist/*        # 需要先在 pypi.org 建 API token
 
 上传完到 https://pypi.org/project/hoshiori/ 确认，顺手把 description 改成正经的一句话。
 
-### npm（两个 scope 都已上传，卡在 staged 审批）
+### npm（两个 scope 均已公开）
 
-`@hoshiori/loom` 与 `@hoshiori-ai/loom` 均为 HTTP 202 staged：包名占住了，但需登录 npmjs.com → Staged Packages 手动 Approve 才公开。自动化 token 列不出 stage id，只能走网页。
+2026-11-24 上传时返回 HTTP 202（staged），随后自动通过：两个包现均 200、可 `npm i`，维护者为 mnsjtxy。
+202 之后到通过前，同版本重发会 409——那一段确实像卡住，实际是 npm 的暂存期。
 
 ```bash
 # 令牌用 Classic / Automation，绕过 2FA
