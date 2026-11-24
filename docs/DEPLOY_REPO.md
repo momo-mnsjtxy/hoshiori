@@ -55,7 +55,9 @@ twine upload dist/*        # 需要先在 pypi.org 建 API token
 
 上传完到 https://pypi.org/project/hoshiori/ 确认，顺手把 description 改成正经的一句话。
 
-### npm（组织已建 `hoshiori-ai`，包名随组织改成 `@hoshiori-ai/loom`）
+### npm（两个 scope 都已上传，卡在 staged 审批）
+
+`@hoshiori/loom` 与 `@hoshiori-ai/loom` 均为 HTTP 202 staged：包名占住了，但需登录 npmjs.com → Staged Packages 手动 Approve 才公开。自动化 token 列不出 stage id，只能走网页。
 
 ```bash
 # 令牌用 Classic / Automation，绕过 2FA
